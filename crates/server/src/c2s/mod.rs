@@ -488,7 +488,8 @@ impl Negotiation {
                 self.sasl = None;
                 self.user = Some(user.clone());
                 if !v2 {
-                    t.send(&sasl_el("success", data.as_deref().or(Some(&[])))).await.map_err(|_| None)?;
+                    // No additional data: an empty <success/> (RFC 6120 §6.4.6).
+                    t.send(&sasl_el("success", data.as_deref().filter(|d| !d.is_empty()))).await.map_err(|_| None)?;
                     t.restart();
                     return Ok(None);
                 }

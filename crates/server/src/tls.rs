@@ -29,8 +29,6 @@ struct Entry {
     info: CertInfo,
     /// RFC 5929 tls-server-end-point binding for this certificate.
     end_point: Vec<u8>,
-    /// Source files and their modification times, to notice changes.
-    files: Vec<(PathBuf, Option<SystemTime>)>,
 }
 
 /// Picks a certificate for each connection by the name the client asked for.
@@ -39,6 +37,9 @@ pub struct CertStore {
     self_signed_dir: PathBuf,
     fallback: bool,
     entries: RwLock<Vec<Arc<Entry>>>,
+    /// Every certificate and key file seen at the last reload, with its modification time, so a
+    /// change (or a broken file being fixed) is noticed.
+    seen: RwLock<Vec<(PathBuf, Option<SystemTime>)>>,
     /// Domains we serve, for self-signed fallbacks and the default when there's no SNI.
     domains: RwLock<Vec<String>>,
 }
@@ -64,6 +65,7 @@ impl CertStore {
             self_signed_dir: data_dir.join("self-signed"),
             fallback,
             entries: RwLock::new(Vec::new()),
+            seen: RwLock::new(Vec::new()),
             domains: RwLock::new(Vec::new()),
         })
     }
@@ -81,7 +83,9 @@ impl CertStore {
     /// Re-reads the cert folder. Returns how many certificates are loaded.
     pub fn reload(&self) -> Result<usize, TlsError> {
         let mut entries = Vec::new();
-        for (crt, key) in pairs_in(&self.dir) {
+        let pairs = pairs_in(&self.dir);
+        *self.seen.write() = snapshot(&pairs);
+        for (crt, key) in pairs {
             match load_entry(&crt, &key, false) {
                 Ok(e) => entries.push(Arc::new(e)),
                 Err(e) => tracing::warn!(error = %e, "skipping certificate"),
@@ -102,13 +106,7 @@ impl CertStore {
 
     /// True when a certificate file changed since it was loaded (or a new one appeared).
     pub fn changed(&self) -> bool {
-        let entries = self.entries.read();
-        let on_disk = pairs_in(&self.dir);
-        let loaded = entries.iter().filter(|e| !e.info.self_signed).count();
-        if on_disk.len() != loaded {
-            return true;
-        }
-        entries.iter().filter(|e| !e.info.self_signed).any(|e| e.files.iter().any(|(p, t)| mtime(p) != *t))
+        snapshot(&pairs_in(&self.dir)) != *self.seen.read()
     }
 
     /// Watches the cert folder and reloads when it changes. Polling works on every filesystem,
@@ -217,6 +215,10 @@ pub fn covers(names: &[String], name: &str) -> bool {
     })
 }
 
+fn snapshot(pairs: &[(PathBuf, PathBuf)]) -> Vec<(PathBuf, Option<SystemTime>)> {
+    pairs.iter().flat_map(|(c, k)| [c, k]).map(|p| (p.clone(), mtime(p))).collect()
+}
+
 fn mtime(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
@@ -276,13 +278,7 @@ fn load_entry(crt: &Path, key: &Path, self_signed: bool) -> Result<Entry, TlsErr
         "1.2.840.113549.1.1.13" | "1.2.840.10045.4.3.4" => sha2::Sha512::digest(&leaf).to_vec(),
         _ => sha2::Sha256::digest(&leaf).to_vec(),
     };
-    Ok(Entry {
-        key: Arc::new(ck),
-        names,
-        info: CertInfo { self_signed, not_after, issuer },
-        end_point,
-        files: vec![(crt.to_path_buf(), mtime(crt)), (key.to_path_buf(), mtime(key))],
-    })
+    Ok(Entry { key: Arc::new(ck), names, info: CertInfo { self_signed, not_after, issuer }, end_point })
 }
 
 fn loop_key(pem: &[u8]) -> Option<PrivateKeyDer<'static>> {

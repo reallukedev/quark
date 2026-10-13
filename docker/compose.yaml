@@ -1,0 +1,22 @@
+# Quark on its own: docker compose -f docker/compose.yaml up -d
+# Put your certificate in ./data/config/certs/<domain>.crt and .key (Gluon does this for you),
+# or let Quark use a self-signed one to start with.
+services:
+  quark:
+    build: ..
+    image: ghcr.io/reallukedev/quark:0.1
+    restart: unless-stopped
+    environment:
+      QUARK_DOMAIN: chat.example.com
+      QUARK_ADMINS: admin@chat.example.com
+    ports:
+      - "5222:5222"     # chat apps
+      - "5223:5223"     # chat apps, TLS from the start
+      - "5269:5269"     # other servers
+      - "5280:5280"     # web chat, uploads, invite pages (put Caddy or another TLS proxy in front)
+      - "3478:3478/udp" # call relay
+      - "3478:3478"
+      - "49160-49200:49160-49200/udp"
+    volumes:
+      - ./data/config:/etc/quark
+      - ./data/lib:/var/lib/quark

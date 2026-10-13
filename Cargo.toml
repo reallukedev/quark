@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/server", "crates/testkit"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+rust-version = "1.85"
+
+[workspace.dependencies]
+quark-core = { path = "crates/core" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+large_futures = "warn"

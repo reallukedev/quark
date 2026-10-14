@@ -38,6 +38,20 @@ pub static MIGRATION: Migration = Migration {
 /// device, not per sign-in.
 pub const ITERATIONS: u32 = 10_000;
 
+/// PBKDF2 rounds accepted from imported keys. Below this the keys are too weak to keep; above
+/// it, one PLAIN sign-in would hold a hashing slot for seconds or hours (4 billion rounds), so a
+/// few attempts would stall every sign-in on the server.
+pub const IMPORT_ITERATIONS: std::ops::RangeInclusive<u32> = 1_000..=1_000_000;
+
+/// Why imported keys with `n` rounds aren't taken.
+pub fn iterations_refused(n: u32) -> String {
+    format!(
+        "The SCRAM keys use {n} hashing rounds; Quark takes {} to {}. Ask the person to set a new password instead.",
+        IMPORT_ITERATIONS.start(),
+        IMPORT_ITERATIONS.end()
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -450,6 +464,9 @@ impl Accounts {
         if k.salt.is_empty() || k.iterations == 0 || k.keys.iter().all(Option::is_none) {
             return Err(AccountError::Invalid("The SCRAM keys are incomplete.".into()));
         }
+        if !IMPORT_ITERATIONS.contains(&k.iterations) {
+            return Err(AccountError::Invalid(iterations_refused(k.iterations)));
+        }
         let (host, user) = (host.to_string(), user.to_string());
         let jid = format!("{user}@{host}");
         let now = quark_core::time::now_ms();
@@ -513,6 +530,12 @@ impl Accounts {
         let Some((h, stored_key)) = [1, 2, 0].into_iter().find_map(|i| k.keys[i].as_ref().map(|(st, _)| (HASHES[i], st.clone()))) else {
             return Ok(None);
         };
+        // Keys stored before imports were checked could carry any count; hashing an absurd one
+        // would hold a slot for as long as it takes, so such a password can only be reset.
+        if k.iterations > *IMPORT_ITERATIONS.end() {
+            tracing::warn!(%host, %user, iterations = k.iterations, "refusing a password check with too many hashing rounds; reset the password");
+            return Ok(None);
+        }
         let pw = password.to_string();
         let (salt, iterations) = (k.salt.clone(), k.iterations);
         let ok = self
@@ -668,6 +691,22 @@ mod tests {
         assert!(a.keys("a.test", "kim").await.unwrap().unwrap().keys.iter().all(Option::is_some));
         assert!(a.verify_password("a.test", "kim", "old pw").await.unwrap());
         assert!(matches!(a.create_with_keys("a.test", "kim", &k, &facts).await, Err(AccountError::Exists(_))));
+    }
+
+    #[tokio::test]
+    async fn absurd_iteration_counts_are_refused_on_import_and_never_hashed() {
+        let a = accounts().await;
+        let facts = Imported { role: Role::Member, enabled: true, created: None };
+        let mut k = keys_for("old pw");
+        k.iterations = 4_000_000_000;
+        assert!(matches!(a.create_with_keys("a.test", "kim", &k, &facts).await, Err(AccountError::Invalid(_))));
+        // One stored before imports were checked: a PLAIN check refuses it instead of hashing.
+        k.iterations = 1_000;
+        a.create_with_keys("a.test", "kim", &k, &facts).await.unwrap();
+        a.db.write(|t| t.execute("UPDATE accounts SET iterations = 4000000000 WHERE user = 'kim'", [])).await.unwrap();
+        let check = a.password_state("a.test", "kim", "old pw");
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), check).await.expect("answered without hashing");
+        assert_eq!(r.unwrap(), None);
     }
 
     #[tokio::test]

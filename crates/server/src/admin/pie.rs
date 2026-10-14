@@ -351,6 +351,9 @@ fn credentials(el: &Element) -> Result<Option<StoredKeys>, String> {
         if salt.is_empty() || iterations == 0 || server.len() != len || stored.len() != len {
             return Err(format!("The {mech} keys are incomplete."));
         }
+        if !crate::accounts::IMPORT_ITERATIONS.contains(&iterations) {
+            return Err(crate::accounts::iterations_refused(iterations));
+        }
         found.push((i, salt, iterations, stored, server));
     }
     // Strongest first: SHA-512, SHA-256, SHA-1.
@@ -516,5 +519,23 @@ mod tests {
         let short = Element::parse(&format!("<user xmlns='{PIE}' name='sam'>{}</user>", k("SCRAM-SHA-256", "s1", 20))).unwrap();
         assert!(credentials(&short).is_err());
         assert!(credentials(&Element::parse(&format!("<user xmlns='{PIE}' name='sam'/>")).unwrap()).unwrap().is_none());
+    }
+
+    #[test]
+    fn refuses_absurd_iteration_counts() {
+        let k = |n: u64| {
+            let c = format!(
+                "<scram-credentials xmlns='{SCRAM}' mechanism='SCRAM-SHA-256'><iter-count>{n}</iter-count><salt>{}</salt>\
+                 <server-key>{}</server-key><stored-key>{}</stored-key></scram-credentials>",
+                B64.encode("salt"),
+                B64.encode([1u8; 32]),
+                B64.encode([2u8; 32])
+            );
+            credentials(&Element::parse(&format!("<user xmlns='{PIE}' name='sam'>{c}</user>")).unwrap())
+        };
+        assert!(k(4_000_000_000).is_err());
+        assert!(k(1_000_001).is_err());
+        assert!(k(999).is_err());
+        assert_eq!(k(1_000_000).unwrap().unwrap().iterations, 1_000_000);
     }
 }

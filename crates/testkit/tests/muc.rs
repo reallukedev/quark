@@ -105,6 +105,45 @@ fn admin_item(attrs: &[(&str, &str)]) -> Element {
     Element::new("query", MUC_ADMIN).child(it)
 }
 
+fn register_form(nick: &str) -> Element {
+    Element::new("query", ns::REGISTER).child(
+        Element::new("x", ns::DATA_FORMS)
+            .attr_set("type", "submit")
+            .child(Element::new("field", ns::DATA_FORMS).attr_set("var", "FORM_TYPE").text_child(
+                "value",
+                ns::DATA_FORMS,
+                "http://jabber.org/protocol/muc#register",
+            ))
+            .child(Element::new("field", ns::DATA_FORMS).attr_set("var", "muc#register_roomnick").text_child(
+                "value",
+                ns::DATA_FORMS,
+                nick,
+            )),
+    )
+}
+
+/// Reads a room's archive: the archived messages, oldest first.
+async fn room_archive(c: &mut Client, name: &str) -> anyhow::Result<Vec<Element>> {
+    let id = quark_testkit::quark_core::new_id();
+    let q = Element::new("query", ns::MAM).attr_set("queryid", "q1");
+    c.send(&quark_testkit::quark_core::stanza::iq("set", &id, None, Some(&room(name)), q)).await?;
+    let mut out = Vec::new();
+    loop {
+        let e = c.recv().await?;
+        if e.name() == "iq" && e.attr("id") == Some(&id) {
+            anyhow::ensure!(e.attr("type") == Some("result"), "query failed: {e}");
+            return Ok(out);
+        }
+        if let Some(m) = e
+            .get_child("result", ns::MAM)
+            .and_then(|r| r.get_child("forwarded", ns::FORWARD))
+            .and_then(|f| f.get_child("message", ns::CLIENT))
+        {
+            out.push(m.clone());
+        }
+    }
+}
+
 fn groupchat(name: &str, body: &str) -> Element {
     message(&room(name), "groupchat", body)
 }
@@ -662,23 +701,13 @@ async fn registering_reserves_a_nickname() -> anyhow::Result<()> {
     let mut bob = person(&s, "bob").await?;
     let mut carol = person(&s, "carol").await?;
     make_room(&mut alice, "tea", "alice").await?;
+    // Only people in the room can make themselves members.
+    let r = carol.iq_set(Some(&room("tea")), register_form("carol")).await?;
+    assert_eq!(error_condition(&r).as_deref(), Some("not-acceptable"), "{r}");
+    join(&mut bob, &occ("tea", "bob")).await?;
     let form = bob.iq_get(Some(&room("tea")), Element::new("query", ns::REGISTER)).await?;
     assert!(form.get_child("query", ns::REGISTER).and_then(|q| q.get_child("x", ns::DATA_FORMS)).is_some(), "{form}");
-    let submit = Element::new("query", ns::REGISTER).child(
-        Element::new("x", ns::DATA_FORMS)
-            .attr_set("type", "submit")
-            .child(Element::new("field", ns::DATA_FORMS).attr_set("var", "FORM_TYPE").text_child(
-                "value",
-                ns::DATA_FORMS,
-                "http://jabber.org/protocol/muc#register",
-            ))
-            .child(Element::new("field", ns::DATA_FORMS).attr_set("var", "muc#register_roomnick").text_child(
-                "value",
-                ns::DATA_FORMS,
-                "bobby",
-            )),
-    );
-    let r = bob.iq_set(Some(&room("tea")), submit).await?;
+    let r = bob.iq_set(Some(&room("tea")), register_form("bobby")).await?;
     assert_eq!(r.attr("type"), Some("result"), "{r}");
     let again = bob.iq_get(Some(&room("tea")), Element::new("query", ns::REGISTER)).await?;
     let q = again.get_child("query", ns::REGISTER).unwrap();
@@ -688,6 +717,8 @@ async fn registering_reserves_a_nickname() -> anyhow::Result<()> {
     assert!(nick.to_xml().contains("name='bobby'"), "{nick}");
 
     assert_eq!(join_refused(&mut carol, &occ("tea", "bobby"), join_presence(&occ("tea", "bobby"))).await?, "conflict");
+    bob.send(&presence(Some(&occ("tea", "bob")), Some("unavailable"))).await?;
+    bob.expect(|e| e.name() == "presence" && e.attr("type") == Some("unavailable")).await?;
     let me = join(&mut bob, &occ("tea", "bobby")).await?;
     assert_eq!(item(&me).attr("affiliation"), Some("member"));
     Ok(())
@@ -876,5 +907,183 @@ async fn admin_functions_create_post_list_and_destroy() -> anyhow::Result<()> {
     assert!(p.to_xml().contains("Closing"));
     assert!(muc::list_rooms(&s.srv, ROOMS).await.iter().all(|r| r.jid != room("news")));
     assert!(matches!(muc::destroy_room(&s.srv, &room("news"), None).await, Err(muc::RoomError::NotFound(_))));
+    Ok(())
+}
+
+fn sid_of(m: &Element) -> String {
+    m.get_child("stanza-id", ns::SID).and_then(|s| s.attr("id")).unwrap_or_default().to_string()
+}
+
+#[tokio::test]
+async fn retracted_messages_stay_gone_after_a_restart_and_from_the_archive() -> anyhow::Result<()> {
+    let mut s = TestServer::start().await?;
+    for u in ["alice", "bob", "carol"] {
+        s.add_user(u, "password").await?;
+    }
+    {
+        let mut alice = s.online("alice", "password", "phone").await?;
+        let mut bob = s.online("bob", "password", "phone").await?;
+        make_room(&mut alice, "home", "alice").await?;
+        configure(&mut alice, "home", &[("muc#roomconfig_persistentroom", "1")]).await?;
+        join(&mut bob, &occ("home", "bob")).await?;
+        bob.send(&groupchat("home", "oops, wrong room")).await?;
+        let m = expect_body(&mut bob, &occ("home", "bob"), "oops, wrong room").await?;
+        let retract = Element::new("message", ns::CLIENT)
+            .attr_set("to", room("home"))
+            .attr_set("type", "groupchat")
+            .child(Element::new("retract", ns::RETRACT).attr_set("id", sid_of(&m)));
+        bob.send(&retract).await?;
+        alice.expect(|e| e.name() == "message" && e.has_child("retract", ns::RETRACT)).await?;
+        // In the archive, only a tombstone is left.
+        let archived = room_archive(&mut alice, "home").await?;
+        let gone = archived
+            .iter()
+            .find(|m| m.attr("from") == Some(&occ("home", "bob")) && !m.has_child("retract", ns::RETRACT))
+            .expect("tombstone");
+        assert!(!gone.has_child("body", ns::CLIENT), "{gone}");
+        assert!(gone.has_child("retracted", ns::RETRACT), "{gone}");
+    }
+    s.restart().await?;
+    let mut carol = s.online("carol", "password", "phone").await?;
+    let to = occ("home", "carol");
+    carol.send(&join_presence(&to)).await?;
+    carol.expect(|e| e.name() == "presence" && e.attr("from") == Some(&to) && codes(e).contains(&110)).await?;
+    let next = next_message(&mut carol).await?;
+    assert!(next.has_child("subject", ns::CLIENT), "nothing in the history after a restart: {next}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn moderated_messages_leave_only_a_tombstone_in_the_archive() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    let mut alice = person(&s, "alice").await?;
+    let mut bob = person(&s, "bob").await?;
+    make_room(&mut alice, "tea", "alice").await?;
+    join(&mut bob, &occ("tea", "bob")).await?;
+    bob.send(&groupchat("tea", "something rude")).await?;
+    let m = expect_body(&mut alice, &occ("tea", "bob"), "something rude").await?;
+    let moderate = Element::new("moderate", "urn:xmpp:message-moderate:1")
+        .attr_set("id", sid_of(&m))
+        .child(Element::new("retract", ns::RETRACT))
+        .text_child("reason", "urn:xmpp:message-moderate:1", "Be nice");
+    let r = alice.iq_set(Some(&room("tea")), moderate).await?;
+    assert_eq!(r.attr("type"), Some("result"), "{r}");
+    let archived = room_archive(&mut bob, "tea").await?;
+    assert!(archived.iter().all(|m| m.child_text("body", ns::CLIENT).as_deref() != Some("something rude")), "{archived:?}");
+    let t = archived.iter().find(|m| m.has_child("retracted", ns::RETRACT)).expect("tombstone");
+    assert_eq!(t.attr("from"), Some(occ("tea", "bob").as_str()));
+    let retracted = t.get_child("retracted", ns::RETRACT).unwrap();
+    assert!(retracted.has_child("moderated", "urn:xmpp:message-moderate:1"), "{t}");
+    assert_eq!(retracted.child_text("reason", ns::RETRACT).as_deref(), Some("Be nice"));
+    Ok(())
+}
+
+fn block(jid: &str) -> Element {
+    Element::new("block", ns::BLOCKING).child(Element::new("item", ns::BLOCKING).attr_set("jid", jid))
+}
+
+#[tokio::test]
+async fn people_who_blocked_an_occupant_dont_hear_from_them() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    let mut alice = person(&s, "alice").await?;
+    let mut bob = person(&s, "bob").await?;
+    let mut carol = person(&s, "carol").await?;
+    make_room(&mut alice, "tea", "alice").await?;
+    join(&mut bob, &occ("tea", "bob")).await?;
+    join(&mut carol, &occ("tea", "carol")).await?;
+    let r = bob.iq_set(None, block(&occ("tea", "alice"))).await?;
+    assert_eq!(r.attr("type"), Some("result"), "{r}");
+
+    alice.send(&groupchat("tea", "from alice")).await?;
+    expect_body(&mut alice, &occ("tea", "alice"), "from alice").await?;
+    carol.send(&groupchat("tea", "from carol")).await?;
+    let next = next_message(&mut bob).await?;
+    assert_eq!(next.child_text("body", ns::CLIENT).as_deref(), Some("from carol"), "{next}");
+
+    // Her private messages don't reach him either, and he stays in the room.
+    alice.send(&message(&occ("tea", "bob"), "chat", "psst")).await?;
+    carol.send(&groupchat("tea", "still here?")).await?;
+    let next = next_message(&mut bob).await?;
+    assert_eq!(next.child_text("body", ns::CLIENT).as_deref(), Some("still here?"), "{next}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn private_messages_go_to_the_recipients_archive() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    let mut alice = person(&s, "alice").await?;
+    let mut bob = person(&s, "bob").await?;
+    make_room(&mut alice, "tea", "alice").await?;
+    join(&mut bob, &occ("tea", "bob")).await?;
+    alice.send(&message(&occ("tea", "bob"), "chat", "just between us")).await?;
+    let got = expect_body(&mut bob, &occ("tea", "alice"), "just between us").await?;
+    assert!(got.has_child("x", ns::MUC_USER));
+    let sid = got.get_child("stanza-id", ns::SID).expect("archived by bob's server");
+    assert_eq!(sid.attr("by"), Some("bob@quark.test"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn sleeping_occupants_are_woken_by_push() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    let mut alice = person(&s, "alice").await?;
+    s.add_user("app", "password").await?;
+    let mut app = s.login_as("app", "password", "svc").await?;
+    let mut bob = person(&s, "bob").await?;
+    let enable = Element::new("enable", ns::PUSH).attr_set("jid", "app@quark.test/svc").attr_set("node", "n1");
+    let r = bob.iq_set(None, enable).await?;
+    assert_eq!(r.attr("type"), Some("result"), "{r}");
+    make_room(&mut alice, "tea", "alice").await?;
+    join(&mut bob, &occ("tea", "bob")).await?;
+    bob.send_raw("<enable xmlns='urn:xmpp:sm:3' resume='true'/>").await?;
+    bob.expect(|e| e.is("enabled", ns::SM)).await?;
+    bob.drop_connection();
+    let phone = quark_testkit::quark_core::Jid::parse("bob@quark.test/phone")?;
+    for _ in 0..100 {
+        if s.srv.sessions.get(&phone).is_some_and(|x| x.flags.lock().hibernating) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    alice.send(&groupchat("tea", "bob, you there?")).await?;
+    let iq = app.expect(|e| e.name() == "iq" && e.attr("type") == Some("set") && e.has_child("pubsub", ns::PUBSUB)).await?;
+    assert_eq!(iq.attr("from"), Some("bob@quark.test"));
+    assert!(!iq.to_xml().contains("you there"), "{iq}");
+    Ok(())
+}
+
+fn listed(items: &Element) -> Vec<String> {
+    items
+        .get_child("query", ns::DISCO_ITEMS)
+        .map(|q| q.children().filter_map(|i| i.attr("jid").map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn the_public_listing_follows_rooms_as_they_change() -> anyhow::Result<()> {
+    let mut s = TestServer::start().await?;
+    s.add_user("alice", "password").await?;
+    {
+        let mut alice = s.online("alice", "password", "phone").await?;
+        make_room(&mut alice, "club", "alice").await?;
+        configure(&mut alice, "club", &[("muc#roomconfig_persistentroom", "1")]).await?;
+        let items = alice.iq_get(Some(ROOMS), Element::new("query", ns::DISCO_ITEMS)).await?;
+        assert!(listed(&items).contains(&room("club")), "{items}");
+        configure(&mut alice, "club", &[("muc#roomconfig_publicroom", "0")]).await?;
+        let items = alice.iq_get(Some(ROOMS), Element::new("query", ns::DISCO_ITEMS)).await?;
+        assert!(!listed(&items).contains(&room("club")), "{items}");
+        configure(&mut alice, "club", &[("muc#roomconfig_publicroom", "1"), ("muc#roomconfig_roomname", "The Club")]).await?;
+    }
+    // Read back from storage, as it was last saved.
+    s.restart().await?;
+    let mut alice = s.online("alice", "password", "phone").await?;
+    let items = alice.iq_get(Some(ROOMS), Element::new("query", ns::DISCO_ITEMS)).await?;
+    assert!(items.to_xml().contains("The Club"), "{items}");
+    join(&mut alice, &occ("club", "alice")).await?;
+    let destroy = Element::new("query", MUC_OWNER).child(Element::new("destroy", MUC_OWNER));
+    let r = alice.iq_set(Some(&room("club")), destroy).await?;
+    assert_eq!(r.attr("type"), Some("result"), "{r}");
+    let items = alice.iq_get(Some(ROOMS), Element::new("query", ns::DISCO_ITEMS)).await?;
+    assert!(!listed(&items).contains(&room("club")), "{items}");
     Ok(())
 }

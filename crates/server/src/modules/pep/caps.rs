@@ -5,6 +5,7 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -185,12 +186,61 @@ impl<K: Hash + Eq + Clone, V> Bounded<K, V> {
 }
 
 /// Who is waiting for a `ver` to be resolved.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Waiter {
     /// A local session (its full JID).
     Local(Jid),
     /// A remote contact's resource, online for a local account.
     Remote { owner: Jid, entity: Jid },
+}
+
+impl Waiter {
+    /// The entity that presented the caps, and that gets asked about them.
+    pub fn entity(&self) -> &Jid {
+        match self {
+            Waiter::Local(j) => j,
+            Waiter::Remote { entity, .. } => entity,
+        }
+    }
+
+    /// Whose share of the queries in flight this takes: the account (or remote contact) behind
+    /// it, so one party making up `ver`s only ever holds up itself.
+    fn party(&self) -> Jid {
+        self.entity().to_bare()
+    }
+}
+
+/// Queries in flight, by key: who's waiting (with the caps node each presented), the first
+/// being the one asked. Plus how many queries each party has in flight.
+#[derive(Default)]
+struct Pending {
+    queries: HashMap<String, Vec<(Waiter, String)>>,
+    per_party: HashMap<Jid, usize>,
+}
+
+impl Pending {
+    fn has_room(&self, party: &Jid) -> bool {
+        self.queries.len() < MAX_PENDING && self.per_party.get(party).copied().unwrap_or(0) < MAX_PENDING_PER_PARTY
+    }
+    fn start(&mut self, party: Jid) {
+        *self.per_party.entry(party).or_default() += 1;
+    }
+    fn finish(&mut self, party: &Jid) {
+        if let Some(n) = self.per_party.get_mut(party) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.per_party.remove(party);
+            }
+        }
+    }
+}
+
+/// How often a waiter whose lookup failed was tried again.
+#[derive(Debug, Clone, Copy)]
+struct Retry {
+    tries: u32,
+    /// A retry is already scheduled, so another failure doesn't schedule a second.
+    scheduled: bool,
 }
 
 /// What's known about caps, shared by every account on the server.
@@ -199,34 +249,58 @@ pub struct CapsCache {
     verified: Mutex<Bounded<String, Arc<Caps>>>,
     /// Answers we couldn't verify, only trusted for the entity that gave them.
     per_entity: Mutex<Bounded<Jid, (String, Arc<Caps>)>>,
-    /// Queries in flight, by key, with who's waiting.
-    pending: Mutex<HashMap<String, Vec<Waiter>>>,
+    pending: Mutex<Pending>,
+    retries: Mutex<Bounded<Waiter, Retry>>,
 }
 
 const VERIFIED_CAP: usize = 4096;
 const PER_ENTITY_CAP: usize = 8192;
 const MAX_PENDING: usize = 512;
+/// Queries one account (or remote contact) may have in flight; real clients need one or two.
+const MAX_PENDING_PER_PARTY: usize = 4;
 const MAX_WAITERS: usize = 1024;
+/// Longest caps `node` or `ver` looked up; real ones are well under 100 bytes.
+pub const MAX_CAPS_FIELD: usize = 1024;
+/// Retries after a failed lookup: after RETRY_BASE, then twice as long each time (1 s to 16 s).
+const MAX_RETRIES: u32 = 5;
+const RETRY_BASE: Duration = Duration::from_secs(1);
+const RETRIES_CAP: usize = 8192;
 
 impl Default for CapsCache {
     fn default() -> Self {
         CapsCache {
             verified: Mutex::new(Bounded::new(VERIFIED_CAP)),
             per_entity: Mutex::new(Bounded::new(PER_ENTITY_CAP)),
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(Pending::default()),
+            retries: Mutex::new(Bounded::new(RETRIES_CAP)),
         }
     }
 }
 
 /// What to do after a presence's caps were looked up.
+#[derive(Debug)]
 pub enum Lookup {
     Known(Arc<Caps>),
     /// Unknown: the caller should send the query (it's the first to ask).
     Ask(String),
     /// Unknown, and someone already asked; the waiter is queued.
     Queued,
-    /// Unknown, and too many queries are in flight to ask now.
+    /// Unknown, and the waiter's party (or the whole server) has too many queries in flight to
+    /// ask now: try again later.
     Busy,
+}
+
+/// The outcome of one query.
+#[derive(Debug, Default)]
+pub struct Resolved {
+    /// What the asked entity answered, if it did.
+    pub caps: Option<Arc<Caps>>,
+    /// Waiters `caps` is good for.
+    pub done: Vec<Waiter>,
+    /// Waiters still without caps, to try again later.
+    pub retry: Vec<Waiter>,
+    /// Ask this waiter next (with the caps node it presented), for the others still queued.
+    pub next: Option<(Waiter, String)>,
 }
 
 impl CapsCache {
@@ -238,48 +312,100 @@ impl CapsCache {
     }
 
     /// Looks `ver` up for `waiter`; when unknown, queues the waiter under the query key.
-    pub fn lookup(&self, entity: &Jid, ver: &str, hash: Option<&str>, waiter: Waiter) -> Lookup {
-        if let Some(c) = self.get(entity, ver) {
+    pub fn lookup(&self, node: &str, ver: &str, hash: Option<&str>, waiter: Waiter) -> Lookup {
+        if let Some(c) = self.get(waiter.entity(), ver) {
             return Lookup::Known(c);
         }
         // Verifiable answers are shared, so one query serves everyone with the same `ver`.
         let key = match hash {
             Some(h) if verifiable(h) => format!("{h}\0{ver}"),
-            _ => format!("{entity}\0{ver}"),
+            _ => format!("{}\0{ver}", waiter.entity()),
         };
         let mut p = self.pending.lock();
-        if let Some(w) = p.get_mut(&key) {
-            if w.len() < MAX_WAITERS && !w.contains(&waiter) {
-                w.push(waiter);
+        if let Some(w) = p.queries.get_mut(&key) {
+            if w.iter().any(|(q, _)| *q == waiter) {
+                return Lookup::Queued;
             }
+            if w.len() >= MAX_WAITERS {
+                return Lookup::Busy;
+            }
+            w.push((waiter, node.to_string()));
             return Lookup::Queued;
         }
-        if p.len() >= MAX_PENDING {
+        let party = waiter.party();
+        if !p.has_room(&party) {
             return Lookup::Busy;
         }
-        p.insert(key.clone(), vec![waiter]);
+        p.start(party);
+        p.queries.insert(key.clone(), vec![(waiter, node.to_string())]);
         Lookup::Ask(key)
     }
 
-    /// Stores the answer and hands back who was waiting. Without an answer (a timeout, an
-    /// error) nothing is cached, so the entity is asked again with its next presence: a slow
-    /// phone must not lose its notifications for good.
-    pub fn resolve(&self, key: &str, entity: &Jid, ver: &str, hash: Option<&str>, answer: Option<&Element>) -> (Arc<Caps>, Vec<Waiter>) {
-        let waiters = self.pending.lock().remove(key).unwrap_or_default();
-        let Some(q) = answer else { return (Arc::new(Caps::default()), Vec::new()) };
-        let caps = Arc::new(Caps::from_disco(q));
-        if hash.is_some_and(|h| verifiable(h) && verify(q, h, ver)) {
-            self.verified.lock().insert(ver.to_string(), caps.clone());
-            return (caps, waiters);
-        }
-        // Unverified: good for this entity only. Others who waited on the same key ask again
-        // with their next presence.
-        self.per_entity.lock().insert(entity.clone(), (ver.to_string(), caps.clone()));
-        let mine = |w: &Waiter| match w {
-            Waiter::Local(j) => j == entity,
-            Waiter::Remote { entity: e, .. } => e == entity,
+    /// Takes the asked entity's answer (None after a timeout or an error). A verified answer is
+    /// cached for everyone and serves every waiter. Otherwise it's only good for the entity that
+    /// gave it, and the next waiter whose party has room is asked in turn, so one slow or lying
+    /// client doesn't leave the others without caps. Those that can't be asked now, and the
+    /// entity itself when it didn't answer, are handed back to try again later.
+    pub fn resolve(&self, key: &str, entity: &Jid, ver: &str, hash: Option<&str>, answer: Option<&Element>) -> Resolved {
+        let waiters = {
+            let mut p = self.pending.lock();
+            p.finish(&entity.to_bare());
+            p.queries.remove(key).unwrap_or_default()
         };
-        (caps, waiters.into_iter().filter(mine).collect())
+        let caps = answer.map(|q| Arc::new(Caps::from_disco(q)));
+        let mut out = Resolved { caps: caps.clone(), ..Resolved::default() };
+        if let (Some(q), Some(c)) = (answer, &caps) {
+            if hash.is_some_and(|h| verifiable(h) && verify(q, h, ver)) {
+                self.verified.lock().insert(ver.to_string(), c.clone());
+                out.done = waiters.into_iter().map(|(w, _)| w).collect();
+                return out;
+            }
+            self.per_entity.lock().insert(entity.clone(), (ver.to_string(), c.clone()));
+        }
+        let (mine, mut rest): (Vec<_>, Vec<_>) = waiters.into_iter().partition(|(w, _)| w.entity() == entity);
+        let mine = mine.into_iter().map(|(w, _)| w);
+        if caps.is_some() {
+            out.done.extend(mine);
+        } else {
+            out.retry.extend(mine);
+        }
+        let mut p = self.pending.lock();
+        while !rest.is_empty() {
+            let party = rest[0].0.party();
+            if p.has_room(&party) {
+                p.start(party);
+                out.next = Some(rest[0].clone());
+                p.queries.insert(key.to_string(), rest);
+                break;
+            }
+            out.retry.push(rest.remove(0).0);
+        }
+        out
+    }
+
+    /// When to look `w` up again after a failure, or None when it had its tries (or one is
+    /// already scheduled); its next presence then asks again anyway.
+    pub fn schedule_retry(&self, w: &Waiter) -> Option<Duration> {
+        let mut r = self.retries.lock();
+        let cur = r.get(w).copied().unwrap_or(Retry { tries: 0, scheduled: false });
+        if cur.scheduled || cur.tries >= MAX_RETRIES {
+            return None;
+        }
+        r.insert(w.clone(), Retry { tries: cur.tries + 1, scheduled: true });
+        Some(RETRY_BASE * 2u32.pow(cur.tries))
+    }
+
+    /// A scheduled retry is starting.
+    pub fn retry_due(&self, w: &Waiter) {
+        let mut r = self.retries.lock();
+        if let Some(cur) = r.get(w).copied() {
+            r.insert(w.clone(), Retry { scheduled: false, ..cur });
+        }
+    }
+
+    /// `w` got its caps: a later failure starts with a full set of tries.
+    pub fn succeeded(&self, w: &Waiter) {
+        self.retries.lock().remove(w);
     }
 }
 
@@ -365,24 +491,78 @@ mod tests {
         assert!(m.order.len() <= 4);
     }
 
+    fn local(j: &str) -> Waiter {
+        Waiter::Local(Jid::parse(j).unwrap())
+    }
+
     #[test]
     fn one_query_per_verifiable_ver() {
         let c = CapsCache::default();
-        let a = Jid::parse("a@x/1").unwrap();
-        let b = Jid::parse("b@x/1").unwrap();
-        let Lookup::Ask(key) = c.lookup(&a, "v", Some("sha-1"), Waiter::Local(a.clone())) else { panic!() };
-        assert!(matches!(c.lookup(&b, "v", Some("sha-1"), Waiter::Local(b.clone())), Lookup::Queued));
-        // A wrong hash: only the entity that answered gets the (unverified) result.
+        let (a, b) = (local("a@x/1"), local("b@x/1"));
+        let Lookup::Ask(key) = c.lookup("n", "v", Some("sha-1"), a.clone()) else { panic!() };
+        assert!(matches!(c.lookup("n", "v", Some("sha-1"), b.clone()), Lookup::Queued));
+        // A wrong hash: only the entity that answered gets the (unverified) result, and the next
+        // waiter is asked for itself.
         let q = Element::parse("<query xmlns='http://jabber.org/protocol/disco#info'><feature var='n+notify'/></query>").unwrap();
-        let (caps, waiters) = c.resolve(&key, &a, "v", Some("sha-1"), Some(&q));
-        assert!(caps.wants("n"));
-        assert_eq!(waiters, vec![Waiter::Local(a.clone())]);
-        assert!(c.get(&a, "v").is_some());
-        assert!(c.get(&b, "v").is_none());
-        // No answer: nothing cached, the next presence asks again.
-        let Lookup::Ask(key) = c.lookup(&b, "w", None, Waiter::Local(b.clone())) else { panic!() };
-        let (_, waiters) = c.resolve(&key, &b, "w", None, None);
-        assert!(waiters.is_empty());
-        assert!(matches!(c.lookup(&b, "w", None, Waiter::Local(b.clone())), Lookup::Ask(_)));
+        let r = c.resolve(&key, a.entity(), "v", Some("sha-1"), Some(&q));
+        assert!(r.caps.is_some_and(|c| c.wants("n")));
+        assert_eq!(r.done, vec![a.clone()]);
+        assert_eq!(r.next, Some((b.clone(), "n".to_string())));
+        assert!(c.get(a.entity(), "v").is_some());
+        assert!(c.get(b.entity(), "v").is_none());
+        // B doesn't answer either: it's handed back for a retry, and nothing is cached.
+        let r = c.resolve(&key, b.entity(), "v", Some("sha-1"), None);
+        assert_eq!((r.done, r.retry, r.next), (vec![], vec![b.clone()], None));
+        assert!(matches!(c.lookup("n", "v", Some("sha-1"), b.clone()), Lookup::Ask(_)));
+    }
+
+    #[test]
+    fn a_slow_client_hands_the_query_to_the_next_waiter() {
+        let c = CapsCache::default();
+        let (a, b, d) = (local("a@x/1"), local("b@x/1"), local("d@x/1"));
+        let Lookup::Ask(key) = c.lookup("n", "v", Some("sha-1"), a.clone()) else { panic!() };
+        c.lookup("n2", "v", Some("sha-1"), b.clone());
+        c.lookup("n", "v", Some("sha-1"), d.clone());
+        let r = c.resolve(&key, a.entity(), "v", Some("sha-1"), None);
+        assert_eq!(r.retry, vec![a]);
+        assert_eq!(r.next, Some((b.clone(), "n2".to_string())));
+        // A verified answer from B serves D too.
+        let q = Element::parse("<query xmlns='http://jabber.org/protocol/disco#info'><feature var='f'/></query>").unwrap();
+        let ver = B64.encode(sha1::Sha1::digest(ver_string(&q).unwrap().as_bytes()));
+        let r = c.resolve(&key, b.entity(), "v", Some("sha-1"), Some(&q));
+        assert_eq!(r.done, vec![b.clone()], "the answer doesn't match `v`, so it's only B's");
+        assert_eq!(r.next.map(|n| n.0), Some(d.clone()));
+        let Lookup::Ask(key) = c.lookup("n", &ver, Some("sha-1"), b.clone()) else { panic!() };
+        c.lookup("n", &ver, Some("sha-1"), d.clone());
+        let r = c.resolve(&key, b.entity(), &ver, Some("sha-1"), Some(&q));
+        assert_eq!(r.done, vec![b, d]);
+    }
+
+    #[test]
+    fn made_up_vers_only_hold_up_their_own_account() {
+        let c = CapsCache::default();
+        for i in 0..MAX_PENDING_PER_PARTY {
+            assert!(matches!(c.lookup("n", &format!("fake{i}"), Some("sha-1"), local("eve@x/1")), Lookup::Ask(_)));
+        }
+        assert!(matches!(c.lookup("n", "fake-more", Some("sha-1"), local("eve@x/2")), Lookup::Busy));
+        assert!(matches!(c.lookup("n", "real", Some("sha-1"), local("bob@x/1")), Lookup::Ask(_)));
+    }
+
+    #[test]
+    fn retries_back_off_and_stop() {
+        let c = CapsCache::default();
+        let a = local("a@x/1");
+        assert_eq!(c.schedule_retry(&a), Some(RETRY_BASE));
+        assert_eq!(c.schedule_retry(&a), None, "one retry at a time");
+        let mut waits = Vec::new();
+        for _ in 1..MAX_RETRIES {
+            c.retry_due(&a);
+            waits.push(c.schedule_retry(&a).unwrap());
+        }
+        assert_eq!(waits.last(), Some(&(RETRY_BASE * 16)));
+        c.retry_due(&a);
+        assert_eq!(c.schedule_retry(&a), None);
+        c.succeeded(&a);
+        assert_eq!(c.schedule_retry(&a), Some(RETRY_BASE));
     }
 }

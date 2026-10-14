@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -28,6 +29,7 @@ mod caps;
 mod config;
 mod deliver;
 mod iq;
+mod pie;
 mod store;
 
 use caps::{Bounded, Caps, CapsCache};
@@ -94,23 +96,90 @@ impl Default for Pep {
 
 /// A remote contact's resource that's online for a local account.
 struct RemoteResource {
+    /// The caps it presents (node, ver and hash), as sent.
+    node: String,
     ver: String,
-    /// The caps whose last items it already got.
-    acted: Option<Arc<Caps>>,
+    hash: Option<String>,
+    /// The caps it was last known to have: what its notifications are filtered by, and whose
+    /// last items it already got. Kept here rather than looked up in the shared caches, which
+    /// anyone can churn.
+    caps: Option<Arc<Caps>>,
+}
+
+/// Remote resources online, per local account, with a running total so the global limit is
+/// checked without walking every account.
+#[derive(Default)]
+struct Remote {
+    by_owner: HashMap<Jid, HashMap<Jid, RemoteResource>>,
+    total: usize,
+}
+
+impl Remote {
+    /// Records the caps `from` presents to `owner`. False when it's new and there's no room.
+    fn update(&mut self, owner: &Jid, from: &Jid, node: &str, ver: &str, hash: Option<&str>) -> bool {
+        let (node, ver, hash) = (node.to_string(), ver.to_string(), hash.map(str::to_string));
+        if let Some(r) = self.get_mut(owner, from) {
+            (r.node, r.ver, r.hash) = (node, ver, hash);
+            return true;
+        }
+        if self.total >= REMOTE_TOTAL || self.by_owner.get(owner).is_some_and(|m| m.len() >= REMOTE_PER_ACCOUNT) {
+            return false;
+        }
+        self.by_owner.entry(owner.clone()).or_default().insert(from.clone(), RemoteResource { node, ver, hash, caps: None });
+        self.total += 1;
+        true
+    }
+
+    fn get(&self, owner: &Jid, from: &Jid) -> Option<&RemoteResource> {
+        self.by_owner.get(owner)?.get(from)
+    }
+
+    fn get_mut(&mut self, owner: &Jid, from: &Jid) -> Option<&mut RemoteResource> {
+        self.by_owner.get_mut(owner)?.get_mut(from)
+    }
+
+    /// The account's remote resources with known caps.
+    fn with_caps(&self, owner: &Jid) -> Vec<(Jid, Arc<Caps>)> {
+        let Some(m) = self.by_owner.get(owner) else { return Vec::new() };
+        m.iter().filter_map(|(j, r)| Some((j.clone(), r.caps.clone()?))).collect()
+    }
+
+    fn remove(&mut self, owner: &Jid, from: &Jid) {
+        let Some(m) = self.by_owner.get_mut(owner) else { return };
+        if m.remove(from).is_some() {
+            self.total -= 1;
+        }
+        if m.is_empty() {
+            self.by_owner.remove(owner);
+        }
+    }
+
+    fn remove_owner(&mut self, owner: &Jid) {
+        if let Some(m) = self.by_owner.remove(owner) {
+            self.total -= m.len();
+        }
+    }
 }
 
 /// Remote resources tracked per local account, and in all.
 const REMOTE_PER_ACCOUNT: usize = 256;
 const REMOTE_TOTAL: usize = 100_000;
 const AVATAR_CACHE: usize = 8192;
+/// Whether a remote JID is a contact of an account, remembered so presence from it doesn't
+/// read the roster every time; briefly, as roster changes don't reach PEP.
+const CONTACT_CACHE: usize = 16_384;
+const CONTACT_TTL: Duration = Duration::from_secs(60);
 
 /// What PEP keeps in memory; all of it can be rebuilt from presence and the database.
 pub(crate) struct State {
     caps: CapsCache,
-    /// Local sessions, by full JID: the caps whose last items they already got.
+    /// Local sessions, by full JID: the caps they were last known to have (what notifications
+    /// are filtered by, and whose last items they already got).
     local: Mutex<HashMap<Jid, Arc<Caps>>>,
     /// Remote contacts' resources online, per local account (bare JID).
-    remote: Mutex<HashMap<Jid, HashMap<Jid, RemoteResource>>>,
+    remote: Mutex<Remote>,
+    /// (account, remote bare JID) → is it a contact, and since when that's known.
+    contacts: Mutex<Bounded<(Jid, Jid), (bool, Instant)>>,
     /// Avatar hashes for presence (XEP-0398), by account: None when the account has no public
     /// avatar to advertise.
     avatars: Mutex<Bounded<Jid, Option<String>>>,
@@ -121,7 +190,8 @@ impl Default for State {
         State {
             caps: CapsCache::default(),
             local: Mutex::new(HashMap::new()),
-            remote: Mutex::new(HashMap::new()),
+            remote: Mutex::new(Remote::default()),
+            contacts: Mutex::new(Bounded::new(CONTACT_CACHE)),
             avatars: Mutex::new(Bounded::new(AVATAR_CACHE)),
         }
     }
@@ -169,6 +239,22 @@ impl Module for Pep {
 
     fn account_identities(&self, _host: &Host) -> Vec<Identity> {
         vec![Identity { category: "pubsub", kind: "pep", name: None }]
+    }
+
+    async fn export_account(&self, srv: &Arc<Server>, host: &Host, user: &str) -> Result<Vec<Element>, crate::db::DbError> {
+        let o = store::Owner { host: host.domain.clone(), user: user.to_string() };
+        srv.db.read(move |c| pie::export(c, &o)).await
+    }
+
+    async fn import_account(&self, srv: &Arc<Server>, host: &Host, user: &str, data: &Element) -> Result<Vec<String>, crate::db::DbError> {
+        if !data.has_child("pubsub", ns::PUBSUB) && !data.has_child("pubsub", ns::PUBSUB_OWNER) {
+            return Ok(Vec::new());
+        }
+        let (o, data) = (store::Owner { host: host.domain.clone(), user: user.to_string() }, data.clone());
+        let notes = srv.db.write(move |t| pie::import(t, &o, &data)).await?;
+        // The avatar hash for presence comes from the database again.
+        self.st.avatars.lock().remove(&Jid::bare_unchecked(user, &host.domain));
+        Ok(notes)
     }
 
     async fn account_items(&self, cx: &IqCtx<'_>) -> Vec<Element> {
@@ -226,13 +312,14 @@ impl Module for Pep {
                 self.st.local.lock().remove(jid);
             }
             Event::SubscriptionApproved { user, contact } => {
+                self.st.contacts.lock().remove(&(user.clone(), contact.to_bare()));
                 let (st, srv, user, contact) = (self.st.clone(), srv.clone(), user.clone(), contact.clone());
                 tokio::spawn(async move { st.subscription_approved(&srv, &user, &contact).await });
             }
+            // Its resources stay tracked while their presence still reaches the account: every
+            // notification checks the roster, and a later approval needs to know them.
             Event::SubscriptionRevoked { user, contact } => {
-                if let Some(m) = self.st.remote.lock().get_mut(user) {
-                    m.retain(|j, _| j.to_bare() != *contact);
-                }
+                self.st.contacts.lock().remove(&(user.clone(), contact.to_bare()));
             }
             Event::AccountDeleted { jid } => self.st.forget(jid),
             Event::VCardChanged { jid, vcard } => self.st.vcard_changed(srv, jid, vcard).await,
@@ -246,7 +333,69 @@ impl State {
     /// Drops everything kept in memory for an account.
     fn forget(&self, bare: &Jid) {
         self.local.lock().retain(|j, _| j.to_bare() != *bare);
-        self.remote.lock().remove(bare);
+        self.remote.lock().remove_owner(bare);
         self.avatars.lock().remove(bare);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use sha1::Digest;
+
+    fn j(s: &str) -> Jid {
+        Jid::parse(s).unwrap()
+    }
+
+    #[test]
+    fn remote_resources_keep_a_running_total() {
+        let mut r = Remote::default();
+        let (a, b) = (j("a@here"), j("b@here"));
+        assert!(r.update(&a, &j("z@there/1"), "n", "v", None));
+        assert!(r.update(&a, &j("z@there/1"), "n", "w", Some("sha-1")));
+        assert!(r.update(&a, &j("z@there/2"), "n", "v", None));
+        assert!(r.update(&b, &j("y@there/1"), "n", "v", None));
+        assert_eq!(r.total, 3);
+        assert_eq!(r.get(&a, &j("z@there/1")).map(|x| x.ver.as_str()), Some("w"));
+        r.remove(&a, &j("z@there/1"));
+        r.remove(&a, &j("z@there/1"));
+        assert_eq!(r.total, 2);
+        r.remove_owner(&a);
+        assert_eq!(r.total, 1);
+        for i in 0..REMOTE_PER_ACCOUNT {
+            assert!(r.update(&a, &j(&format!("z@there/{i}")), "n", "v", None));
+        }
+        assert!(!r.update(&a, &j("z@there/more"), "n", "v", None));
+        assert_eq!(r.total, 1 + REMOTE_PER_ACCOUNT);
+    }
+
+    /// Notifications go by the caps stored with each session, so someone flooding the shared
+    /// caps cache with new `ver`s can't make others lose theirs.
+    #[test]
+    fn session_caps_outlive_the_shared_cache() {
+        let st = State::default();
+        let ver_of =
+            |q: &Element| base64::engine::general_purpose::STANDARD.encode(sha1::Sha1::digest(caps::ver_string(q).unwrap().as_bytes()));
+        let learn = |w: &caps::Waiter, q: &Element| {
+            let ver = ver_of(q);
+            if let caps::Lookup::Ask(key) = st.caps.lookup("n", &ver, Some("sha-1"), w.clone()) {
+                st.caps.resolve(&key, w.entity(), &ver, Some("sha-1"), Some(q));
+            }
+        };
+        let me = caps::Waiter::Local(j("a@here/phone"));
+        let mine = Element::parse("<query xmlns='http://jabber.org/protocol/disco#info'><feature var='n+notify'/></query>").unwrap();
+        learn(&me, &mine);
+        let known = st.caps.get(me.entity(), &ver_of(&mine)).unwrap();
+        st.local.lock().insert(me.entity().clone(), known);
+        let eve = caps::Waiter::Local(j("eve@here/1"));
+        for i in 0..5000 {
+            learn(
+                &eve,
+                &Element::parse(&format!("<query xmlns='http://jabber.org/protocol/disco#info'><feature var='f{i}'/></query>")).unwrap(),
+            );
+        }
+        assert!(st.caps.get(me.entity(), &ver_of(&mine)).is_none(), "the shared cache was churned");
+        assert!(st.local_caps_of(me.entity()).is_some_and(|c| c.wants("n")));
     }
 }

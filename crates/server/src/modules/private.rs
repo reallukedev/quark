@@ -23,6 +23,31 @@ pub static MIGRATION: Migration = Migration {
 
 const MAX_BYTES: usize = 64 * 1024;
 
+/// What an account stored under `ns` and element `name`, inside a database closure.
+pub fn load(c: &rusqlite::Connection, host: &str, user: &str, ns: &str, name: &str) -> rusqlite::Result<Option<Element>> {
+    let xml: Option<String> = c
+        .prepare_cached("SELECT xml FROM private_xml WHERE host = ?1 AND user = ?2 AND ns = ?3 AND name = ?4")?
+        .query_row(params![host, user, ns, name], |r| r.get(0))
+        .optional()?;
+    Ok(xml.and_then(|x| Element::parse(&x).ok()))
+}
+
+/// Stores `data` (whitespace stripped) under its namespace and name, inside a database
+/// closure. False, with nothing stored, when it's over the size limit.
+pub fn store(c: &rusqlite::Connection, host: &str, user: &str, data: &Element) -> rusqlite::Result<bool> {
+    let mut v = data.clone();
+    v.strip_whitespace();
+    let xml = v.to_xml();
+    if xml.len() > MAX_BYTES {
+        return Ok(false);
+    }
+    c.prepare_cached(
+        "INSERT INTO private_xml (host, user, ns, name, xml) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(host, user, ns, name) DO UPDATE SET xml = excluded.xml",
+    )?
+    .execute(params![host, user, v.ns(), v.name(), xml])?;
+    Ok(true)
+}
+
 pub struct Private;
 
 #[async_trait]
@@ -56,39 +81,17 @@ impl Module for Private {
         let (n, name) = (item.ns().to_string(), item.name().to_string());
         match cx.kind {
             IqType::Get => {
-                let xml: Option<String> = cx
-                    .srv
-                    .db
-                    .read(move |c| {
-                        c.query_row(
-                            "SELECT xml FROM private_xml WHERE host = ?1 AND user = ?2 AND ns = ?3 AND name = ?4",
-                            params![h, u, n, name],
-                            |r| r.get(0),
-                        )
-                        .optional()
-                    })
-                    .await
-                    .map_err(|_| StanzaError::internal())?;
-                let stored = xml.and_then(|x| Element::parse(&x).ok()).unwrap_or_else(|| item.clone());
-                ok(Element::new("query", ns::PRIVATE).child(stored))
+                let stored = cx.srv.db.read(move |c| load(c, &h, &u, &n, &name)).await.map_err(|_| StanzaError::internal())?;
+                ok(Element::new("query", ns::PRIVATE).child(stored.unwrap_or_else(|| item.clone())))
             }
             IqType::Set => {
                 let mut v = item.clone();
                 v.strip_whitespace();
-                let xml = v.to_xml();
-                if xml.len() > MAX_BYTES {
+                let data = v.clone();
+                let fits = cx.srv.db.write(move |t| store(t, &h, &u, &data)).await.map_err(|_| StanzaError::internal())?;
+                if !fits {
                     return Err(StanzaError::new(quark_core::Condition::NotAcceptable).with_text("That's too much to store."));
                 }
-                cx.srv
-                    .db
-                    .write(move |t| {
-                        t.execute(
-                            "INSERT INTO private_xml (host, user, ns, name, xml) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(host, user, ns, name) DO UPDATE SET xml = excluded.xml",
-                            params![h, u, n, name, xml],
-                        )
-                    })
-                    .await
-                    .map_err(|_| StanzaError::internal())?;
                 cx.srv.emit(&super::Event::PrivateChanged { jid: me, data: v }).await;
                 ok_empty()
             }

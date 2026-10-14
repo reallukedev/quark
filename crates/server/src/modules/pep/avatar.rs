@@ -16,7 +16,7 @@ use super::config::{defaults_for, Access};
 use super::iq::Opts;
 use super::store::{self, Owner};
 use super::{Origin, State};
-use crate::db::{params, OptionalExtension};
+use crate::modules::vcard;
 use crate::server::Server;
 
 pub const DATA: &str = "urn:xmpp:avatar:data";
@@ -56,7 +56,7 @@ fn load(c: &rusqlite::Connection, o: &Owner) -> rusqlite::Result<Current> {
     let Some(id) = info.attr("id") else { return Ok(cur) };
     cur.id = Some(id.to_string());
     cur.public = store::node(c, o, DATA)?.is_some_and(|cfg| cfg.access == Access::Open);
-    if let Some(item) = store::items_by_id(c, o, DATA, &[id.to_string()])?.pop().and_then(|i| i.payload()) {
+    if let Some(item) = store::items_by_id(c, o, DATA, &[id.to_string()], usize::MAX)?.pop().and_then(|i| i.payload()) {
         let kind = info.attr("type").unwrap_or("image/png").to_string();
         cur.data = Some((item.text_content().split_whitespace().collect(), kind));
     }
@@ -72,14 +72,6 @@ fn sniff(bytes: &[u8]) -> &'static str {
         [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
         _ => "image/png",
     }
-}
-
-fn read_vcard(c: &rusqlite::Connection, o: &Owner) -> rusqlite::Result<Option<Element>> {
-    let xml: Option<String> = c
-        .prepare_cached("SELECT xml FROM vcards WHERE host = ?1 AND user = ?2")?
-        .query_row(params![o.host, o.user], |r| r.get(0))
-        .optional()?;
-    Ok(xml.and_then(|x| Element::parse(&x).ok()))
 }
 
 impl State {
@@ -118,11 +110,13 @@ impl State {
             .db
             .write(move |t| {
                 let cur = load(t, &oo)?;
-                let Some(mut vcard) = read_vcard(t, &oo)?.or_else(|| cur.data.is_some().then(|| Element::new("vCard", ns::VCARD))) else {
+                let stored = vcard::load(t, &oo.host, &oo.user)?;
+                let Some(mut vcard) = stored.or_else(|| cur.data.is_some().then(|| Element::new("vCard", ns::VCARD))) else {
                     return Ok(cur.presence_hash());
                 };
                 let before = vcard.clone();
                 vcard.remove_children(|c| c.is("PHOTO", ns::VCARD));
+                let without = vcard.clone();
                 if let (true, Some((b64, kind))) = (cur.public, &cur.data) {
                     vcard.append(Element::new("PHOTO", ns::VCARD).text_child("TYPE", ns::VCARD, kind.clone()).text_child(
                         "BINVAL",
@@ -130,11 +124,9 @@ impl State {
                         b64.clone(),
                     ));
                 }
-                if vcard != before {
-                    t.prepare_cached(
-                        "INSERT INTO vcards (host, user, xml) VALUES (?1, ?2, ?3) ON CONFLICT(host, user) DO UPDATE SET xml = excluded.xml",
-                    )?
-                    .execute(params![oo.host, oo.user, vcard.to_xml()])?;
+                // A picture too big for a vCard leaves none there rather than an old one.
+                if vcard != before && !vcard::store(t, &oo.host, &oo.user, &vcard)? && without != before {
+                    vcard::store(t, &oo.host, &oo.user, &without)?;
                 }
                 Ok(cur.presence_hash())
             })

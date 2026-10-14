@@ -12,7 +12,7 @@ use super::config::{defaults_for, MAX_ITEMS};
 use super::iq::Opts;
 use super::store::{self, Owner};
 use super::{Origin, State};
-use crate::db::{params, OptionalExtension};
+use crate::modules::private;
 use crate::server::Server;
 
 pub const NODE: &str = "urn:xmpp:bookmarks:1";
@@ -135,11 +135,13 @@ fn load(c: &rusqlite::Connection, o: &Owner) -> rusqlite::Result<Stored> {
         })
         .collect();
     let legacy_pep = store::last_item(c, o, LEGACY_NODE)?.and_then(|i| i.payload()).filter(|p| p.is("storage", LEGACY_NS));
-    let private: Option<String> = c
-        .prepare_cached("SELECT xml FROM private_xml WHERE host = ?1 AND user = ?2 AND ns = ?3 AND name = 'storage'")?
-        .query_row(params![o.host, o.user, LEGACY_NS], |r| r.get(0))
-        .optional()?;
-    Ok(Stored { v2, legacy_pep, private: private.and_then(|x| Element::parse(&x).ok()) })
+    let private = private::load(c, &o.host, &o.user, LEGACY_NS, "storage")?;
+    Ok(Stored { v2, legacy_pep, private })
+}
+
+/// A bookmarks 2 item id as the room JID legacy documents would name it, when it is one.
+fn room_jid(id: &str) -> Option<String> {
+    Jid::parse(id).ok().filter(|j| j.node().is_some()).map(|j| j.to_bare().to_string())
 }
 
 impl State {
@@ -183,22 +185,34 @@ impl State {
         self.write_legacy(srv, &o, data, st.legacy_pep.as_ref(), st.private.as_ref(), true, false).await;
     }
 
-    /// Makes bookmarks 2 hold exactly the rooms in a legacy document.
+    /// Makes bookmarks 2 hold exactly the rooms in a legacy document. Rooms are matched by
+    /// their normalized JID (legacy documents are read that way), and an existing item is
+    /// updated under its own id, keeping its extensions. Items whose id isn't a room JID can't
+    /// be in a legacy document at all, so they're left alone.
     async fn sync_v2(self: &Arc<Self>, srv: &Arc<Server>, o: &Owner, doc: &Element, v2: &[(String, Bookmark, Option<Element>)]) {
         let want = legacy_rooms(doc);
-        let have: HashMap<&str, (&Bookmark, Option<&Element>)> = v2.iter().map(|(j, b, x)| (j.as_str(), (b, x.as_ref()))).collect();
+        let mut have: HashMap<String, (&str, &Bookmark, Option<&Element>)> = HashMap::new();
+        for (id, b, x) in v2 {
+            if let Some(room) = room_jid(id) {
+                have.entry(room).or_insert((id.as_str(), b, x.as_ref()));
+            }
+        }
         for (jid, b) in &want {
-            let ext = match have.get(jid.as_str()) {
-                Some((old, _)) if *old == b => continue,
-                Some((_, x)) => *x,
-                None => None,
+            let (id, ext) = match have.get(jid) {
+                Some((_, old, _)) if *old == b => continue,
+                Some((id, _, x)) => (id.to_string(), *x),
+                None => (jid.clone(), None),
             };
-            match self.store_item(srv, o, NODE, jid.clone(), b.to_v2(ext), Opts::Create(defaults_for(NODE))).await {
+            match self.store_item(srv, o, NODE, id, b.to_v2(ext), Opts::Create(defaults_for(NODE))).await {
                 Ok(p) => self.after_publish(srv, o, &p, Origin::Sync).await,
                 Err(e) => return tracing::debug!(error = %e, "pep: bookmark not converted"),
             }
         }
-        let gone: Vec<String> = v2.iter().filter(|(j, _, _)| !want.iter().any(|(w, _)| w == j)).map(|(j, _, _)| j.clone()).collect();
+        let gone: Vec<String> = v2
+            .iter()
+            .filter(|(id, _, _)| room_jid(id).is_some_and(|room| !want.iter().any(|(w, _)| *w == room)))
+            .map(|(id, _, _)| id.clone())
+            .collect();
         if gone.is_empty() {
             return;
         }
@@ -222,19 +236,11 @@ impl State {
         to_private: bool,
     ) {
         if to_private && private_now != Some(doc) {
-            let (oo, xml) = (o.clone(), doc.to_xml());
-            let r = srv
-                .db
-                .write(move |t| {
-                    t.prepare_cached(
-                        "INSERT INTO private_xml (host, user, ns, name, xml) VALUES (?1, ?2, ?3, 'storage', ?4)
-                         ON CONFLICT(host, user, ns, name) DO UPDATE SET xml = excluded.xml",
-                    )?
-                    .execute(params![oo.host, oo.user, LEGACY_NS, xml])
-                })
-                .await;
-            if let Err(e) = r {
-                tracing::warn!(error = %e, "pep: writing legacy bookmarks");
+            let (oo, d) = (o.clone(), doc.clone());
+            match srv.db.write(move |t| private::store(t, &oo.host, &oo.user, &d)).await {
+                Ok(true) => {}
+                Ok(false) => tracing::debug!("pep: legacy bookmarks too big for private storage"),
+                Err(e) => tracing::warn!(error = %e, "pep: writing legacy bookmarks"),
             }
         }
         if to_pep && pep_now != Some(doc) {

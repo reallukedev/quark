@@ -40,7 +40,7 @@ s2s_tls = ["[::]:5270"]
 http = ["[::]:5280"]       # WebSocket, BOSH, uploads, invite pages, metrics (plain HTTP; put a TLS proxy in front)
 
 [limits]
-c2s_stanza_bytes = 262144
+c2s_stanza_bytes = 262144         # also caps PEP items replies, with s2s_stanza_bytes
 s2s_stanza_bytes = 524288
 c2s_bytes_per_sec = 65536       # sustained, with a 4x burst
 auth_timeout_secs = 60

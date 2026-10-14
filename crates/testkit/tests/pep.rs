@@ -2,11 +2,15 @@
 //! models, publish-options, item limits, last items on coming online, and the conversions to
 //! vCard avatars and legacy bookmarks.
 
+mod common;
+
 use std::time::Duration;
 
 use base64::Engine;
+use common::admin_ok;
 use quark_testkit::quark_core::{ns, Element};
-use quark_testkit::{presence, Client, TestServer, DOMAIN};
+use quark_testkit::{caps_ver, presence, Client, Options, TestServer, DOMAIN};
+use serde_json::json;
 
 const PW: &str = "password-1";
 const NICK: &str = "http://jabber.org/protocol/nick";
@@ -611,5 +615,307 @@ async fn remote_contacts_online_with_notify_caps_get_notifications() -> anyhow::
             Some(e) => assert!(e.name() != "message" || e.attr("type") != Some("error"), "{e}"),
         }
     }
+    Ok(())
+}
+
+/// Caps this test answers itself (instead of [`Client::caps`]): the disco#info a testkit client
+/// with `features` gives, and the `<c/>` that advertises it.
+fn manual_caps(features: &[&str]) -> (Element, Element) {
+    let mut q = Element::new("query", ns::DISCO_INFO)
+        .child(Element::new("identity", ns::DISCO_INFO).attr_set("category", "client").attr_set("type", "pc").attr_set("name", "testkit"));
+    for f in features {
+        q.append(Element::new("feature", ns::DISCO_INFO).attr_set("var", *f));
+    }
+    let c =
+        Element::new("c", ns::CAPS).attr_set("hash", "sha-1").attr_set("node", "https://quark.test/testkit").attr_set("ver", caps_ver(&q));
+    (q, c)
+}
+
+fn is_disco_query(e: &Element) -> bool {
+    e.name() == "iq" && e.attr("type") == Some("get") && e.has_child("query", ns::DISCO_INFO)
+}
+
+fn disco_answer(iq: &Element, q: &Element) -> Element {
+    let mut a = q.clone();
+    a.set_attr_opt("node", iq.get_child("query", ns::DISCO_INFO).and_then(|q| q.attr("node")));
+    quark_testkit::quark_core::stanza::iq_result(iq).child(a)
+}
+
+fn disco_refusal(iq: &Element) -> Element {
+    let err = quark_testkit::quark_core::StanzaError::service_unavailable();
+    quark_testkit::quark_core::stanza::error_reply(iq, &err).expect("an error reply")
+}
+
+/// A server whose clients may send as fast as they like.
+async fn fast_server(users: &[&str], limits: &str) -> anyhow::Result<TestServer> {
+    let o = Options { extra_config: format!("[limits]\nc2s_bytes_per_sec = 100000000\n{limits}\n"), ..Options::default() };
+    let s = TestServer::start_with(o).await?;
+    for u in users {
+        s.add_user(u, PW).await?;
+    }
+    Ok(s)
+}
+
+#[tokio::test]
+async fn made_up_caps_from_one_account_do_not_stall_the_others() -> anyhow::Result<()> {
+    let s = fast_server(&["eve", "bob"], "").await?;
+    // Eve announces hundreds of caps nobody has, and never answers what they are.
+    let mut eve = s.login_as("eve", PW, "pc").await?;
+    for i in 0..600 {
+        let c = Element::new("c", ns::CAPS).attr_set("hash", "sha-1").attr_set("node", "x").attr_set("ver", format!("fake{i}="));
+        eve.send(&presence(None, None).child(c)).await?;
+    }
+    eve.pump(SETTLE).await?;
+    let bob = online(&s, "bob", "pc", &[NICK_NOTIFY]).await?;
+    assert_eq!(bob.disco_queries, 1, "Bob's caps are still looked up");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_caps_query_is_tried_again() -> anyhow::Result<()> {
+    let s = server(&["alice", "bob"]).await?;
+    s.make_contacts("alice", "bob").await?;
+    let mut alice = online(&s, "alice", "phone", &[]).await?;
+    alice.iq_set(None, publish(NICK, Some("current"), nick("Alice"))).await?;
+
+    let mut bob = s.login_as("bob", PW, "pc").await?;
+    let (q, c) = manual_caps(&[NICK_NOTIFY]);
+    bob.send(&presence(None, None).child(c)).await?;
+    let first = bob.expect(is_disco_query).await?;
+    bob.send(&disco_refusal(&first)).await?;
+    // The server asks again a little later, and this time gets an answer.
+    let again = bob.expect(is_disco_query).await?;
+    bob.send(&disco_answer(&again, &q)).await?;
+    bob.expect(is_event(NICK)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_client_that_fails_its_caps_query_does_not_hold_up_others() -> anyhow::Result<()> {
+    let s = server(&["alice", "bob", "carol"]).await?;
+    s.make_contacts("alice", "carol").await?;
+    let mut alice = online(&s, "alice", "phone", &[]).await?;
+    alice.iq_set(None, publish(NICK, Some("current"), nick("Alice"))).await?;
+
+    // Bob is asked first and keeps the server waiting…
+    let mut bob = s.login_as("bob", PW, "pc").await?;
+    let (_, c) = manual_caps(&[NICK_NOTIFY]);
+    bob.send(&presence(None, None).child(c)).await?;
+    let asked = bob.expect(is_disco_query).await?;
+    // …while Carol shows up with the same caps.
+    let mut carol = s.login_as("carol", PW, "pc").await?;
+    carol.iq_get(None, Element::new("query", ns::ROSTER)).await?;
+    let caps = carol.caps(&[NICK_NOTIFY]);
+    carol.send(&presence(None, None).child(caps)).await?;
+    carol.pump(SETTLE).await?;
+    assert_eq!(carol.disco_queries, 0, "one query per ver at a time");
+    // Bob fails: Carol is asked instead and gets Alice's nickname.
+    bob.send(&disco_refusal(&asked)).await?;
+    carol.expect(is_event(NICK)).await?;
+    assert_eq!(carol.disco_queries, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_remote_contact_approved_later_gets_the_last_items() -> anyhow::Result<()> {
+    let s = server(&["alice", "bob"]).await?;
+    // Alice sees Zed's presence; he doesn't see hers yet.
+    let zed_bare = "zed@remote.example";
+    s.roster_set("alice", zed_bare, "to").await?;
+    let mut alice = online(&s, "alice", "phone", &[]).await?;
+    alice.iq_set(None, publish(NICK, Some("current"), nick("Alice"))).await?;
+    // Bob's client has the same caps as Zed's, so the server already knows that `ver`.
+    let mut bob = s.login_as("bob", PW, "pc").await?;
+    let caps = bob.caps(&[NICK_NOTIFY]);
+    bob.send(&presence(None, None).child(caps.clone())).await?;
+    bob.pump(SETTLE).await?;
+
+    let zed = "zed@remote.example/laptop";
+    s.srv.route(presence(Some(&jid("alice")), None).attr_set("from", zed).child(caps)).await;
+    alice.expect(|e| e.name() == "presence" && e.attr("from") == Some(zed)).await?;
+    // Nothing for him yet: he isn't allowed to see her.
+    alice.iq_set(None, publish(NICK, Some("current"), nick("Alice 2"))).await?;
+    loop {
+        match alice.recv_within(QUIET).await? {
+            None => break,
+            Some(e) => assert!(e.name() != "message" || e.attr("type") != Some("error"), "{e}"),
+        }
+    }
+
+    // He asks, she approves: her last nickname heads to his server (and bounces back here).
+    s.srv.route(presence(Some(&jid("alice")), Some("subscribe")).attr_set("from", zed_bare)).await;
+    alice.expect(|e| e.name() == "presence" && e.attr("type") == Some("subscribe")).await?;
+    alice.send(&presence(Some(zed_bare), Some("subscribed"))).await?;
+    alice.expect(|e| e.name() == "message" && e.attr("type") == Some("error") && e.attr("from") == Some(zed)).await?;
+    Ok(())
+}
+
+/// An IQ that `from`, on another server, sends Alice's PEP service.
+fn remote_subscribe(from: &str, node: &str) -> Element {
+    let sub = pubsub(Element::new("subscribe", ns::PUBSUB).attr_set("node", node).attr_set("jid", from));
+    quark_testkit::quark_core::stanza::iq("set", &quark_testkit::quark_core::new_id(), Some(from), Some(&jid("alice")), sub)
+}
+
+async fn subscriber_count(s: &TestServer) -> anyhow::Result<i64> {
+    Ok(s.srv.db.read(|c| c.query_row("SELECT COUNT(*) FROM pep_subscriptions", [], |r| r.get(0))).await?)
+}
+
+#[tokio::test]
+async fn only_known_people_on_other_servers_subscribe_and_only_so_many() -> anyhow::Result<()> {
+    let s = server(&["alice"]).await?;
+    let mut alice = online(&s, "alice", "phone", &[]).await?;
+    let open = [("pubsub#access_model", "open")];
+    alice.iq_set(None, with_options(publish(DEVICES, Some("current"), devices(&[1])), &open)).await?;
+
+    s.srv.route(remote_subscribe("stranger@remote.example/x", DEVICES)).await;
+    alice.pump(SETTLE).await?;
+    assert_eq!(subscriber_count(&s).await?, 0, "a stranger elsewhere can't subscribe");
+
+    for i in 0..20 {
+        let c = format!("c{i}@remote.example");
+        s.roster_set("alice", &c, "both").await?;
+        s.srv.route(remote_subscribe(&format!("{c}/x"), DEVICES)).await;
+    }
+    alice.pump(SETTLE).await?;
+    assert_eq!(subscriber_count(&s).await?, 16, "no more than 16 from one domain");
+    Ok(())
+}
+
+#[tokio::test]
+async fn items_replies_fit_in_a_stanza() -> anyhow::Result<()> {
+    let s = fast_server(&["alice"], "c2s_stanza_bytes = 16384").await?;
+    let mut alice = online(&s, "alice", "phone", &[]).await?;
+    let big = "x".repeat(4000);
+    for i in 1..=5 {
+        let id = i.to_string();
+        let r = alice.iq_set(None, with_options(publish("urn:example:log", Some(&id), nick(&big)), &[("pubsub#max_items", "10")])).await?;
+        assert_eq!(r.attr("type"), Some("result"), "{r}");
+    }
+    let r = alice.iq_get(None, items("urn:example:log")).await?;
+    assert_eq!(ids(&result_items(&r)?), ["3", "4", "5"], "the newest that fit");
+    let set = r.get_child("pubsub", ns::PUBSUB).and_then(|p| p.get_child("set", ns::RSM)).expect("an RSM set");
+    assert_eq!(set.child_text("count", ns::RSM).as_deref(), Some("5"));
+    assert_eq!(set.get_child("first", ns::RSM).and_then(|f| f.attr("index")), Some("2"));
+    assert!(r.to_xml().len() < 16384);
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_bookmarks_sync_keeps_modern_ids_and_extensions() -> anyhow::Result<()> {
+    let s = server(&["alice"]).await?;
+    let mut alice = online(&s, "alice", "phone", &[]).await?;
+    let conf = Element::new("conference", BOOKMARKS)
+        .attr_set("name", "Room")
+        .attr_set("autojoin", "true")
+        .child(Element::new("extensions", BOOKMARKS).child(Element::new("x", "urn:example:ext")));
+    alice.iq_set(None, publish(BOOKMARKS, Some("Room@Rooms.Example"), conf)).await?;
+    // Not a room JID, so no legacy document can name it.
+    alice.iq_set(None, publish(BOOKMARKS, Some("rooms.example"), Element::new("conference", BOOKMARKS))).await?;
+
+    // An old client writes back the same room, spelled the normal way.
+    let legacy = Element::new("storage", "storage:bookmarks").child(
+        Element::new("conference", "storage:bookmarks")
+            .attr_set("jid", "room@rooms.example")
+            .attr_set("name", "Room")
+            .attr_set("autojoin", "true"),
+    );
+    alice.iq_set(None, Element::new("query", ns::PRIVATE).child(legacy)).await?;
+    let got = result_items(&alice.iq_get(None, items(BOOKMARKS)).await?)?;
+    let mut got_ids = ids(&got);
+    got_ids.sort();
+    assert_eq!(got_ids, ["Room@Rooms.Example", "rooms.example"]);
+    let room = got.iter().find(|i| i.attr("id") == Some("Room@Rooms.Example")).and_then(|i| i.get_child("conference", BOOKMARKS));
+    assert!(room.is_some_and(|c| c.has_child("extensions", BOOKMARKS)), "{got:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn items_pushed_out_by_the_limit_are_retracted() -> anyhow::Result<()> {
+    let s = server(&["alice", "bob"]).await?;
+    s.make_contacts("alice", "bob").await?;
+    let mut alice = online(&s, "alice", "phone", &[]).await?;
+    let mut bob = online(&s, "bob", "pc", &["urn:example:log+notify"]).await?;
+    for id in ["a", "b", "c"] {
+        alice.iq_set(None, with_options(publish("urn:example:log", Some(id), nick(id)), &[("pubsub#max_items", "2")])).await?;
+    }
+    let retracted = |m: &Element| {
+        event_items(m, "urn:example:log")
+            .and_then(|i| i.get_child("retract", ns::PUBSUB_EVENT))
+            .and_then(|r| r.attr("id"))
+            .map(String::from)
+    };
+    let m = bob.expect(|m| retracted(m).is_some()).await?;
+    assert_eq!(retracted(&m).as_deref(), Some("a"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_full_node_with_no_limit_refuses_rather_than_forgets() -> anyhow::Result<()> {
+    let s = server(&["alice"]).await?;
+    let mut alice = online(&s, "alice", "phone", &[]).await?;
+    let opts = [("pubsub#max_items", "max"), ("pubsub#access_model", "whitelist")];
+    let conf = || Element::new("conference", BOOKMARKS);
+    alice.iq_set(None, with_options(publish(BOOKMARKS, Some("first@rooms.example"), conf()), &opts)).await?;
+    // Fill it up to the most the server keeps.
+    s.srv
+        .db
+        .write(|t| {
+            t.execute(
+                "WITH RECURSIVE n(i) AS (SELECT 2 UNION ALL SELECT i + 1 FROM n WHERE i < 1024)
+                 INSERT INTO pep_items (host, user, node, id, seq, publisher, xml, updated)
+                 SELECT ?1, 'alice', ?2, 'room' || i || '@rooms.example', i, NULL, '<conference xmlns=''urn:xmpp:bookmarks:1''/>', 0 FROM n",
+                quark::db::params![DOMAIN, BOOKMARKS],
+            )
+        })
+        .await?;
+    let r = alice.iq_set(None, with_options(publish(BOOKMARKS, Some("new@rooms.example"), conf()), &opts)).await?;
+    assert_eq!(error_of(&r).0, "resource-constraint");
+    assert_eq!(ids(&result_items(&alice.iq_get(None, items(BOOKMARKS)).await?)?).first(), Some(&"first@rooms.example"));
+    // Changing one that's there is fine.
+    let r = alice.iq_set(None, with_options(publish(BOOKMARKS, Some("first@rooms.example"), conf()), &opts)).await?;
+    assert_eq!(r.attr("type"), Some("result"), "{r}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_mirrored_avatar_never_makes_the_vcard_too_big() -> anyhow::Result<()> {
+    let s = fast_server(&["alice"], "").await?;
+    let mut alice = online(&s, "alice", "phone", &[]).await?;
+    alice.iq_set(None, Element::new("vCard", ns::VCARD).text_child("FN", ns::VCARD, "Alice")).await?;
+    // 150 kB of image is 200 kB of base64: fine for PEP, too much for a vCard.
+    let mut png = vec![0x89u8, b'P', b'N', b'G'];
+    png.resize(150 * 1024, 7);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let open = [("pubsub#access_model", "open")];
+    let r = alice.iq_set(None, with_options(publish(AVATAR_DATA, Some(id), Element::new("data", AVATAR_DATA).text(b64)), &open)).await?;
+    assert_eq!(r.attr("type"), Some("result"), "{r}");
+    let meta = Element::new("metadata", AVATAR_META)
+        .child(Element::new("info", AVATAR_META).attr_set("id", id).attr_set("bytes", png.len().to_string()).attr_set("type", "image/png"));
+    alice.iq_set(None, with_options(publish(AVATAR_META, Some(id), meta), &open)).await?;
+    let v = alice.iq_get(None, Element::new("vCard", ns::VCARD)).await?;
+    let v = v.get_child("vCard", ns::VCARD).expect("a vCard");
+    assert_eq!(v.child_text("FN", ns::VCARD).as_deref(), Some("Alice"));
+    assert!(!v.has_child("PHOTO", ns::VCARD), "the photo didn't fit");
+    Ok(())
+}
+
+#[tokio::test]
+async fn pep_nodes_move_with_an_account_export() -> anyhow::Result<()> {
+    let s = server(&["alice"]).await?;
+    let mut alice = online(&s, "alice", "phone", &[]).await?;
+    let open = [("pubsub#access_model", "open"), ("pubsub#max_items", "5")];
+    alice.iq_set(None, with_options(publish(DEVICES, Some("current"), devices(&[7, 8])), &open)).await?;
+    let out = admin_ok(&s, json!({ "cmd": "account.export", "args": { "host": DOMAIN } })).await;
+    let xml = out["xml"].as_str().unwrap_or_default().to_string();
+
+    let t = server(&[]).await?;
+    let r = admin_ok(&t, json!({ "cmd": "account.import", "args": { "xml": xml } })).await;
+    assert!(r["notes"].as_array().is_some_and(Vec::is_empty), "{r}");
+    t.add_user("eve", PW).await?;
+    let mut eve = online(&t, "eve", "pc", &[]).await?;
+    let got = result_items(&eve.iq_get(Some(&jid("alice")), items(DEVICES)).await?)?;
+    assert_eq!(ids(&got), ["current"], "imported, and still open to anyone");
+    assert_eq!(got[0].first_child().map(|l| l.children().count()), Some(2));
     Ok(())
 }

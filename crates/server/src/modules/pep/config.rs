@@ -346,7 +346,8 @@ fn boolean(v: &str) -> Option<bool> {
 }
 
 /// A number, or `max` for the most this server allows. Larger numbers are capped rather than
-/// refused: a client asking for 10 000 bookmarks wants "as many as possible".
+/// refused: a client asking for 10 000 bookmarks wants "as many as possible". A node at that
+/// cap refuses new items once full (`resource-constraint`) instead of dropping its oldest.
 fn max_items(v: &str) -> Option<u32> {
     if v == "max" {
         return Some(MAX_ITEMS);

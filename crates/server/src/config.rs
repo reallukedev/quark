@@ -3,6 +3,7 @@
 //! Chat settings people change day to day (sign-up, history, group chats…) live in the database
 //! and are changed through the admin API; the config file only seeds them for a new domain.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -180,14 +181,49 @@ pub struct S2sSection {
     /// Seconds an idle server-to-server link stays open.
     #[serde(default = "default_s2s_idle")]
     pub idle_secs: u64,
-    /// Domains never talked to.
+    /// Domains never talked to (their subdomains included).
     #[serde(default)]
     pub blocked: Vec<String>,
+    /// Fixed addresses for remote domains instead of DNS, for private deployments and tests:
+    /// `"chat.example" = "10.0.0.5:5269"` (STARTTLS) or `"tls://10.0.0.5:5270"` (direct TLS).
+    #[serde(default)]
+    pub routes: BTreeMap<String, String>,
+    /// PEM files with certificates to trust for federation besides the public CAs: a private
+    /// CA, or another server's self-signed certificate.
+    #[serde(default)]
+    pub trusted_certs: Vec<PathBuf>,
+    /// Let servers without a certificate we trust prove who they are with dialback (XEP-0220).
+    #[serde(default = "yes")]
+    pub dialback: bool,
+    /// The secret dialback keys are made from. Made and stored on first start when unset; set
+    /// the same one on every node of a cluster.
+    #[serde(default)]
+    pub dialback_secret: Option<String>,
+    /// Seconds a server that couldn't be reached is remembered, so messages to it fail fast.
+    #[serde(default = "default_s2s_retry")]
+    pub retry_secs: u64,
+    /// Incoming server connections at once.
+    #[serde(default = "default_s2s_incoming")]
+    pub max_incoming: usize,
+    /// Seconds to reach another server and sign in before giving up on it.
+    #[serde(default = "default_s2s_timeout")]
+    pub timeout_secs: u64,
 }
 
 impl Default for S2sSection {
     fn default() -> Self {
-        S2sSection { require_tls: true, idle_secs: default_s2s_idle(), blocked: Vec::new() }
+        S2sSection {
+            require_tls: true,
+            idle_secs: default_s2s_idle(),
+            blocked: Vec::new(),
+            routes: BTreeMap::new(),
+            trusted_certs: Vec::new(),
+            dialback: true,
+            dialback_secret: None,
+            retry_secs: default_s2s_retry(),
+            max_incoming: default_s2s_incoming(),
+            timeout_secs: default_s2s_timeout(),
+        }
     }
 }
 
@@ -285,6 +321,15 @@ fn default_registrations() -> u32 {
 fn default_s2s_idle() -> u64 {
     900
 }
+fn default_s2s_retry() -> u64 {
+    60
+}
+fn default_s2s_incoming() -> usize {
+    2000
+}
+fn default_s2s_timeout() -> u64 {
+    30
+}
 fn default_turn_listen() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], 3478))
 }
@@ -349,6 +394,16 @@ impl Config {
                 }
                 *a = j.to_bare().to_string();
             }
+        }
+        let routes = std::mem::take(&mut self.s2s.routes);
+        for (d, target) in routes {
+            let domain = quark_core::Jid::domain_jid(&d)
+                .map_err(|e| ConfigError::Invalid(format!("s2s.routes: \"{d}\" isn't a valid domain ({e}).")))?;
+            crate::s2s::Target::parse_route(&target).map_err(|e| ConfigError::Invalid(format!("s2s.routes.\"{d}\": {e}")))?;
+            self.s2s.routes.insert(domain.domain().to_string(), target);
+        }
+        for b in &mut self.s2s.blocked {
+            *b = b.trim().trim_end_matches('.').to_ascii_lowercase();
         }
         if self.turn.relay_min > self.turn.relay_max {
             return Err(ConfigError::Invalid("turn.relay_min is above turn.relay_max.".into()));
@@ -445,6 +500,13 @@ mod tests {
         .unwrap();
         assert_eq!(c.hosts.len(), 2);
         assert_eq!(c.hosts[0].admins, vec!["root@a.test".to_string()]);
+    }
+
+    #[test]
+    fn s2s_routes_are_checked() {
+        let c = Config::parse("[s2s.routes]\n\"B.Test\" = \"127.0.0.1:5269\"\n", Path::new("x")).unwrap();
+        assert_eq!(c.s2s.routes.get("b.test").map(String::as_str), Some("127.0.0.1:5269"));
+        assert!(Config::parse("[s2s.routes]\n\"b.test\" = \"nowhere\"\n", Path::new("x")).is_err());
     }
 
     #[test]

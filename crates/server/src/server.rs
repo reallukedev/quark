@@ -83,6 +83,10 @@ pub trait Remote: Send + Sync {
     fn send(&self, from_domain: &str, to_domain: &str, stanza: Element);
     /// (incoming, outgoing) links.
     fn counts(&self) -> (usize, usize);
+    /// The links that are up, for status pages.
+    fn links(&self) -> Vec<crate::s2s::LinkInfo> {
+        Vec::new()
+    }
 }
 
 #[derive(Default)]

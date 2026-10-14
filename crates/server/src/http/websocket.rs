@@ -59,13 +59,14 @@ pub(super) async fn handler(
     // The connection's place under the listener's cap goes with the WebSocket, which outlives
     // the HTTP connection task.
     let permit = conn.permit.clone();
+    let written = conn.written.clone();
     ws.protocols(["xmpp"]).max_message_size(frame).max_frame_size(frame).on_upgrade(move |socket| async move {
         let _permit = permit;
         let (tx, rx) = socket.split();
         let t = WsTransport {
             srv: st.srv.clone(),
             reader: WsReader { rx, max_stanza, bytes: 0 },
-            writer: WsWriter::new(tx),
+            writer: WsWriter::new(tx, written),
             ip: peer.ip,
             secure: peer.secure,
             cb,
@@ -144,13 +145,15 @@ type Sink = SplitSink<WebSocket, Message>;
 /// The sending half, shared with the task that pings the client.
 struct WsWriter {
     tx: Arc<tokio::sync::Mutex<Sink>>,
+    /// Bytes the HTTP connection under this WebSocket has taken.
+    written: Option<Arc<std::sync::atomic::AtomicU64>>,
     closed: bool,
 }
 
 impl WsWriter {
     /// Starts pinging: proxies drop WebSockets that look idle (nginx after 60 seconds), and a
     /// failed ping finds a dead connection long before the session's own check would.
-    fn new(sink: Sink) -> Self {
+    fn new(sink: Sink, written: Option<Arc<std::sync::atomic::AtomicU64>>) -> Self {
         let tx = Arc::new(tokio::sync::Mutex::new(sink));
         let weak = Arc::downgrade(&tx);
         tokio::spawn(async move {
@@ -166,7 +169,7 @@ impl WsWriter {
                 }
             }
         });
-        WsWriter { tx, closed: false }
+        WsWriter { tx, written, closed: false }
     }
 
     fn check(&self) -> io::Result<()> {
@@ -302,6 +305,9 @@ impl StanzaReader for WsReader {
 
 #[async_trait]
 impl StanzaWriter for WsWriter {
+    fn progress(&self) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        self.written.clone()
+    }
     async fn write(&mut self, el: &Element) -> io::Result<()> {
         self.feed(el).await
     }

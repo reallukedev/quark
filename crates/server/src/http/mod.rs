@@ -33,6 +33,7 @@ use tower::ServiceExt as _;
 use crate::modules::Module;
 use crate::sasl::ChannelBindings;
 use crate::server::{Host, Server};
+use crate::transport::Counted;
 
 /// Time a client has to send a request's headers.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -54,6 +55,8 @@ pub(crate) struct Conn {
     /// to a task of its own and ends the connection task, so the WebSocket keeps a clone of
     /// this until it closes.
     pub permit: Option<Arc<OwnedSemaphorePermit>>,
+    /// Bytes the socket has taken, so a WebSocket session can tell a slow link from a stuck one.
+    pub written: Option<Arc<AtomicU64>>,
 }
 
 pub(crate) struct TlsFacts {
@@ -161,12 +164,8 @@ pub async fn start(srv: &Arc<Server>) -> anyhow::Result<Vec<std::net::SocketAddr
     // Nothing is uploading yet, so uploads a restart cut off give their slots back.
     crate::modules::upload::reset_interrupted(srv).await;
     let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    let state = Arc::new(WebState {
-        srv: srv.clone(),
-        bosh: bosh::Registry::default(),
-        stats: WebStats::default(),
-        connections: limit.clone(),
-    });
+    let state =
+        Arc::new(WebState { srv: srv.clone(), bosh: bosh::Registry::default(), stats: WebStats::default(), connections: limit.clone() });
     let app = router(srv, state.clone());
     let tls = cfg.http.tls.then(|| srv.certs.server_config(&[b"http/1.1"]));
     let mut out = Vec::new();
@@ -228,13 +227,17 @@ async fn accept_loop(
             let permit = Some(Arc::new(permit));
             let _ = tcp.set_nodelay(true);
             let peer = SocketAddr::new(addr.ip().to_canonical(), addr.port());
+            let written = Arc::new(AtomicU64::new(0));
             match tls {
-                None => serve_conn(TokioIo::new(tcp), Conn { peer, tls: None, permit }, app, state, shutdown).await,
+                None => {
+                    let conn = Conn { peer, tls: None, permit, written: Some(written.clone()) };
+                    serve_conn(TokioIo::new(Counted::new(tcp, written)), conn, app, state, shutdown).await
+                }
                 Some(cfg) => {
                     let Some(stream) = handshake(tcp, cfg).await else { return };
                     let (sni, _, cb) = crate::tls::session_facts(&stream, &state.srv.certs);
-                    let conn = Conn { peer, tls: Some(Arc::new(TlsFacts { sni, cb })), permit };
-                    serve_conn(TokioIo::new(stream), conn, app, state, shutdown).await
+                    let conn = Conn { peer, tls: Some(Arc::new(TlsFacts { sni, cb })), permit, written: Some(written.clone()) };
+                    serve_conn(TokioIo::new(Counted::new(stream, written)), conn, app, state, shutdown).await
                 }
             }
         });
@@ -450,7 +453,7 @@ mod tests {
     use super::*;
 
     fn conn(ip: &str) -> Conn {
-        Conn { peer: SocketAddr::new(ip.parse().unwrap(), 4000), tls: None, permit: None }
+        Conn { peer: SocketAddr::new(ip.parse().unwrap(), 4000), tls: None, permit: None, written: None }
     }
 
     fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {

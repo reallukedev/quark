@@ -225,6 +225,22 @@ impl Element {
 
     // ---------------------------------------------------------------- serializing
 
+    /// About how many bytes this takes, in memory or serialized (names, namespaces, attributes
+    /// and text, plus markup), without serializing it: cheap enough to run on every stanza a
+    /// queue takes, for byte budgets.
+    pub fn size_hint(&self) -> usize {
+        let attrs: usize = self.attrs.iter().map(|(k, v)| k.len() + v.len() + 4).sum();
+        let children: usize = self
+            .children
+            .iter()
+            .map(|c| match c {
+                Node::Element(e) => e.size_hint(),
+                Node::Text(t) => t.len(),
+            })
+            .sum();
+        2 * self.name.len() + self.ns.len() + 5 + attrs + children
+    }
+
     /// Serializes as a standalone document fragment, always declaring its namespace.
     pub fn to_xml(&self) -> String {
         let mut s = String::with_capacity(256);
@@ -814,6 +830,16 @@ mod tests {
         assert_eq!(el.child_text("body", ns::CLIENT).unwrap(), "hi & <bye>");
         assert_eq!(el.get_child("x", "urn:x").unwrap().get_child("y", "urn:x").unwrap().attr("a"), Some("'"));
         assert_eq!(Element::parse(&el.to_xml()).unwrap(), el);
+    }
+
+    #[test]
+    fn size_hint_follows_the_serialized_size() {
+        let small = Element::new("message", ns::CLIENT).attr_set("to", "a@b").text_child("body", ns::CLIENT, "hi");
+        let big = Element::new("message", ns::CLIENT).text_child("body", ns::CLIENT, "x".repeat(100_000));
+        for el in [&small, &big] {
+            let (hint, real) = (el.size_hint(), el.to_xml().len());
+            assert!(hint * 2 >= real && hint <= real * 2, "{hint} vs {real}");
+        }
     }
 
     #[test]

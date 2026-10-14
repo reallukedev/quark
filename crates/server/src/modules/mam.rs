@@ -279,9 +279,9 @@ pub fn strip_stanza_ids(msg: &mut Element, account: &Jid) {
     let bare = account.to_bare();
     msg.remove_children(|c| {
         c.is("stanza-id", ns::SID)
-            && c.attr("by").and_then(|b| Jid::parse(b).ok()).is_some_and(|b| {
-                b.to_bare() == bare || (b.node().is_none() && b.domain() == bare.domain())
-            })
+            && c.attr("by")
+                .and_then(|b| Jid::parse(b).ok())
+                .is_some_and(|b| b.to_bare() == bare || (b.node().is_none() && b.domain() == bare.domain()))
     });
 }
 

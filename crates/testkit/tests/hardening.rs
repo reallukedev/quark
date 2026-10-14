@@ -171,7 +171,8 @@ async fn control_characters_end_the_stream_and_go_nowhere() -> anyhow::Result<()
 
 #[tokio::test]
 async fn connections_signing_in_are_capped_per_address() -> anyhow::Result<()> {
-    let s = TestServer::start_with(Options { extra_config: "[limits]\nmax_unauthenticated_per_ip = 2\n".into(), ..Default::default() }).await?;
+    let s =
+        TestServer::start_with(Options { extra_config: "[limits]\nmax_unauthenticated_per_ip = 2\n".into(), ..Default::default() }).await?;
     s.add_user("alice", PW).await?;
     let first = Client::connect(s.c2s(), s.domain()).await?;
     let _second = Client::connect(s.c2s(), s.domain()).await?;

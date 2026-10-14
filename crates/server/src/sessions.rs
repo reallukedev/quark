@@ -9,6 +9,7 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 use quark_core::{Element, Jid};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::c2s::session::SessionMsg;
 
@@ -57,13 +58,79 @@ pub struct Flags {
     pub smid: Option<String>,
 }
 
+/// What waits in a session's queue for its actor, and how much it may hold: by count and by
+/// size, since a few hundred large stanzas (512 KiB from another server) weigh more than ten
+/// thousand chat messages.
+pub struct Queue {
+    stanzas: AtomicUsize,
+    bytes: AtomicUsize,
+    max_stanzas: usize,
+    max_bytes: usize,
+    /// Set once when the queue overflows: the actor watches it ahead of the queue, so the client
+    /// is cut off right away instead of after the backlog, and only once.
+    overflow: CancellationToken,
+}
+
+impl Queue {
+    pub fn new(max_stanzas: usize, max_bytes: usize) -> Arc<Queue> {
+        Arc::new(Queue {
+            stanzas: AtomicUsize::new(0),
+            bytes: AtomicUsize::new(0),
+            max_stanzas,
+            max_bytes,
+            overflow: CancellationToken::new(),
+        })
+    }
+
+    /// Takes room for a stanza of `size` bytes. False (and the overflow flag set) when full.
+    fn reserve(&self, size: usize) -> bool {
+        let n = self.stanzas.fetch_add(1, Ordering::Relaxed);
+        let b = self.bytes.fetch_add(size, Ordering::Relaxed);
+        if n >= self.max_stanzas || b.saturating_add(size) > self.max_bytes {
+            self.release(size);
+            self.cut_off();
+            return false;
+        }
+        true
+    }
+
+    /// Gives back the room of a stanza the actor took (or that never got queued).
+    pub fn release(&self, size: usize) {
+        self.stanzas.fetch_sub(1, Ordering::Relaxed);
+        self.bytes.fetch_sub(size, Ordering::Relaxed);
+    }
+
+    /// Resolves once the queue has overflowed.
+    pub async fn overflowed(&self) {
+        self.overflow.cancelled().await;
+    }
+
+    pub fn is_overflowed(&self) -> bool {
+        self.overflow.is_cancelled()
+    }
+
+    /// Marks the queue as overflowed, so the session closes the stream next.
+    pub fn cut_off(&self) {
+        self.overflow.cancel();
+    }
+
+    /// The most bytes the session may hold for its client.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// The most stanzas the session may hold for its client.
+    pub fn max_stanzas(&self) -> usize {
+        self.max_stanzas
+    }
+}
+
 pub struct SessionHandle {
     pub id: u64,
     pub jid: Jid,
     pub info: SessionInfo,
     tx: mpsc::UnboundedSender<SessionMsg>,
-    queued: Arc<AtomicUsize>,
-    max_queue: usize,
+    queue: Arc<Queue>,
     pub presence: Mutex<Presence>,
     pub flags: Mutex<Flags>,
 }
@@ -75,34 +142,29 @@ impl std::fmt::Debug for SessionHandle {
 }
 
 impl SessionHandle {
-    pub fn new(jid: Jid, info: SessionInfo, tx: mpsc::UnboundedSender<SessionMsg>, queued: Arc<AtomicUsize>, max_queue: usize) -> Self {
+    pub fn new(jid: Jid, info: SessionInfo, tx: mpsc::UnboundedSender<SessionMsg>, queue: Arc<Queue>) -> Self {
         static IDS: AtomicU64 = AtomicU64::new(1);
         SessionHandle {
             id: IDS.fetch_add(1, Ordering::Relaxed),
             jid,
             info,
             tx,
-            queued,
-            max_queue,
+            queue,
             presence: Mutex::new(Presence::default()),
             flags: Mutex::new(Flags::default()),
         }
     }
 
     /// Queues a stanza for the client. A client that stops reading is cut off once its queue
-    /// passes the limit, instead of letting memory grow.
+    /// passes the limits, instead of letting memory grow: the actor sees the overflow ahead of
+    /// anything queued and closes the stream (once, however many stanzas were refused).
     pub fn send(&self, el: Element) -> bool {
-        let n = self.queued.fetch_add(1, Ordering::Relaxed);
-        if n >= self.max_queue {
-            self.queued.fetch_sub(1, Ordering::Relaxed);
-            let _ = self.tx.send(SessionMsg::Close {
-                condition: "policy-violation",
-                text: Some("Too many stanzas waiting; the connection is too slow.".into()),
-            });
+        let size = el.size_hint();
+        if !self.queue.reserve(size) {
             return false;
         }
-        if self.tx.send(SessionMsg::Deliver(el)).is_err() {
-            self.queued.fetch_sub(1, Ordering::Relaxed);
+        if self.tx.send(SessionMsg::Deliver(el, size)).is_err() {
+            self.queue.release(size);
             return false;
         }
         true

@@ -742,7 +742,8 @@ impl ScramClient {
             "SCRAM-SHA-512" => "sha512",
             m => bail!("unknown mechanism {m}"),
         };
-        let nonce: String = rand::Rng::sample_iter(rand::thread_rng(), rand::distributions::Alphanumeric).take(24).map(char::from).collect();
+        let nonce: String =
+            rand::Rng::sample_iter(rand::thread_rng(), rand::distributions::Alphanumeric).take(24).map(char::from).collect();
         let (gs2, cb) =
             if plus { ("p=tls-exporter,,".to_string(), Some(exporter.context("-PLUS needs TLS 1.3")?)) } else { ("n,,".to_string(), None) };
         let client_first_bare = format!("n={user},r={nonce}");

@@ -3,7 +3,7 @@
 //! small bounded channel, so a client sending faster than we process is slowed at the socket.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,13 +13,17 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::server::{Host, Server};
-use crate::sessions::{SessionHandle, SessionInfo};
+use crate::sessions::{Queue, SessionHandle, SessionInfo};
 use crate::transport::{StanzaReader, StanzaWriter, StreamError};
 
 /// Messages to a session actor.
 pub enum SessionMsg {
-    Deliver(Element),
-    Close { condition: &'static str, text: Option<String> },
+    /// A stanza and the room it takes in the queue (its `size_hint`).
+    Deliver(Element, usize),
+    Close {
+        condition: &'static str,
+        text: Option<String>,
+    },
     Resume(Box<ResumeRequest>),
 }
 
@@ -74,15 +78,20 @@ struct Sm {
     in_h: u32,
     /// Stanzas sent to the client.
     out_h: u32,
-    /// Sent but not yet acknowledged, oldest first. The last one is number `out_h`.
-    unacked: VecDeque<Element>,
+    /// Sent but not yet acknowledged, oldest first, with their sizes. The last one is number
+    /// `out_h`.
+    unacked: VecDeque<(Element, usize)>,
+    /// What `unacked` weighs, in `size_hint` bytes.
+    unacked_bytes: usize,
     /// Sent stanzas since we last asked for an ack.
     since_request: u32,
+    /// We asked (`<r/>`) and the client hasn't answered yet: one question at a time.
+    request_pending: bool,
 }
 
 impl Sm {
     fn new(id: Option<String>) -> Self {
-        Sm { id, in_h: 0, out_h: 0, unacked: VecDeque::new(), since_request: 0 }
+        Sm { id, in_h: 0, out_h: 0, unacked: VecDeque::new(), unacked_bytes: 0, since_request: 0, request_pending: false }
     }
 
     /// Drops what the client confirmed. False when `h` is impossible (acks more than we sent).
@@ -93,13 +102,37 @@ impl Sm {
         if newly > pending {
             return false;
         }
-        self.unacked.drain(..newly as usize);
+        for (_, size) in self.unacked.drain(..newly as usize) {
+            self.unacked_bytes = self.unacked_bytes.saturating_sub(size);
+        }
+        true
+    }
+
+    /// Counts a stanza sent; true when it's time to ask for an ack: every `ACK_EVERY` stanzas,
+    /// but never while an earlier request is still unanswered.
+    fn sent(&mut self, el: Element, size: usize) -> bool {
+        self.out_h = self.out_h.wrapping_add(1);
+        self.unacked.push_back((el, size));
+        self.unacked_bytes += size;
+        self.since_request += 1;
+        self.request_due()
+    }
+
+    /// Whether to ask for an ack now (and if so, records that we did).
+    fn request_due(&mut self) -> bool {
+        if self.request_pending || self.since_request < ACK_EVERY {
+            return false;
+        }
+        self.since_request = 0;
+        self.request_pending = true;
         true
     }
 }
 
 const INBOUND_QUEUE: usize = 32;
 const CSI_BUFFER: usize = 256;
+/// Bytes of stanzas held back for a backgrounded app before they go out anyway.
+const CSI_BYTES: usize = 256 * 1024;
 /// How long without hearing from the client before we check on it, then give up.
 const IDLE_CHECK: Duration = Duration::from_secs(300);
 const IDLE_GIVE_UP: Duration = Duration::from_secs(120);
@@ -109,40 +142,72 @@ const ACK_EVERY: u32 = 5;
 const HIBERNATION_QUEUE: usize = 5_000;
 /// Writes between flushes while draining a burst.
 const DRAIN_BATCH: usize = 64;
-/// Longest a single write or flush may take. A client that stops reading (but keeps the TCP
-/// connection open) fills its socket buffer and would otherwise park the actor in a write
-/// forever, where neither new stanzas nor an admin's sign-out can reach it.
+/// Longest a write or flush may go without the connection taking a byte. A client that stops
+/// reading (but keeps the TCP connection open) fills its socket buffer and would otherwise park
+/// the actor in a write forever, where neither new stanzas nor an admin's sign-out can reach it.
+/// A slow link that keeps moving isn't stuck, however long a big stanza takes.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A writer whose writes and flushes fail with `TimedOut` after `limit`, so the session treats
-/// a stuck connection like a dropped one.
+/// A writer whose writes and flushes fail with `TimedOut` once the connection has taken nothing
+/// for `limit`, so the session treats a stuck connection like a dropped one. Transports that
+/// can't tell what the socket took get `limit` for each whole write instead.
 pub struct TimedWriter {
     inner: Box<dyn StanzaWriter>,
     limit: Duration,
+    progress: Option<Arc<AtomicU64>>,
 }
 
 impl TimedWriter {
     pub fn boxed(inner: Box<dyn StanzaWriter>, limit: Duration) -> Box<dyn StanzaWriter> {
-        Box::new(TimedWriter { inner, limit })
+        let progress = inner.progress();
+        Box::new(TimedWriter { inner, limit, progress })
     }
 }
 
-async fn timed(limit: Duration, f: impl std::future::Future<Output = std::io::Result<()>>) -> std::io::Result<()> {
-    tokio::time::timeout(limit, f)
-        .await
-        .unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the client stopped reading")))
+fn stuck() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "the client stopped reading")
+}
+
+async fn timed(
+    limit: Duration,
+    progress: Option<&AtomicU64>,
+    f: impl std::future::Future<Output = std::io::Result<()>>,
+) -> std::io::Result<()> {
+    let Some(progress) = progress else {
+        return tokio::time::timeout(limit, f).await.unwrap_or_else(|_| Err(stuck()));
+    };
+    tokio::pin!(f);
+    // Looked at a few times per `limit`, so a stall is noticed within a quarter of it.
+    let step = (limit / 4).max(Duration::from_millis(1));
+    let (mut seen, mut moved) = (progress.load(Ordering::Relaxed), Instant::now());
+    loop {
+        tokio::select! {
+            r = &mut f => return r,
+            _ = tokio::time::sleep(step) => {
+                let now = progress.load(Ordering::Relaxed);
+                if now != seen {
+                    (seen, moved) = (now, Instant::now());
+                } else if moved.elapsed() >= limit {
+                    return Err(stuck());
+                }
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl StanzaWriter for TimedWriter {
+    fn progress(&self) -> Option<Arc<AtomicU64>> {
+        self.progress.clone()
+    }
     async fn write(&mut self, el: &Element) -> std::io::Result<()> {
-        timed(self.limit, self.inner.write(el)).await
+        timed(self.limit, self.progress.as_deref(), self.inner.write(el)).await
     }
     async fn flush(&mut self) -> std::io::Result<()> {
-        timed(self.limit, self.inner.flush()).await
+        timed(self.limit, self.progress.as_deref(), self.inner.flush()).await
     }
     async fn keepalive(&mut self) -> std::io::Result<()> {
-        timed(self.limit, self.inner.keepalive()).await
+        timed(self.limit, self.progress.as_deref(), self.inner.keepalive()).await
     }
     async fn close(&mut self, err: Option<&StreamError>) {
         // Transports bound their own close; this bounds it again for any that don't.
@@ -153,9 +218,9 @@ impl StanzaWriter for TimedWriter {
 /// Registers and runs a new session. Returns its handle once it's in the registry.
 pub fn spawn(s: Start) -> Arc<SessionHandle> {
     let (tx, rx) = mpsc::unbounded_channel();
-    let queued = Arc::new(AtomicUsize::new(0));
     let cfg = s.srv.config();
-    let handle = Arc::new(SessionHandle::new(s.jid.clone(), s.info, tx, queued.clone(), cfg.limits.max_queue));
+    let queue = Queue::new(cfg.limits.max_queue, cfg.limits.max_queue_bytes);
+    let handle = Arc::new(SessionHandle::new(s.jid.clone(), s.info, tx, queue.clone()));
     {
         let mut f = handle.flags.lock();
         f.carbons = s.carbons;
@@ -175,12 +240,13 @@ pub fn spawn(s: Start) -> Arc<SessionHandle> {
         host: s.host,
         handle: handle.clone(),
         rx,
-        queued,
+        queue,
         inbound: Some(in_rx),
         writer: Some(TimedWriter::boxed(s.writer, WRITE_TIMEOUT)),
         write_failed: false,
         sm,
         csi: Vec::new(),
+        csi_bytes: 0,
         hibernate_until: None,
         last_heard: Instant::now(),
         checking_since: None,
@@ -246,7 +312,7 @@ struct Actor {
     host: Arc<Host>,
     handle: Arc<SessionHandle>,
     rx: mpsc::UnboundedReceiver<SessionMsg>,
-    queued: Arc<AtomicUsize>,
+    queue: Arc<Queue>,
     inbound: Option<mpsc::Receiver<ReaderEvent>>,
     writer: Option<Box<dyn StanzaWriter>>,
     /// A write or flush failed (or timed out): the connection is as good as gone even though
@@ -254,7 +320,8 @@ struct Actor {
     write_failed: bool,
     sm: Option<Sm>,
     /// Stanzas held back while the app is in the background (CSI, XEP-0352).
-    csi: Vec<Element>,
+    csi: Vec<(Element, usize)>,
+    csi_bytes: usize,
     hibernate_until: Option<Instant>,
     last_heard: Instant,
     /// When we last asked a quiet client whether it's still there.
@@ -263,6 +330,8 @@ struct Actor {
 }
 
 enum Next {
+    /// The queue overflowed (see `Queue`).
+    Overflow,
     Msg(Option<SessionMsg>),
     Inbound(Option<ReaderEvent>),
     Expired,
@@ -298,12 +367,23 @@ impl Actor {
         loop {
             let next = tokio::select! {
                 biased;
+                // Ahead of the queue: a client too slow for what's waiting is cut off now.
+                _ = self.queue.overflowed() => Next::Overflow,
                 m = self.rx.recv() => Next::Msg(m),
                 i = recv_opt(&mut self.inbound) => Next::Inbound(i),
                 _ = sleep_opt(self.hibernate_until) => Next::Expired,
                 _ = tick.tick() => Next::Tick,
             };
             let end = match next {
+                Next::Overflow => {
+                    // No flush first: what's buffered is what the client isn't taking. The
+                    // transport bounds the close itself.
+                    if let Some(mut w) = self.writer.take() {
+                        w.close(Some(&StreamError::with_text("policy-violation", "Too many stanzas waiting; the connection is too slow.")))
+                            .await;
+                    }
+                    Some(End::Final)
+                }
                 Next::Msg(None) => Some(End::Final),
                 Next::Msg(Some(m)) => self.on_msg(m).await,
                 Next::Inbound(None) => self.lost(),
@@ -320,7 +400,7 @@ impl Actor {
             } else {
                 // Drain what's ready without waiting, then flush once: one write for a burst.
                 let mut n = 0;
-                while n < DRAIN_BATCH {
+                while n < DRAIN_BATCH && !self.queue.is_overflowed() {
                     let Ok(m) = self.rx.try_recv() else { break };
                     n += 1;
                     let end = self.on_msg(m).await;
@@ -374,9 +454,9 @@ impl Actor {
 
     async fn on_msg(&mut self, m: SessionMsg) -> Option<End> {
         match m {
-            SessionMsg::Deliver(el) => {
-                self.queued.fetch_sub(1, Ordering::Relaxed);
-                self.deliver(el).await
+            SessionMsg::Deliver(el, size) => {
+                self.queue.release(size);
+                self.deliver(el, size).await
             }
             SessionMsg::Close { condition, text } => {
                 if let Some(w) = self.writer.as_mut() {
@@ -425,6 +505,11 @@ impl Actor {
                 let h = el.attr("h").and_then(|h| h.parse::<u32>().ok());
                 let sm = self.sm.as_mut()?;
                 if h.is_some_and(|h| sm.ack(h)) {
+                    // Our question is answered; ask again if enough went out meanwhile.
+                    sm.request_pending = false;
+                    if sm.request_due() {
+                        self.write_raw(&Element::new("r", ns::SM)).await;
+                    }
                     return None;
                 }
                 // XEP-0198 §5: say what was claimed and what was really sent.
@@ -494,7 +579,8 @@ impl Actor {
             self.checking_since = Some(Instant::now());
             // A client answers either, so a dead connection is noticed even through NAT boxes
             // that keep the TCP connection looking alive.
-            let probe = if self.sm.is_some() {
+            let probe = if let Some(sm) = self.sm.as_mut() {
+                sm.request_pending = true;
                 Element::new("r", ns::SM)
             } else {
                 quark_core::stanza::iq(
@@ -511,60 +597,78 @@ impl Actor {
     }
 
     /// A stanza for the client: held back while the app is in the background if it can wait.
-    async fn deliver(&mut self, el: Element) -> Option<End> {
+    async fn deliver(&mut self, el: Element, size: usize) -> Option<End> {
         if self.handle.flags.lock().inactive && !urgent(&el) {
             if el.name() == "presence" {
                 // Only the latest presence from each contact matters.
                 let from = el.attr("from").map(str::to_string);
-                self.csi.retain(|x| x.name() != "presence" || x.attr("from").map(str::to_string) != from);
+                let mut dropped = 0;
+                self.csi.retain(|(x, n)| {
+                    let keep = x.name() != "presence" || x.attr("from").map(str::to_string) != from;
+                    if !keep {
+                        dropped += n;
+                    }
+                    keep
+                });
+                self.csi_bytes -= dropped;
             }
-            self.csi.push(el);
-            if self.csi.len() >= CSI_BUFFER {
+            self.csi.push((el, size));
+            self.csi_bytes += size;
+            if self.csi.len() >= CSI_BUFFER || self.csi_bytes >= CSI_BYTES {
                 self.flush_csi().await;
             }
-            return None;
+            return self.over_budget();
         }
         self.flush_csi().await;
-        self.send(el).await;
-        // A session nobody resumes can't hoard messages forever.
-        if self.writer.is_none() && self.sm.as_ref().is_some_and(|s| s.unacked.len() > HIBERNATION_QUEUE) {
+        self.send(el, size).await;
+        self.over_budget()
+    }
+
+    /// Ends a session that holds more for its client than the queue limits allow: unconfirmed
+    /// stanzas of a live client that doesn't acknowledge them, or of a dropped connection nobody
+    /// resumes (which can't hoard messages forever; they go back to the account).
+    fn over_budget(&mut self) -> Option<End> {
+        let sm = self.sm.as_ref()?;
+        let (count, bytes) = (sm.unacked.len(), sm.unacked_bytes);
+        let too_many = count > self.queue.max_stanzas() || bytes > self.queue.max_bytes();
+        if self.writer.is_none() && (too_many || count > HIBERNATION_QUEUE) {
             return Some(End::Final);
+        }
+        if too_many {
+            tracing::debug!(jid = %self.handle.jid, count, bytes, "client isn't acknowledging what it gets; closing");
+            // Handled like an overflowing queue, ahead of anything else waiting.
+            self.queue.cut_off();
         }
         None
     }
 
     async fn flush_csi(&mut self) {
-        for el in std::mem::take(&mut self.csi) {
-            self.send(el).await;
+        self.csi_bytes = 0;
+        for (el, size) in std::mem::take(&mut self.csi) {
+            self.send(el, size).await;
         }
     }
 
     /// Sends a counted stanza (kept for resending until acked when SM is on).
-    async fn send(&mut self, el: Element) {
+    async fn send(&mut self, el: Element, size: usize) {
         self.srv.count_out();
-        let mut ask = false;
-        if let Some(sm) = self.sm.as_mut() {
-            sm.out_h = sm.out_h.wrapping_add(1);
-            sm.since_request += 1;
-            if sm.since_request >= ACK_EVERY {
-                sm.since_request = 0;
-                ask = true;
-            }
-            self.write_raw(&el).await;
-            if let Some(sm) = self.sm.as_mut() {
-                sm.unacked.push_back(el);
-            }
-        } else {
-            self.write_raw(&el).await;
-        }
+        self.write_raw(&el).await;
+        let ask = self.sm.as_mut().is_some_and(|sm| sm.sent(el, size));
         if ask {
             self.write_raw(&Element::new("r", ns::SM)).await;
         }
     }
 
+    /// Writes, giving up (as for a failed write) if the queue overflows meanwhile: a slow client
+    /// is cut off then, not after the write it's slowly taking.
     async fn write_raw(&mut self, el: &Element) {
         if let Some(w) = self.writer.as_mut() {
-            if w.write(el).await.is_err() {
+            let r = tokio::select! {
+                biased;
+                _ = self.queue.overflowed() => Err(stuck()),
+                r = w.write(el) => r,
+            };
+            if r.is_err() {
                 self.writer = None;
                 self.write_failed = true;
             }
@@ -573,7 +677,12 @@ impl Actor {
 
     async fn flush(&mut self) {
         if let Some(w) = self.writer.as_mut() {
-            if w.flush().await.is_err() {
+            let r = tokio::select! {
+                biased;
+                _ = self.queue.overflowed() => Err(stuck()),
+                r = w.flush() => r,
+            };
+            if r.is_err() {
                 self.writer = None;
                 self.write_failed = true;
             }
@@ -597,7 +706,10 @@ impl Actor {
             old.close(Some(&StreamError::with_text("conflict", "Resumed from another connection."))).await;
         }
         let resumed = Element::new("resumed", ns::SM).attr_set("h", sm.in_h.to_string()).attr_opt("previd", sm.id.clone());
-        let replay: Vec<Element> = sm.unacked.iter().cloned().collect();
+        let replay: Vec<Element> = sm.unacked.iter().map(|(el, _)| el.clone()).collect();
+        // Any question asked on the old connection died with it.
+        sm.request_pending = false;
+        sm.since_request = u32::try_from(replay.len()).unwrap_or(u32::MAX);
         let mut w = TimedWriter::boxed(req.writer, WRITE_TIMEOUT);
         let first = match req.wrap {
             Some(success) => success.child(resumed),
@@ -639,7 +751,7 @@ impl Actor {
         // Messages the client never confirmed go to the account's other devices or offline storage.
         let unacked = self.sm.take().map(|s| s.unacked).unwrap_or_default();
         let held = std::mem::take(&mut self.csi);
-        for el in unacked.into_iter().chain(held) {
+        for (el, _) in unacked.into_iter().chain(held) {
             if el.name() == "message" && el.has_child("body", ns::CLIENT) && matches!(el.attr("type"), None | Some("chat" | "normal")) {
                 crate::router::redeliver(&self.srv, &self.host, &self.handle.jid, el).await;
             }
@@ -718,16 +830,17 @@ mod tests {
     fn ack_drops_confirmed_stanzas() {
         let mut sm = Sm::new(None);
         for _ in 0..5 {
-            sm.out_h += 1;
-            sm.unacked.push_back(msg());
+            sm.sent(msg(), 10);
         }
+        assert_eq!(sm.unacked_bytes, 50);
         assert!(sm.ack(3));
-        assert_eq!(sm.unacked.len(), 2);
+        assert_eq!((sm.unacked.len(), sm.unacked_bytes), (2, 20));
         assert!(sm.ack(3));
         assert_eq!(sm.unacked.len(), 2);
         assert!(!sm.ack(9));
         assert!(sm.ack(5));
         assert!(sm.unacked.is_empty());
+        assert_eq!(sm.unacked_bytes, 0);
     }
 
     #[test]
@@ -735,11 +848,24 @@ mod tests {
         let mut sm = Sm::new(None);
         sm.out_h = u32::MAX - 1;
         for _ in 0..3 {
-            sm.out_h = sm.out_h.wrapping_add(1);
-            sm.unacked.push_back(msg());
+            sm.sent(msg(), 1);
         }
         assert!(sm.ack(0));
         assert_eq!(sm.unacked.len(), 1);
+    }
+
+    #[test]
+    fn acks_are_asked_for_one_at_a_time() {
+        let mut sm = Sm::new(None);
+        let asks: Vec<bool> = (0..20).map(|_| sm.sent(msg(), 1)).collect();
+        assert_eq!(asks.iter().filter(|a| **a).count(), 1, "one question while it's unanswered: {asks:?}");
+        assert!(asks[ACK_EVERY as usize - 1]);
+        // The answer comes: enough went out meanwhile to ask again right away, then not before
+        // another ACK_EVERY.
+        assert!(sm.ack(5));
+        sm.request_pending = false;
+        assert!(sm.request_due());
+        assert!(!(0..ACK_EVERY - 1).any(|_| sm.sent(msg(), 1)));
     }
 
     /// A connection whose writes never finish (a client that stopped reading) and that never
@@ -770,33 +896,168 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_client_that_stops_reading_is_dropped() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("quark.toml");
-        let text = format!(
-            "[server]\ndata_dir = {:?}\n[tls]\ncert_dir = {:?}\n[[host]]\ndomain = \"a.test\"\n",
-            dir.path().join("data"),
-            dir.path().join("certs")
-        );
-        std::fs::write(&path, text).unwrap();
-        let srv = crate::run::build(crate::run::load_config(&path).unwrap()).unwrap();
-        let host = srv.host("a.test").unwrap();
-        let jid = Jid::parse("sam@a.test/phone").unwrap();
+    /// A connection that takes 100 bytes a second: slow, but moving.
+    struct Slow {
+        written: Arc<AtomicU64>,
+        closes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl StanzaWriter for Slow {
+        fn progress(&self) -> Option<Arc<AtomicU64>> {
+            Some(self.written.clone())
+        }
+        async fn write(&mut self, el: &Element) -> std::io::Result<()> {
+            for _ in 0..el.size_hint().div_ceil(100) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                self.written.fetch_add(100, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+        async fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn keepalive(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn close(&mut self, _err: Option<&StreamError>) {
+            self.closes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A connection that takes everything at once and has dropped on the reading side.
+    struct Dropped;
+
+    #[async_trait::async_trait]
+    impl StanzaWriter for Dropped {
+        async fn write(&mut self, _el: &Element) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn keepalive(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn close(&mut self, _err: Option<&StreamError>) {}
+    }
+
+    #[async_trait::async_trait]
+    impl StanzaReader for Dropped {
+        async fn read(&mut self) -> Result<Option<StreamEvent>, XmlError> {
+            Ok(None)
+        }
+        fn bytes_read(&self) -> u64 {
+            0
+        }
+    }
+
+    fn start(srv: &Arc<Server>, writer: Box<dyn StanzaWriter>, reader: Box<dyn StanzaReader>, sm: Option<bool>) -> Arc<SessionHandle> {
         let info = SessionInfo { ip: None, secure: true, since: 0, transport: "tcp", client: None };
-        let start = Start {
+        spawn(Start {
             srv: srv.clone(),
-            host,
-            jid: jid.clone(),
+            host: srv.host("a.test").unwrap(),
+            jid: Jid::parse("sam@a.test/phone").unwrap(),
             info,
-            writer: Box::new(Stuck),
-            reader: Box::new(Stuck),
+            writer,
+            reader,
             prelude: Vec::new(),
             carbons: false,
             inactive: false,
-            sm: None,
-        };
-        let handle = spawn(start);
+            sm,
+        })
+    }
+
+    fn body(n: usize) -> Element {
+        Element::new("message", ns::CLIENT).text_child("body", ns::CLIENT, "x".repeat(n))
+    }
+
+    /// Waits (in paused time) up to `secs` for the session to leave the registry.
+    async fn gone_within(srv: &Server, secs: u64) -> bool {
+        let jid = Jid::parse("sam@a.test/phone").unwrap();
+        for _ in 0..secs * 10 {
+            if srv.sessions.get(&jid).is_none() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        srv.sessions.get(&jid).is_none()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_link_that_keeps_moving_is_not_cut_off() {
+        let written = Arc::new(AtomicU64::new(0));
+        let w = Slow { written: written.clone(), closes: Arc::default() };
+        // Ten times the write timeout for one stanza, a byte budget at a time.
+        let n = usize::try_from(WRITE_TIMEOUT.as_secs() * 10 * 100).unwrap();
+        let mut t = TimedWriter::boxed(Box::new(w), WRITE_TIMEOUT);
+        t.write(&body(n)).await.expect("a slow write that keeps moving finishes");
+        assert!(written.load(Ordering::Relaxed) as usize >= n);
+        // One that takes nothing for the whole timeout fails, however it's reported.
+        let still = AtomicU64::new(0);
+        let begun = Instant::now();
+        let r = timed(WRITE_TIMEOUT, Some(&still), std::future::pending()).await;
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(begun.elapsed() >= WRITE_TIMEOUT && begun.elapsed() <= WRITE_TIMEOUT + WRITE_TIMEOUT / 4 + Duration::from_millis(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_overflowing_queue_cuts_the_client_off_at_once_and_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = crate::run::test_server(dir.path(), "[limits]\nmax_queue = 20\nmax_queue_bytes = 1000000\n");
+        let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = start(&srv, Box::new(Slow { written: Arc::default(), closes: closes.clone() }), Box::new(Stuck), None);
+        // Each takes the slow link a second; far more than the queue holds.
+        let taken = (0..200).filter(|_| h.send(body(10))).count();
+        assert!(taken <= 22, "the queue refused what didn't fit: {taken}");
+        // Not after working through the 20 queued (20 seconds). The write it was in the middle
+        // of is abandoned, so the connection is dropped without a stream error after it.
+        assert!(gone_within(&srv, 3).await, "cut off at once");
+        assert!(closes.load(Ordering::Relaxed) <= 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_queue_has_a_byte_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = crate::run::test_server(dir.path(), "[limits]\nmax_queue_bytes = 100000\n");
+        let h = start(&srv, Box::new(Slow { written: Arc::default(), closes: Arc::default() }), Box::new(Stuck), None);
+        // Ten stanzas of 20 KB: the count limit (10,000) is far off, the bytes aren't.
+        let taken = (0..10).filter(|_| h.send(body(20_000))).count();
+        assert!((4..=6).contains(&taken), "{taken} of 10 taken");
+        assert!(gone_within(&srv, 3).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hibernating_session_holds_only_so_many_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = crate::run::test_server(dir.path(), "[limits]\nmax_queue_bytes = 100000\n");
+        let h = start(&srv, Box::new(Dropped), Box::new(Dropped), Some(true));
+        let jid = Jid::parse("sam@a.test/phone").unwrap();
+        for _ in 0..50 {
+            if h.flags.lock().hibernating {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(h.flags.lock().hibernating, "the connection dropped; waiting to be resumed");
+        for _ in 0..4 {
+            h.send(body(20_000));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(srv.sessions.get(&jid).is_some(), "80 KB waits for the client");
+        for _ in 0..2 {
+            h.send(body(20_000));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(gone_within(&srv, 3).await, "past the budget the session ends");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_stops_reading_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = crate::run::test_server(dir.path(), "");
+        let jid = Jid::parse("sam@a.test/phone").unwrap();
+        let handle = start(&srv, Box::new(Stuck), Box::new(Stuck), None);
         handle.send(Element::new("message", ns::CLIENT).text_child("body", ns::CLIENT, "hi"));
         tokio::time::sleep(WRITE_TIMEOUT - Duration::from_secs(1)).await;
         assert!(srv.sessions.get(&jid).is_some(), "still trying to write");

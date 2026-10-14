@@ -4,6 +4,7 @@
 use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -54,6 +55,11 @@ pub trait StanzaReader: Send {
 /// The sending half. `write` may buffer; `flush` sends.
 #[async_trait]
 pub trait StanzaWriter: Send {
+    /// Bytes the connection has taken so far, when the transport can tell: a slow link that
+    /// keeps moving is then told from a stuck one (see `c2s::session::TimedWriter`).
+    fn progress(&self) -> Option<Arc<AtomicU64>> {
+        None
+    }
     async fn write(&mut self, el: &Element) -> io::Result<()>;
     async fn flush(&mut self) -> io::Result<()>;
     /// Sends a keepalive the client ignores (whitespace on TCP).
@@ -81,6 +87,62 @@ pub trait Transport: Send {
     fn peer(&self) -> Option<IpAddr>;
     fn kind(&self) -> &'static str;
     fn split(self: Box<Self>) -> (Box<dyn StanzaReader>, Box<dyn StanzaWriter>);
+}
+
+/// A connection that counts the bytes written to it (taken by the socket, not just buffered).
+pub struct Counted<T> {
+    inner: T,
+    written: Arc<AtomicU64>,
+}
+
+impl<T> Counted<T> {
+    pub fn new(inner: T, written: Arc<AtomicU64>) -> Self {
+        Counted { inner, written }
+    }
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+    fn count(&self, r: &Poll<io::Result<usize>>) {
+        if let Poll::Ready(Ok(n)) = r {
+            self.written.fetch_add(*n as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Counted<T> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Counted<T> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let me = self.get_mut();
+        let r = Pin::new(&mut me.inner).poll_write(cx, buf);
+        me.count(&r);
+        r
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+    fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[io::IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        let me = self.get_mut();
+        let r = Pin::new(&mut me.inner).poll_write_vectored(cx, bufs);
+        me.count(&r);
+        r
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+type TcpOut = BufWriter<Counted<WriteHalf<Io>>>;
+
+fn tcp_out(w: WriteHalf<Io>, written: &Arc<AtomicU64>) -> TcpOut {
+    BufWriter::with_capacity(8 * 1024, Counted::new(w, written.clone()))
 }
 
 /// TCP, optionally upgraded to TLS.
@@ -134,7 +196,9 @@ impl AsyncWrite for Io {
 /// An XML stream over TCP: client-to-server or server-to-server.
 pub struct TcpTransport {
     reader: Option<StreamReader<ReadHalf<Io>>>,
-    writer: Option<BufWriter<WriteHalf<Io>>>,
+    writer: Option<TcpOut>,
+    /// Bytes the socket has taken, for the session's write timeout.
+    written: Arc<AtomicU64>,
     peer: Option<IpAddr>,
     secure: bool,
     cb: ChannelBindings,
@@ -158,11 +222,13 @@ impl TcpTransport {
         let peer = tcp.peer_addr().ok().map(|a| a.ip().to_canonical());
         tune_socket(&tcp);
         let (r, w) = tokio::io::split(Io::Plain(tcp));
+        let written = Arc::default();
         let mut reader = StreamReader::new(r, max_stanza);
         reader.server_ns = stream_ns == ns::SERVER;
         TcpTransport {
             reader: Some(reader),
-            writer: Some(BufWriter::with_capacity(8 * 1024, w)),
+            writer: Some(tcp_out(w, &written)),
+            written,
             peer,
             secure: false,
             cb: ChannelBindings::default(),
@@ -180,11 +246,13 @@ impl TcpTransport {
         tune_socket(tls.get_ref().0);
         let (sni, _, cb) = crate::tls::session_facts(&tls, &certs);
         let (r, w) = tokio::io::split(Io::Tls(Box::new(tls)));
+        let written = Arc::default();
         let mut reader = StreamReader::new(r, max_stanza);
         reader.server_ns = stream_ns == ns::SERVER;
         TcpTransport {
             reader: Some(reader),
-            writer: Some(BufWriter::with_capacity(8 * 1024, w)),
+            writer: Some(tcp_out(w, &written)),
+            written,
             peer,
             secure: true,
             cb,
@@ -196,7 +264,7 @@ impl TcpTransport {
         }
     }
 
-    fn writer(&mut self) -> io::Result<&mut BufWriter<WriteHalf<Io>>> {
+    fn writer(&mut self) -> io::Result<&mut TcpOut> {
         self.writer.as_mut().ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream closed"))
     }
 }
@@ -262,7 +330,7 @@ impl Transport for TcpTransport {
             // Anything sent before the handshake would be injected into the encrypted stream.
             return Err(io::Error::new(io::ErrorKind::InvalidData, "data after <starttls/>"));
         }
-        let tcp = match reader.into_inner().unsplit(writer.into_inner()) {
+        let tcp = match reader.into_inner().unsplit(writer.into_inner().into_inner()) {
             Io::Plain(tcp) => tcp,
             Io::Tls(_) => return Err(io::Error::other("already encrypted")),
         };
@@ -275,7 +343,7 @@ impl Transport for TcpTransport {
         let mut reader = StreamReader::new(r, self.max_stanza);
         reader.server_ns = self.stream_ns == ns::SERVER;
         self.reader = Some(reader);
-        self.writer = Some(BufWriter::with_capacity(8 * 1024, w));
+        self.writer = Some(tcp_out(w, &self.written));
         Ok(())
     }
 
@@ -300,7 +368,7 @@ impl Transport for TcpTransport {
         let reader = me.reader.map(|r| Box::new(TcpReader(r)) as Box<dyn StanzaReader>).unwrap_or_else(|| Box::new(Closed));
         let writer = me
             .writer
-            .map(|w| Box::new(TcpWriter { w, stream_ns: me.stream_ns }) as Box<dyn StanzaWriter>)
+            .map(|w| Box::new(TcpWriter { w, stream_ns: me.stream_ns, written: me.written }) as Box<dyn StanzaWriter>)
             .unwrap_or_else(|| Box::new(Closed));
         (reader, writer)
     }
@@ -330,12 +398,16 @@ impl StanzaReader for TcpReader {
 }
 
 pub struct TcpWriter {
-    w: BufWriter<WriteHalf<Io>>,
+    w: TcpOut,
     stream_ns: &'static str,
+    written: Arc<AtomicU64>,
 }
 
 #[async_trait]
 impl StanzaWriter for TcpWriter {
+    fn progress(&self) -> Option<Arc<AtomicU64>> {
+        Some(self.written.clone())
+    }
     async fn write(&mut self, el: &Element) -> io::Result<()> {
         let xml = el.to_stream_xml(self.stream_ns);
         self.w.write_all(xml.as_bytes()).await

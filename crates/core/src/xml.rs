@@ -14,6 +14,9 @@ use tokio::io::{AsyncRead, BufReader, ReadBuf};
 
 const READ_AHEAD: u64 = 16 * 1024;
 
+/// The deepest nesting accepted inside one stanza. Real stanzas stay under 20 levels.
+pub const MAX_DEPTH: usize = 64;
+
 use crate::ns;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -306,7 +309,12 @@ impl Element {
             let (res, ev) = r.read_resolved_event().map_err(XmlError::from)?;
             let ens = element_ns(&res);
             match ev {
-                Event::Start(e) => stack.push(start_element(ens, &e)?),
+                Event::Start(e) => {
+                    if stack.len() >= MAX_DEPTH {
+                        return Err(XmlError::TooDeep);
+                    }
+                    stack.push(start_element(ens, &e)?)
+                }
                 Event::Empty(e) => {
                     let el = start_element(ens, &e)?;
                     match stack.last_mut() {
@@ -400,6 +408,10 @@ pub enum XmlError {
     Restricted,
     #[error("stanza too big")]
     TooBig,
+    /// Elements nested deeper than [`MAX_DEPTH`]: nothing legitimate does that, and deep trees
+    /// would overflow the stack when dropped or copied.
+    #[error("elements nested too deeply")]
+    TooDeep,
     /// The stream header is `<stream>` in the wrong namespace.
     #[error("wrong stream namespace")]
     InvalidNamespace,
@@ -646,6 +658,9 @@ impl<R: AsyncRead + Unpin> StreamReader<R> {
                     if self.server_ns && el.ns == ns::SERVER {
                         el.ns = ns::CLIENT.to_string();
                     }
+                    if self.stack.len() >= MAX_DEPTH {
+                        return Err(XmlError::TooDeep);
+                    }
                     self.stack.push(el);
                 }
                 Event::Empty(e) => {
@@ -723,6 +738,14 @@ mod tests {
         let el = Element::parse("<a xmlns='u:1' xmlns:p='u:2'><p:b/><c/></a>").unwrap();
         assert!(el.has_child("b", "u:2"));
         assert!(el.has_child("c", "u:1"));
+    }
+
+    #[test]
+    fn deep_nesting_is_refused() {
+        let deep = format!("{}{}", "<a xmlns='x'>".repeat(MAX_DEPTH + 1), "</a>".repeat(MAX_DEPTH + 1));
+        assert!(matches!(Element::parse(&deep), Err(XmlError::TooDeep)));
+        let ok = format!("{}{}", "<a xmlns='x'>".repeat(MAX_DEPTH), "</a>".repeat(MAX_DEPTH));
+        assert!(Element::parse(&ok).is_ok());
     }
 
     #[test]

@@ -264,7 +264,7 @@ impl From<XmlError> for StreamFailure {
     fn from(e: XmlError) -> Self {
         match e {
             XmlError::Io(e) => StreamFailure::Io(e),
-            XmlError::TooBig => StreamFailure::Local(StreamError::with_text("policy-violation", "Stanza too big.")),
+            XmlError::TooBig | XmlError::TooDeep => StreamFailure::Local(StreamError::with_text("policy-violation", "Stanza too big.")),
             XmlError::Restricted => StreamFailure::Local(StreamError::new("restricted-xml")),
             XmlError::Malformed(_) => StreamFailure::Local(StreamError::new("not-well-formed")),
             XmlError::InvalidNamespace => StreamFailure::Local(StreamError::new("invalid-namespace")),

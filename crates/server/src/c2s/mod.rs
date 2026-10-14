@@ -250,7 +250,7 @@ impl Negotiation {
                     Err(e) => e,
                 },
                 Ok(None) | Err(XmlError::Io(_)) => None,
-                Err(XmlError::TooBig) => Some(StreamError::new("policy-violation")),
+                Err(XmlError::TooBig | XmlError::TooDeep) => Some(StreamError::new("policy-violation")),
                 Err(XmlError::Restricted) => Some(StreamError::new("restricted-xml")),
                 Err(XmlError::InvalidNamespace) => Some(StreamError::new("invalid-namespace")),
                 Err(XmlError::Malformed(_)) => Some(StreamError::new("not-well-formed")),

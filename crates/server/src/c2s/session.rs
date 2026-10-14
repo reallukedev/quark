@@ -176,7 +176,9 @@ pub(super) async fn read_loop(mut r: Box<dyn StanzaReader>, tx: mpsc::Sender<Rea
             Ok(Some(StreamEvent::Open { .. })) => ReaderEvent::Gone(Gone::Error(StreamError::new("invalid-xml"))),
             Ok(None) => ReaderEvent::Gone(Gone::Dropped),
             Err(XmlError::Io(_)) => ReaderEvent::Gone(Gone::Dropped),
-            Err(XmlError::TooBig) => ReaderEvent::Gone(Gone::Error(StreamError::with_text("policy-violation", "Stanza too big."))),
+            Err(XmlError::TooBig | XmlError::TooDeep) => {
+                ReaderEvent::Gone(Gone::Error(StreamError::with_text("policy-violation", "Stanza too big.")))
+            }
             Err(XmlError::Restricted) => ReaderEvent::Gone(Gone::Error(StreamError::new("restricted-xml"))),
             Err(XmlError::Malformed(_) | XmlError::InvalidNamespace) => ReaderEvent::Gone(Gone::Error(StreamError::new("not-well-formed"))),
         };

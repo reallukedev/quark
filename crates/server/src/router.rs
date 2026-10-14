@@ -55,6 +55,9 @@ pub async fn from_client(srv: &Arc<Server>, host: &Arc<Host>, session: &Arc<Sess
                 }
             }
             carbon_sent(srv, session, &to, &el);
+            // The sender's archive id was for its own devices (the sent carbons), not the recipient.
+            let mine = me.to_bare().to_string();
+            crate::modules::mam::strip_stanza_ids(&mut el, &mine);
         }
         _ => {}
     }
@@ -91,6 +94,10 @@ impl Server {
 }
 
 async fn dispatch(srv: &Arc<Server>, from: Jid, to: Jid, el: Element, session: Option<&Arc<SessionHandle>>) {
+    // Nothing an account sends, or the server sends for it (presence, PEP), reaches someone it blocked.
+    if !crate::modules::blocking::outbound_allowed(srv, &from, &to, &el).await {
+        return;
+    }
     match srv.resolve(to.domain()) {
         Dest::Local(host) => local(srv, &host, from, to, el, session).await,
         Dest::Component(c) => c.handle(srv, from, to, el).await,
@@ -256,10 +263,30 @@ pub fn carbon_eligible(msg: &Element) -> bool {
     {
         return false;
     }
+    // XEP-0280 §6: chat messages, and normal ones with a body or the payloads of an IM
+    // conversation (receipts, markers, calls, reactions, retractions).
     kind == "chat"
         || msg.has_child("body", ns::CLIENT)
         || msg.has_child("encrypted", ns::OMEMO)
         || msg.has_child("encrypted", "urn:xmpp:omemo:2")
+        || msg.child_ns(ns::RECEIPTS).is_some()
+        || msg.child_ns(ns::CHAT_MARKERS).is_some()
+        || msg.child_ns("urn:xmpp:jingle-message:0").is_some()
+        || msg.has_child("reactions", "urn:xmpp:reactions:0")
+        || msg.has_child("retract", ns::RETRACT)
+}
+
+/// Whether a message delivered to one of the account's devices is copied to the others.
+fn carbon_received_eligible(from: &Jid, to: &Jid, msg: &Element) -> bool {
+    // A group chat's private message goes to the one device that joined (XEP-0280 §6.1).
+    if to.is_full() && msg.has_child("x", ns::MUC_USER) {
+        return false;
+    }
+    // Bounces of messages sent to a bare JID, so every device learns it didn't arrive.
+    if msg.attr("type") == Some("error") {
+        return from.is_bare() && !msg.has_child("private", ns::CARBONS) && !msg.has_child("no-copy", ns::HINTS);
+    }
+    carbon_eligible(msg)
 }
 
 fn carbon(direction: &str, account: &Jid, to: &Jid, msg: &Element) -> Element {
@@ -309,10 +336,9 @@ pub async fn deliver_message(srv: &Arc<Server>, host: &Arc<Host>, from: &Jid, to
     // To a resource that's online: that session, plus carbons to the others.
     if to.resource().is_some() {
         if let Some(s) = srv.sessions.get(to) {
-            let eligible = carbon_eligible(&msg);
-            if eligible {
+            if carbon_received_eligible(from, to, &msg) {
                 for o in srv.sessions.of(&bare) {
-                    if o.id != s.id && o.carbons() && o.available() {
+                    if o.id != s.id && o.carbons() {
                         o.send(carbon("received", to, &o.jid, &msg));
                     }
                 }
@@ -349,6 +375,15 @@ pub async fn deliver_message(srv: &Arc<Server>, host: &Arc<Host>, from: &Jid, to
             }
         }
         return;
+    }
+    // Devices with carbons on that don't take messages to the bare JID (negative priority, no
+    // presence yet) still follow the conversation (XEP-0280 §5.2).
+    if carbon_received_eligible(from, &bare, &msg) {
+        for o in srv.sessions.of(&bare) {
+            if o.carbons() && !targets.iter().any(|t| t.id == o.id) {
+                o.send(carbon("received", &bare, &o.jid, &msg));
+            }
+        }
     }
     let last = targets.len() - 1;
     for (i, s) in targets.into_iter().enumerate() {

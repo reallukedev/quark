@@ -29,7 +29,7 @@ use rand::RngCore;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
 
-use super::{AppState, Conn, Negotiating, WebState};
+use super::{AddressSlot, AppState, Conn, WebState};
 use crate::sasl::ChannelBindings;
 use crate::transport::{StanzaReader, StanzaWriter, StreamError, Transport};
 
@@ -609,7 +609,7 @@ struct BoshTransport {
     secure: bool,
     cb: ChannelBindings,
     /// Counts against the address's sign-ins until the stream splits into a session.
-    negotiating: Option<Negotiating>,
+    negotiating: Option<AddressSlot>,
 }
 
 #[async_trait]

@@ -167,10 +167,17 @@ pub struct HttpSection {
     /// Serve the admin API over HTTP (bearer token in `<data_dir>/admin.token`).
     #[serde(default)]
     pub admin_api: bool,
-    /// Prometheus metrics at `/metrics`: for direct requests from loopback and private
-    /// addresses, or with `metrics_token` for whoever presents it.
+    /// Prometheus metrics at `/metrics`: for direct requests from loopback, requests from a
+    /// trusted proxy on behalf of a private address, or with `metrics_token` for whoever
+    /// presents it.
     #[serde(default = "yes")]
     pub metrics: bool,
+    /// Reverse proxies whose `X-Forwarded-For` and `X-Forwarded-Proto` are believed, as
+    /// networks (`"172.17.0.0/16"`). Only loopback by default: a private address alone proves
+    /// nothing (under Docker every client arrives from the bridge address). Connections from
+    /// these don't count toward the per-address connection cap.
+    #[serde(default = "default_trusted_proxies")]
+    pub trusted_proxies: Vec<crate::turn::Cidr>,
     /// A bearer token `/metrics` then requires from everyone, so scrapers can come through a
     /// reverse proxy (or from anywhere) without the proxy making every request look local.
     #[serde(default)]
@@ -189,8 +196,20 @@ pub struct HttpSection {
 
 impl Default for HttpSection {
     fn default() -> Self {
-        HttpSection { public_url: None, admin_api: false, metrics: true, metrics_token: None, strip_photo_metadata: false, tls: false }
+        HttpSection {
+            public_url: None,
+            admin_api: false,
+            metrics: true,
+            trusted_proxies: default_trusted_proxies(),
+            metrics_token: None,
+            strip_photo_metadata: false,
+            tls: false,
+        }
     }
+}
+
+fn default_trusted_proxies() -> Vec<crate::turn::Cidr> {
+    vec![crate::turn::Cidr::v4([127, 0, 0, 0], 8), crate::turn::Cidr::v6([0, 0, 0, 0, 0, 0, 0, 1], 128)]
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -528,10 +547,16 @@ impl Config {
     }
 
     /// Applies environment overrides, for containers: `QUARK_DOMAIN` (comma separated) adds
-    /// domains, `QUARK_ADMINS` adds admins to them, `QUARK_DATA_DIR` moves the data.
+    /// domains, `QUARK_ADMINS` adds admins to them, `QUARK_DATA_DIR` moves the data, and
+    /// `QUARK_TURN_EXTERNAL_IP` sets `turn.external_ip` (in a container the relay can't see the
+    /// host's public address, only its bridge network's).
     pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<(), ConfigError> {
         if let Some(dir) = env("QUARK_DATA_DIR").filter(|s| !s.is_empty()) {
             self.server.data_dir = PathBuf::from(dir);
+        }
+        if let Some(ip) = env("QUARK_TURN_EXTERNAL_IP").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            let ip = ip.parse().map_err(|_| ConfigError::Invalid(format!("QUARK_TURN_EXTERNAL_IP: \"{ip}\" isn't an IP address.")))?;
+            self.turn.external_ip = Some(ip);
         }
         if let Some(domains) = env("QUARK_DOMAIN") {
             for d in domains.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -616,6 +641,15 @@ mod tests {
         .unwrap();
         assert_eq!(c.hosts.len(), 2);
         assert_eq!(c.hosts[0].admins, vec!["root@a.test".to_string()]);
+    }
+
+    #[test]
+    fn env_sets_the_relay_external_ip() {
+        let mut c = Config::parse("[turn]\nexternal_ip = \"192.0.2.1\"\n", Path::new("x")).unwrap();
+        c.apply_env(|k| (k == "QUARK_TURN_EXTERNAL_IP").then(|| " 203.0.113.7 ".into())).unwrap();
+        assert_eq!(c.turn.external_ip, Some("203.0.113.7".parse().unwrap()));
+        let mut c = Config::parse("", Path::new("x")).unwrap();
+        assert!(c.apply_env(|k| (k == "QUARK_TURN_EXTERNAL_IP").then(|| "turn.example".into())).is_err());
     }
 
     #[test]

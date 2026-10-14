@@ -20,7 +20,7 @@ use futures_util::{SinkExt, StreamExt};
 use quark_core::xml::{StreamEvent, XmlError};
 use quark_core::{ns, Element};
 
-use super::{AppState, Conn, Negotiating};
+use super::{AddressSlot, AppState, Conn};
 use crate::sasl::ChannelBindings;
 use crate::server::Server;
 use crate::transport::{StanzaReader, StanzaWriter, StreamError, Transport};
@@ -219,7 +219,7 @@ pub struct WsTransport {
     cb: ChannelBindings,
     sni: Option<String>,
     /// Counts against the address's sign-ins until the stream splits into a session.
-    negotiating: Option<Negotiating>,
+    negotiating: Option<AddressSlot>,
 }
 
 #[async_trait]

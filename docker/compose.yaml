@@ -9,11 +9,16 @@ services:
     environment:
       QUARK_DOMAIN: chat.example.com
       QUARK_ADMINS: admin@chat.example.com
+      # Set to the host's public IP, for the call relay: inside the container it only sees the
+      # bridge address, which phones can't reach, so calls through the relay fail without it.
+      # QUARK_TURN_EXTERNAL_IP: 203.0.113.7
     ports:
       - "5222:5222"     # chat apps
       - "5223:5223"     # chat apps, TLS from the start
       - "5269:5269"     # other servers
-      - "5280:5280"     # web chat, uploads, invite pages (put Caddy or another TLS proxy in front)
+      # Web chat, uploads, invite pages. Put Caddy or another TLS proxy in front; when it runs in
+      # a container of its own, list its network in [http] trusted_proxies (docs/config.md).
+      - "5280:5280"
       - "3478:3478/udp" # call relay
       - "3478:3478"
       - "49160-49200:49160-49200/udp"

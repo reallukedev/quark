@@ -1,5 +1,6 @@
 //! The server: domains, their live settings, components, modules and shared services.
 
+use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -116,6 +117,8 @@ pub struct Server {
     pub stats: Stats,
     pub started_at: i64,
     shutdown: watch::Sender<bool>,
+    /// Per-server module state (caches, timers), by type; see [`Server::ext`].
+    extensions: parking_lot::Mutex<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -166,6 +169,7 @@ impl Server {
             stats: Stats::default(),
             started_at: quark_core::time::now_ms(),
             shutdown,
+            extensions: parking_lot::Mutex::new(HashMap::new()),
         });
         srv.load_hosts()?;
         Ok(srv)
@@ -373,6 +377,14 @@ impl Server {
             Some(tx) => tx.send(iq.clone()).is_ok(),
             None => false,
         }
+    }
+
+    /// The state of type `T` for this server, made on first use. Modules are unit structs shared
+    /// by every server in the process (tests run several), so state that belongs to one server
+    /// lives here.
+    pub fn ext<T: Default + Send + Sync + 'static>(&self) -> Arc<T> {
+        let any = self.extensions.lock().entry(TypeId::of::<T>()).or_insert_with(|| Arc::new(T::default())).clone();
+        any.downcast::<T>().expect("each slot holds the type it is keyed by")
     }
 
     pub fn shutdown_signal(&self) -> watch::Receiver<bool> {

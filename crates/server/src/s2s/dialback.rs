@@ -63,13 +63,7 @@ pub fn to_stream_xml(el: &Element) -> String {
     let mut s = String::with_capacity(160);
     s.push_str("<db:");
     s.push_str(el.name());
-    for (k, v) in el.attrs() {
-        s.push(' ');
-        s.push_str(k);
-        s.push_str("='");
-        quark_core::xml::escape_attr(&mut s, v);
-        s.push('\'');
-    }
+    el.write_attrs(&mut s);
     let text = el.text_content();
     let children: Vec<&Element> = el.children().collect();
     if text.is_empty() && children.is_empty() {

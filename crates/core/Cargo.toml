@@ -6,7 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-quick-xml = { version = "0.37", features = ["async-tokio"] }
+rand = "0.8"
+quick-xml ={ version = "0.37", features = ["async-tokio"] }
 stringprep = "0.1"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util"] }

@@ -170,6 +170,43 @@ pub async fn items(srv: &Server, host: &str, user: &str) -> Result<Vec<Item>, Db
         .await
 }
 
+/// The rows presence needs: contacts who see the account (`from`/`both`), and with `initial`
+/// also the ones it follows (`to`) and pending requests. Filtered in SQL, as presence is sent
+/// often and most of a big roster may be neither.
+pub async fn presence_items(srv: &Server, host: &str, user: &str, initial: bool) -> Result<Vec<Item>, DbError> {
+    let (h, u) = (host.to_string(), user.to_string());
+    let filter = if initial { "(subscription <> 'none' OR pending_in IS NOT NULL)" } else { "subscription IN ('from', 'both')" };
+    srv.db
+        .read(move |c| {
+            let mut st = c.prepare_cached(&format!("SELECT {COLS} FROM roster WHERE host = ?1 AND user = ?2 AND {filter}"))?;
+            let rows = st.query_map(params![h, u], row_item)?;
+            Ok(rows.filter_map(|r| r.ok().flatten()).collect())
+        })
+        .await
+}
+
+/// How many contacts the account sees in its roster.
+pub async fn count_visible(srv: &Server, host: &str, user: &str) -> Result<usize, DbError> {
+    count(srv, host, user, "visible = 1").await
+}
+
+/// How many subscription requests wait for an answer.
+pub async fn count_pending(srv: &Server, host: &str, user: &str) -> Result<usize, DbError> {
+    count(srv, host, user, "pending_in IS NOT NULL").await
+}
+
+async fn count(srv: &Server, host: &str, user: &str, filter: &'static str) -> Result<usize, DbError> {
+    let (h, u) = (host.to_string(), user.to_string());
+    srv.db
+        .read(move |c| {
+            c.query_row(&format!("SELECT COUNT(*) FROM roster WHERE host = ?1 AND user = ?2 AND {filter}"), params![h, u], |r| {
+                r.get::<_, i64>(0)
+            })
+        })
+        .await
+        .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+}
+
 pub async fn item(srv: &Server, host: &str, user: &str, contact: &Jid) -> Result<Option<Item>, DbError> {
     let (h, u, c) = (host.to_string(), user.to_string(), contact.to_bare().to_string());
     srv.db
@@ -364,7 +401,7 @@ impl Module for Roster {
                 let mut it = match item(cx.srv, &cx.host.domain, user, &contact).await.map_err(db)? {
                     Some(it) => it,
                     None => {
-                        if items(cx.srv, &cx.host.domain, user).await.map_err(db)?.len() >= MAX_ITEMS {
+                        if count_visible(cx.srv, &cx.host.domain, user).await.map_err(db)? >= MAX_ITEMS {
                             return Err(StanzaError::new(quark_core::Condition::NotAllowed).with_text("The roster is full."));
                         }
                         Item::new(contact)

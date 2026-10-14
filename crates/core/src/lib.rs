@@ -10,21 +10,21 @@ pub use jid::Jid;
 pub use stanza::{Condition, ErrorType, StanzaError};
 pub use xml::{Element, Node};
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// A short unique id for stanzas and streams: process start nanos mixed with a counter.
+/// A short unique id for stanzas and streams: 64 random bits as 16 hex digits.
+///
+/// Drawn from the thread-local CSPRNG (ChaCha, seeded from the OS), so ids can't be guessed:
+/// RFC 6120 §4.7.3 wants unpredictable stream ids, and guessable server IQ ids would let a
+/// third party answer requests it never saw.
 pub fn new_id() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let seed = *SEED.get_or_init(|| {
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
-        t ^ (std::process::id() as u64) << 32
-    });
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    // splitmix64: cheap and well distributed, so ids don't look sequential.
-    let mut z = seed.wrapping_add(n.wrapping_mul(0x9E3779B97F4A7C15));
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^= z >> 31;
-    format!("{z:016x}")
+    format!("{:016x}", rand::random::<u64>())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ids_are_hex_and_distinct() {
+        let ids: std::collections::HashSet<String> = (0..1000).map(|_| super::new_id()).collect();
+        assert_eq!(ids.len(), 1000);
+        assert!(ids.iter().all(|a| a.len() == 16 && a.bytes().all(|c| c.is_ascii_hexdigit())));
+    }
 }

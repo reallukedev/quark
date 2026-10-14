@@ -8,6 +8,11 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use subtle::ConstantTimeEq;
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
 use crate::db::{params, Db, DbError, Migration, OptionalExtension};
 
 pub static MIGRATION: Migration = Migration {
@@ -215,11 +220,38 @@ pub fn check_password(p: &str) -> Result<(), AccountError> {
 #[derive(Clone)]
 pub struct Accounts {
     db: Db,
+    /// Which accounts exist, so routing a message or IQ to a bare JID doesn't ask the database.
+    known: Arc<Mutex<Known>>,
+}
+
+/// Usernames by host, filled from the database on first use. It's only ever loaded or changed
+/// while holding the database's writer (inside `db.write`), the same lock every account insert
+/// and delete takes, so it can't miss one that commits while it loads.
+#[derive(Default)]
+struct Known {
+    loaded: bool,
+    users: HashMap<String, HashSet<String>>,
+}
+
+impl Known {
+    fn insert(&mut self, host: &str, user: &str) {
+        if self.loaded {
+            self.users.entry(host.to_string()).or_default().insert(user.to_string());
+        }
+    }
+    fn remove(&mut self, host: &str, user: &str) {
+        if let Some(set) = self.users.get_mut(host) {
+            set.remove(user);
+        }
+    }
+    fn contains(&self, host: &str, user: &str) -> bool {
+        self.users.get(host).is_some_and(|s| s.contains(user))
+    }
 }
 
 impl Accounts {
     pub fn new(db: Db) -> Self {
-        Accounts { db }
+        Accounts { db, known: Arc::default() }
     }
 
     pub async fn create(&self, host: &str, user: &str, password: &str, role: Role) -> Result<(), AccountError> {
@@ -234,10 +266,11 @@ impl Accounts {
         let (host, user) = (host.to_string(), user.to_string());
         let jid = format!("{user}@{host}");
         let now = quark_core::time::now_ms();
+        let known = self.known.clone();
         let inserted = self
             .db
             .write(move |t| {
-                t.execute(
+                let n = t.execute(
                     "INSERT INTO accounts (host, user, role, enabled, created, password_changed, salt, iterations,
                         sha1_stored, sha1_server, sha256_stored, sha256_server, sha512_stored, sha512_server)
                      VALUES (?1, ?2, ?3, 1, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT DO NOTHING",
@@ -255,7 +288,11 @@ impl Accounts {
                         d.keys[2].0,
                         d.keys[2].1
                     ],
-                )
+                )?;
+                if n > 0 {
+                    known.lock().insert(&host, &user);
+                }
+                Ok(n)
             })
             .await?;
         if inserted == 0 {
@@ -264,13 +301,34 @@ impl Accounts {
         Ok(())
     }
 
+    /// Whether the account exists. From memory after the first call, which loads every
+    /// username (routing asks this for each message and IQ to a bare JID).
     pub async fn exists(&self, host: &str, user: &str) -> Result<bool, DbError> {
+        {
+            let k = self.known.lock();
+            if k.loaded {
+                return Ok(k.contains(host, user));
+            }
+        }
         let (h, u) = (host.to_string(), user.to_string());
+        let known = self.known.clone();
+        // Under the writer lock (see `Known`), so no insert or delete lands between the read
+        // and the cache being marked loaded.
         self.db
-            .read(move |c| {
-                c.query_row("SELECT 1 FROM accounts WHERE host = ?1 AND user = ?2", params![h, u], |_| Ok(()))
-                    .optional()
-                    .map(|r| r.is_some())
+            .write(move |t| {
+                let mut k = known.lock();
+                if !k.loaded {
+                    let mut st = t.prepare_cached("SELECT host, user FROM accounts")?;
+                    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+                    let mut users: HashMap<String, HashSet<String>> = HashMap::new();
+                    for r in rows {
+                        let (h, u) = r?;
+                        users.entry(h).or_default().insert(u);
+                    }
+                    k.users = users;
+                    k.loaded = true;
+                }
+                Ok(k.contains(&h, &u))
             })
             .await
     }
@@ -374,15 +432,20 @@ impl Accounts {
         let created = a.created.filter(|&t| t > 0).unwrap_or(now);
         let [k1, k256, k512] = k.keys.clone().map(Option::unwrap_or_default);
         let (salt, iterations, role, enabled) = (k.salt.clone(), k.iterations, a.role, a.enabled);
+        let known = self.known.clone();
         let inserted = self
             .db
             .write(move |t| {
-                t.execute(
+                let n = t.execute(
                     "INSERT INTO accounts (host, user, role, enabled, created, password_changed, salt, iterations,
                         sha1_stored, sha1_server, sha256_stored, sha256_server, sha512_stored, sha512_server)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) ON CONFLICT DO NOTHING",
                     params![host, user, role.as_str(), enabled, created, now, salt, iterations, k1.0, k1.1, k256.0, k256.1, k512.0, k512.1],
-                )
+                )?;
+                if n > 0 {
+                    known.lock().insert(&host, &user);
+                }
+                Ok(n)
             })
             .await?;
         if inserted == 0 {
@@ -411,15 +474,20 @@ impl Accounts {
     /// Checks a password (PLAIN, in-band password change). Constant time in the comparison.
     /// Imported accounts may have only some hashes' keys: the strongest common one present is
     /// checked, and a match fills in the rest.
+    /// False for a disabled account, whatever the password.
     pub async fn verify_password(&self, host: &str, user: &str, password: &str) -> Result<bool, DbError> {
+        Ok(self.password_state(host, user, password).await? == Some(true))
+    }
+
+    /// Checks a password whether or not the account is enabled: `Some(enabled)` when it is
+    /// right, None when it is wrong or there's no such account. For SASL, which may only say
+    /// "disabled" to someone who proved they know the password.
+    pub async fn password_state(&self, host: &str, user: &str, password: &str) -> Result<Option<bool>, DbError> {
         let Some((k, enabled)) = self.stored_keys(host, user).await? else {
-            return Ok(false);
+            return Ok(None);
         };
-        if !enabled {
-            return Ok(false);
-        }
         let Some((h, stored_key)) = [1, 2, 0].into_iter().find_map(|i| k.keys[i].as_ref().map(|(st, _)| (HASHES[i], st.clone()))) else {
-            return Ok(false);
+            return Ok(None);
         };
         let pw = password.to_string();
         let (salt, iterations) = (k.salt.clone(), k.iterations);
@@ -432,7 +500,7 @@ impl Accounts {
         if ok && k.keys.iter().any(Option::is_none) {
             self.complete_keys(host, user, password).await?;
         }
-        Ok(ok)
+        Ok(ok.then_some(enabled))
     }
 
     pub async fn set_password(&self, host: &str, user: &str, password: &str) -> Result<(), AccountError> {
@@ -492,7 +560,14 @@ impl Accounts {
     /// Deletes the account; tables that reference it go with it (`ON DELETE CASCADE`).
     pub async fn delete(&self, host: &str, user: &str) -> Result<bool, DbError> {
         let (h, u) = (host.to_string(), user.to_string());
-        self.db.write(move |t| t.execute("DELETE FROM accounts WHERE host = ?1 AND user = ?2", params![h, u])).await.map(|n| n > 0)
+        let known = self.known.clone();
+        self.db
+            .write(move |t| {
+                let n = t.execute("DELETE FROM accounts WHERE host = ?1 AND user = ?2", params![h, u])?;
+                known.lock().remove(&h, &u);
+                Ok(n > 0)
+            })
+            .await
     }
 }
 
@@ -525,6 +600,24 @@ mod tests {
         assert!(!a.verify_password("a.test", "sam", "wrong horse!").await.unwrap());
         a.set_password("a.test", "sam", "battery staple").await.unwrap();
         assert!(a.verify_password("a.test", "sam", "battery staple").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn exists_follows_creates_and_deletes() {
+        let a = accounts().await;
+        a.create("a.test", "sam", "correct horse", Role::Member).await.unwrap();
+        assert!(a.exists("a.test", "sam").await.unwrap());
+        assert!(!a.exists("b.test", "sam").await.unwrap());
+        assert!(a.known.lock().loaded, "answered from memory from now on");
+        a.create("a.test", "kim", "correct horse", Role::Member).await.unwrap();
+        assert!(a.exists("a.test", "kim").await.unwrap());
+        let mut k = keys_for("pw for an import");
+        k.keys[0] = None;
+        let imported = Imported { role: Role::Member, enabled: true, created: None };
+        a.create_with_keys("b.test", "lee", &k, &imported).await.unwrap();
+        assert!(a.exists("b.test", "lee").await.unwrap());
+        assert!(a.delete("a.test", "sam").await.unwrap());
+        assert!(!a.exists("a.test", "sam").await.unwrap());
     }
 
     #[tokio::test]

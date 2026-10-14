@@ -96,5 +96,11 @@ fn admin_socket(config: &std::path::Path) -> PathBuf {
             .map(PathBuf::from)
             .unwrap_or_else(|| quark::config::ServerSection::default().data_dir),
     };
-    quark::admin::socket_path(&data_dir)
+    let socket = quark::admin::socket_path(&data_dir);
+    #[cfg(unix)]
+    if let Err(e) = quark::admin::check_socket(&socket, &data_dir) {
+        eprintln!("quark mcp: {e}");
+        std::process::exit(1);
+    }
+    socket
 }

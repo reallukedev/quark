@@ -58,8 +58,13 @@ x509-parser = "0.16"
 webpki-roots = "1"
 qrcode = { version = "0.14", default-features = false }
 
+[target.'cfg(unix)'.dependencies]
+# The effective user id, to check who owns the admin socket (no unsafe libc calls).
+rustix = { version = "1", features = ["process"] }
+
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [lints]
 workspace = true

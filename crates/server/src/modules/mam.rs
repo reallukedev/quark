@@ -383,7 +383,7 @@ async fn insert(srv: &Server, host: &str, user: Option<String>, archive: &Jid, w
                     .query_row(params![jid, host, user], |r| r.get(0))?,
             };
             let last: Option<i64> = t.prepare_cached("SELECT max(id) FROM mam")?.query_row([], |r| r.get(0))?;
-            let id = id_floor(now).max(last.map_or(0, |l| l + 1));
+            let id = id_floor(now).max(last.map_or(0, |l| l.saturating_add(1)));
             t.prepare_cached("INSERT INTO mam (id, archive, with_bare, with_res, indexed, xml) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?
                 .execute(params![id, aid, with_bare, with_res, text.is_some(), xml])?;
             if let Some(text) = text {
@@ -713,10 +713,16 @@ fn parse_query(q: &Element) -> Result<Query, StanzaError> {
                     if let Some(v) = one {
                         let id = parse_id(v)?;
                         out.must_exist.push(id);
+                        // Ids come from clients (decoded ids are 0..=i64::MAX): nothing is after the
+                        // largest or before the smallest, and the arithmetic must not overflow.
                         if var == "after-id" {
-                            out.lo = Some(out.lo.map_or(id + 1, |l| l.max(id + 1)));
+                            match id.checked_add(1) {
+                                Some(n) => out.lo = Some(out.lo.map_or(n, |l| l.max(n))),
+                                None => out.hi = Some(-1),
+                            }
                         } else {
-                            out.hi = Some(out.hi.map_or(id - 1, |h| h.min(id - 1)));
+                            let n = id.saturating_sub(1);
+                            out.hi = Some(out.hi.map_or(n, |h| h.min(n)));
                         }
                     }
                 }
@@ -893,8 +899,8 @@ fn run_sql(c: &rusqlite::Connection, aid: Option<i64>, q: &Query) -> Result<Page
     sql.push_str(if backward { " ORDER BY id DESC" } else { " ORDER BY id ASC" });
     // One extra row tells whether there's more beyond this page.
     sql.push_str(" LIMIT ? OFFSET ?");
-    args.push(Value::Integer(q.max as i64 + 1));
-    args.push(Value::Integer(if backward { 0 } else { q.index.unwrap_or(0) as i64 }));
+    args.push(Value::Integer(i64::try_from(q.max).unwrap_or(i64::MAX).saturating_add(1)));
+    args.push(Value::Integer(if backward { 0 } else { i64::try_from(q.index.unwrap_or(0)).unwrap_or(i64::MAX) }));
     let mut st = c.prepare_cached(&sql)?;
     let rows = st.query_map(rusqlite::params_from_iter(args.iter()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
     let mut items = Vec::with_capacity(q.max.min(64));
@@ -1124,6 +1130,24 @@ mod tests {
 
     fn el(xml: &str) -> Element {
         Element::parse(xml).unwrap()
+    }
+
+    #[test]
+    fn extreme_ids_in_queries_do_not_overflow() {
+        let form = |var: &str, v: &str| {
+            Element::new("query", ns::MAM).child(
+                Element::new("x", ns::DATA_FORMS)
+                    .attr_set("type", "submit")
+                    .child(Element::new("field", ns::DATA_FORMS).attr_set("var", var).text_child("value", ns::DATA_FORMS, v)),
+            )
+        };
+        let max = encode_id(i64::MAX);
+        let q = parse_query(&form("after-id", &max)).unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(q.hi, Some(-1), "nothing comes after the largest id");
+        let q = parse_query(&form("before-id", &encode_id(0))).unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(q.hi, Some(-1));
+        let q = parse_query(&form("before-id", &max)).unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(q.hi, Some(i64::MAX - 1));
     }
 
     #[test]

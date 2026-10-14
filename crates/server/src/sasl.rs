@@ -263,14 +263,12 @@ async fn plain(ctx: &Context<'_>, initial: &[u8]) -> Step {
     if !authzid.is_empty() && localpart(authzid, ctx.host).as_deref() != Some(user.as_str()) {
         return Step::Failure(Failure::InvalidAuthzid, None);
     }
-    match ctx.accounts.info(ctx.host, &user).await {
-        Ok(Some(i)) if !i.enabled => return Step::Failure(Failure::AccountDisabled, None),
-        Ok(_) => {}
-        Err(_) => return Step::Failure(Failure::TemporaryAuthFailure, None),
-    }
-    match ctx.accounts.verify_password(ctx.host, &user, pass).await {
-        Ok(true) => Step::Success { user, data: None },
-        Ok(false) => Step::Failure(Failure::NotAuthorized, None),
+    // The password first: saying "disabled" to anyone would tell them the account exists (and
+    // is disabled) without knowing its password. SCRAM checks the proof first the same way.
+    match ctx.accounts.password_state(ctx.host, &user, pass).await {
+        Ok(Some(true)) => Step::Success { user, data: None },
+        Ok(Some(false)) => Step::Failure(Failure::AccountDisabled, None),
+        Ok(None) => Step::Failure(Failure::NotAuthorized, None),
         Err(_) => Step::Failure(Failure::TemporaryAuthFailure, None),
     }
 }
@@ -525,5 +523,15 @@ mod tests {
         assert!(matches!(Sasl::start(&c, "PLAIN", Some(b"\0user\0nope")).await.1, Step::Failure(Failure::NotAuthorized, _)));
         c.secure = false;
         assert!(matches!(Sasl::start(&c, "PLAIN", Some(b"\0user\0pencil-pencil")).await.1, Step::Failure(Failure::EncryptionRequired, _)));
+    }
+
+    #[tokio::test]
+    async fn plain_says_disabled_only_with_the_right_password() {
+        let a = accounts().await;
+        a.set_enabled("a.test", "user", false).await.unwrap();
+        let cb = ChannelBindings::default();
+        let c = ctx(&a, &cb);
+        assert!(matches!(Sasl::start(&c, "PLAIN", Some(b"\0user\0guess")).await.1, Step::Failure(Failure::NotAuthorized, _)));
+        assert!(matches!(Sasl::start(&c, "PLAIN", Some(b"\0user\0pencil-pencil")).await.1, Step::Failure(Failure::AccountDisabled, _)));
     }
 }

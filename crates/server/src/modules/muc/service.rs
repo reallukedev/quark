@@ -646,7 +646,14 @@ impl Service {
                 }
             }
             ns::MAM => {
-                return match room.may_read_archive(from, admin) {
+                // Only a room that advertises MAM (it keeps a log, see disco#info) answers
+                // queries; the archive of one that stopped logging isn't served either.
+                let allowed = if room.logging {
+                    room.may_read_archive(from, admin)
+                } else {
+                    Err(StanzaError::feature_not_implemented().with_text("This group chat doesn't keep its history."))
+                };
+                return match allowed {
                     Err(e) => {
                         self.reply_error(srv, &el, e);
                         self.finish(srv, cell, room, out).await

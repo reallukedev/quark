@@ -32,9 +32,13 @@ const CONCURRENT: usize = 16;
 pub const SOCKET: &str = "admin.sock";
 
 /// Where the admin socket lives for a data folder: `<data_dir>/admin.sock`, unless that path is
-/// too long for a Unix socket address (about 104 bytes), in which case a name in the temp folder
-/// derived from the data folder, so the server and `quark ctl` agree without talking.
-pub fn socket_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+/// too long for a Unix socket address (about 104 bytes). Then it is `admin.sock` in a folder in
+/// the temp dir named after the data folder, so the server and `quark ctl` agree without
+/// talking. That name is predictable and the temp dir is shared, so the server only uses the
+/// folder when it is its own and private ([`prepare_socket_dir`]), and clients only talk to a
+/// socket owned by the server's user ([`check_socket`]): nobody else can stand in for it and
+/// read admin requests.
+pub fn socket_path(data_dir: &Path) -> PathBuf {
     use sha2::Digest;
     let p = data_dir.join(SOCKET);
     // Leave room for the temporary name used while binding.
@@ -42,7 +46,60 @@ pub fn socket_path(data_dir: &std::path::Path) -> std::path::PathBuf {
         return p;
     }
     let h = sha2::Sha256::digest(data_dir.as_os_str().as_encoded_bytes());
-    std::env::temp_dir().join(format!("quark-{}.sock", hex::encode(&h[..6])))
+    std::env::temp_dir().join(format!("quark-{}", hex::encode(&h[..6]))).join(SOCKET)
+}
+
+/// Makes sure the socket's folder is safe to bind in: the data folder itself, or a fallback
+/// folder created by us with mode 0700. One that exists but belongs to someone else, is a
+/// symlink, or is open to others is refused (someone made it first to catch the socket).
+#[cfg(unix)]
+pub fn prepare_socket_dir(socket: &Path, data_dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let Some(dir) = socket.parent() else { return Ok(()) };
+    if dir == data_dir {
+        return Ok(());
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => anyhow::bail!("creating the admin socket folder {}: {e}", dir.display()),
+    }
+    let m = std::fs::symlink_metadata(dir)?;
+    let me = rustix::process::geteuid().as_raw();
+    if !m.file_type().is_dir() || m.uid() != me || m.mode() & 0o077 != 0 {
+        anyhow::bail!(
+            "The admin socket folder {} isn't private to this user, so it isn't safe to use (someone else may have made it). \
+             Remove it, or set a shorter server.data_dir so the socket fits at <data_dir>/{SOCKET}.",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Before sending a request: the socket must belong to us or to the data folder's owner (the
+/// server's user), and outside the data folder sit in a folder of that same owner that nobody
+/// else can enter. A socket that doesn't exist yet is left for `connect` to report.
+#[cfg(unix)]
+pub fn check_socket(socket: &Path, data_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let sm = match std::fs::symlink_metadata(socket) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("couldn't check the admin socket {}: {e}", socket.display())),
+    };
+    let me = rustix::process::geteuid().as_raw();
+    let server = std::fs::metadata(data_dir).map(|m| m.uid()).unwrap_or(me);
+    let owner = sm.uid();
+    if owner != me && owner != server {
+        return Err(format!("{} belongs to another user (uid {owner}), not the server; not sending it anything.", socket.display()));
+    }
+    if let Some(dir) = socket.parent().filter(|d| *d != data_dir) {
+        let dm = std::fs::symlink_metadata(dir).map_err(|e| format!("couldn't check {}: {e}", dir.display()))?;
+        if !dm.file_type().is_dir() || dm.uid() != owner || dm.mode() & 0o077 != 0 {
+            return Err(format!("{} isn't a private folder of the server's user; not trusting the socket in it.", dir.display()));
+        }
+    }
+    Ok(())
 }
 pub const TOKEN: &str = "admin.token";
 
@@ -158,7 +215,11 @@ pub async fn start(srv: &Arc<Server>) -> anyhow::Result<Vec<std::net::SocketAddr
     let d = dir.clone();
     tokio::task::spawn_blocking(move || load_or_create_token(&d)).await??;
     #[cfg(unix)]
-    unix::listen(srv, &socket_path(&dir))?;
+    {
+        let socket = socket_path(&dir);
+        prepare_socket_dir(&socket, &dir)?;
+        unix::listen(srv, &socket)?;
+    }
     #[cfg(not(unix))]
     tracing::warn!("the admin socket needs a Unix system; use the HTTP admin API instead");
     Ok(Vec::new())
@@ -278,9 +339,14 @@ pub async fn ctl(config: &std::path::Path) -> i32 {
         return 2;
     }
     let text = String::from_utf8_lossy(&input);
-    let socket = socket_path(&data_dir_for(config));
+    let data_dir = data_dir_for(config);
+    let socket = socket_path(&data_dir);
     #[cfg(unix)]
     {
+        if let Err(e) = check_socket(&socket, &data_dir) {
+            eprintln!("quark ctl: {e}");
+            return 1;
+        }
         match request(&socket, &text).await {
             Ok(line) => {
                 println!("{line}");
@@ -337,4 +403,43 @@ async fn http_api(State(st): State<HttpState>, headers: HeaderMap, body: String)
     }
     let out = handle(&st.srv, &body, "http").await;
     ([(header::CONTENT_TYPE, "application/json"), (header::CACHE_CONTROL, "no-store")], out).into_response()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn long_data_dirs_use_a_private_folder() {
+        let short = Path::new("/var/lib/quark");
+        assert_eq!(socket_path(short), short.join(SOCKET));
+        let long = PathBuf::from(format!("/tmp/{}", "d".repeat(100)));
+        let p = socket_path(&long);
+        assert!(p.starts_with(std::env::temp_dir()) && p.ends_with(SOCKET), "{}", p.display());
+        assert!(p.as_os_str().len() < 104);
+    }
+
+    #[test]
+    fn fallback_folder_must_be_ours_and_private() {
+        let base = tempfile::tempdir().unwrap();
+        let data = base.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let socket = base.path().join("sockdir").join(SOCKET);
+        prepare_socket_dir(&socket, &data).unwrap();
+        let dir = socket.parent().unwrap();
+        assert_eq!(std::fs::metadata(dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(check_socket(&socket, &data).is_ok());
+        // Opened up (as a folder someone else prepared might be): refused both ways.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(prepare_socket_dir(&socket, &data).is_err());
+        std::fs::write(&socket, b"").unwrap();
+        assert!(check_socket(&socket, &data).is_err());
+        // A symlink to somewhere else isn't a folder of ours either.
+        std::fs::remove_file(&socket).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+        std::os::unix::fs::symlink(&data, dir).unwrap();
+        assert!(prepare_socket_dir(&socket, &data).is_err());
+    }
 }

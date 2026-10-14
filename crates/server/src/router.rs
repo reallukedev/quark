@@ -195,7 +195,7 @@ async fn local_iq(srv: &Arc<Server>, host: &Arc<Host>, from: Jid, to: Jid, el: E
     };
     if matches!(kind, IqType::Result | IqType::Error) {
         // An answer to something the server asked.
-        srv.answer_pending(&el);
+        srv.answer_pending(&from, &el);
         return;
     }
     // A get or set carries exactly one payload (RFC 6120 §8.2.3).

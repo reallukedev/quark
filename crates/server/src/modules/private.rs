@@ -22,6 +22,10 @@ pub static MIGRATION: Migration = Migration {
 };
 
 const MAX_BYTES: usize = 64 * 1024;
+/// Distinct elements one account may keep, and their total size: clients store a handful
+/// (bookmarks, a few app settings); without a cap an account could fill the disk.
+const MAX_ITEMS: i64 = 256;
+const MAX_TOTAL_BYTES: i64 = 1024 * 1024;
 
 pub struct Private;
 
@@ -79,16 +83,32 @@ impl Module for Private {
                 if xml.len() > MAX_BYTES {
                     return Err(StanzaError::new(quark_core::Condition::NotAcceptable).with_text("That's too much to store."));
                 }
-                cx.srv
+                // Counted in the same transaction as the write, so parallel sets can't overshoot.
+                let stored = cx
+                    .srv
                     .db
                     .write(move |t| {
+                        let (count, total): (i64, i64) = t.query_row(
+                            "SELECT COUNT(*), COALESCE(SUM(length(CAST(xml AS BLOB))), 0) FROM private_xml
+                             WHERE host = ?1 AND user = ?2 AND NOT (ns = ?3 AND name = ?4)",
+                            params![h, u, n, name],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )?;
+                        if count >= MAX_ITEMS || total + xml.len() as i64 > MAX_TOTAL_BYTES {
+                            return Ok(false);
+                        }
                         t.execute(
                             "INSERT INTO private_xml (host, user, ns, name, xml) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(host, user, ns, name) DO UPDATE SET xml = excluded.xml",
                             params![h, u, n, name, xml],
-                        )
+                        )?;
+                        Ok(true)
                     })
                     .await
                     .map_err(|_| StanzaError::internal())?;
+                if !stored {
+                    return Err(StanzaError::new(quark_core::Condition::ResourceConstraint)
+                        .with_text("Private storage for this account is full. Remove something first."));
+                }
                 cx.srv.emit(&super::Event::PrivateChanged { jid: me, data: v }).await;
                 ok_empty()
             }

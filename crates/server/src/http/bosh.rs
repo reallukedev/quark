@@ -143,7 +143,7 @@ pub(super) async fn info() -> Response {
 
 /// A BOSH attribute in the `urn:xmpp:xbosh` namespace, whatever prefix the client bound.
 fn xbosh_attr<'a>(el: &'a Element, local: &str) -> Option<&'a str> {
-    el.attrs().find(|(k, _)| k.split_once(':').is_some_and(|(p, l)| l == local && p != "xml")).map(|(_, v)| v)
+    el.attr_ns(ns::XBOSH, local)
 }
 
 pub(super) async fn handler(State(st): AppState, Extension(conn): Extension<Conn>, headers: HeaderMap, body: Body) -> Response {

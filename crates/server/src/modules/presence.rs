@@ -65,7 +65,7 @@ pub async fn from_client_broadcast(srv: &Arc<Server>, host: &Arc<Host>, session:
     let me = &session.jid;
     let bare = me.to_bare();
     let user = me.node().unwrap_or_default();
-    let items = roster::items(srv, &host.domain, user).await.unwrap_or_else(|e| {
+    let items = roster::presence_items(srv, &host.domain, user, initial).await.unwrap_or_else(|e| {
         log_db(e);
         Vec::new()
     });
@@ -85,13 +85,16 @@ pub async fn from_client_broadcast(srv: &Arc<Server>, host: &Arc<Host>, session:
 
     if initial {
         // What contacts we follow are doing now. Local ones answer straight to this device;
-        // other servers get a probe (from the bare JID, RFC 6121 §4.3).
+        // other servers get a probe (from the bare JID, RFC 6121 §4.3). Handed over without the
+        // router, so the block lists it would apply are checked here: neither side's may forbid it.
         for it in items.iter().filter(|i| i.subscription.receives_from_contact()) {
             if srv.host(it.contact.domain()).is_some() {
                 for s in srv.sessions.available_of(&it.contact) {
                     if let Some(mut p) = s.last_presence() {
                         p.set_attr("to", me.to_string());
-                        session.send(p);
+                        if super::blocking::allowed_between(srv, &s.jid, me, &p).await {
+                            session.send(p);
+                        }
                     }
                 }
             } else {
@@ -107,8 +110,12 @@ pub async fn from_client_broadcast(srv: &Arc<Server>, host: &Arc<Host>, session:
                 }
             }
         }
-        // Requests that came in while we were away (RFC 6121 §3.1.3).
+        // Requests that came in while we were away (RFC 6121 §3.1.3), unless we've blocked
+        // the sender since.
         for it in items.iter().filter(|i| i.pending_in.is_some()) {
+            if super::blocking::is_blocked(srv, &bare, &it.contact).await {
+                continue;
+            }
             let p = it
                 .pending_in
                 .as_deref()
@@ -146,7 +153,7 @@ async fn broadcast_unavailable(
 ) {
     let me = &session.jid;
     let bare = me.to_bare();
-    let items = roster::items(srv, &host.domain, me.node().unwrap_or_default()).await.unwrap_or_default();
+    let items = roster::presence_items(srv, &host.domain, me.node().unwrap_or_default(), false).await.unwrap_or_default();
     let mut sent = std::collections::HashSet::new();
     for it in items.iter().filter(|i| i.subscription.sends_to_contact()) {
         let mut p = el.clone();
@@ -313,6 +320,31 @@ async fn outbound_subscription(
     Ok(())
 }
 
+/// Subscription requests kept per account until answered. Beyond this new ones are dropped
+/// (people answer or ignore requests long before; a flood from one server stops here).
+pub const MAX_PENDING: usize = 500;
+/// Longest status text and nickname kept with a stored request, in bytes.
+const MAX_STORED_TEXT: usize = 1024;
+
+/// What's stored of a subscription request: who, and the status text and nickname (XEP-0172)
+/// a person reads, cut to size. The rest of the stanza (anything a sender wants to park on our
+/// disk) is dropped.
+fn stored_request(el: &Element) -> Element {
+    let mut p = Element::new("presence", ns::CLIENT).attr_opt("from", el.attr("from")).attr_set("type", "subscribe");
+    for (name, child_ns) in [("status", ns::CLIENT), ("nick", ns::NICK)] {
+        if let Some(t) = el.child_text(name, child_ns) {
+            let mut end = t.len().min(MAX_STORED_TEXT);
+            while !t.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end > 0 {
+                p.append(Element::new(name, child_ns).text(&t[..end]));
+            }
+        }
+    }
+    p
+}
+
 /// Presence for a local account, from anyone.
 pub async fn inbound(srv: &Arc<Server>, host: &Arc<Host>, from: &Jid, to: &Jid, el: Element) {
     let Some(user) = to.node() else { return };
@@ -411,10 +443,14 @@ async fn inbound_subscription(
                 srv.emit(&Event::SubscriptionApproved { user: me.clone(), contact: contact.clone() }).await;
                 return Ok(());
             }
+            // Anyone can ask, so what's kept for later is bounded: a few hundred requests per
+            // account, each only the parts a person reads.
+            if it.pending_in.is_none() && roster::count_pending(srv, &host.domain, user).await? >= MAX_PENDING {
+                tracing::debug!(%me, %contact, "dropping a subscription request: too many waiting");
+                return Ok(());
+            }
             // Keep it for when they sign in, and show it now if they're online.
-            let mut stored = el.clone();
-            stored.remove_attr("to");
-            it.pending_in = Some(stored.to_xml());
+            it.pending_in = Some(stored_request(&el).to_xml());
             roster::save(srv, &host.domain, user, &it).await?;
             deliver(el);
         }
@@ -457,4 +493,28 @@ async fn inbound_subscription(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_requests_keep_only_what_people_read() {
+        let long = "\u{e9}".repeat(MAX_STORED_TEXT);
+        let el = Element::new("presence", ns::CLIENT)
+            .attr_set("from", "a@b")
+            .attr_set("to", "c@d")
+            .attr_set("type", "subscribe")
+            .text_child("status", ns::CLIENT, long.as_str())
+            .text_child("nick", ns::NICK, "Al")
+            .child(Element::new("junk", "urn:x").text("x".repeat(100_000)));
+        let p = stored_request(&el);
+        assert_eq!(p.attr("from"), Some("a@b"));
+        assert_eq!(p.attr("to"), None);
+        assert_eq!(p.child_text("nick", ns::NICK).as_deref(), Some("Al"));
+        let status = p.child_text("status", ns::CLIENT).unwrap_or_default();
+        assert_eq!(status.len(), MAX_STORED_TEXT);
+        assert!(p.get_child("junk", "urn:x").is_none());
+    }
 }

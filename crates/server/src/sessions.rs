@@ -177,6 +177,12 @@ impl Sessions {
         self.by_smid.read().get(id).cloned()
     }
 
+    /// Whether a newer session now holds this one's full JID (it signed in again with the same
+    /// resource and this one was told to close).
+    pub fn replaced(&self, s: &SessionHandle) -> bool {
+        self.get(&s.jid).is_some_and(|x| x.id != s.id)
+    }
+
     pub fn get(&self, full: &Jid) -> Option<Arc<SessionHandle>> {
         self.by_bare.read().get(&full.to_bare())?.iter().find(|s| s.jid == *full).cloned()
     }

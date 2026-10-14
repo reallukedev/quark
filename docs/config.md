@@ -67,6 +67,10 @@ require_tls = true
 require_valid_certs = false   # true: only servers whose certificate verifies (no self-signed)
 idle_secs = 900
 blocked = ["spam.example"]
+allow_networks = []           # private networks other servers may be found at through DNS, e.g. ["10.0.0.0/8"]
+
+[s2s.routes]                  # fixed addresses instead of DNS (always followed, private ones too)
+"chat.internal" = "10.0.0.5:5269"   # or "tls://10.0.0.5:5270" for direct TLS
 
 [turn]
 enabled = true
@@ -104,6 +108,15 @@ Relayed addresses that never get a permission end after 3 minutes, so the ones p
 setting up a call and don't use give their ports back quickly. The listener on `[::]` also takes
 IPv4 (UDP and TCP). TCP connections must authenticate within 30 seconds and one address (or IPv6
 /64) may have at most 16 open.
+
+### Federation and private addresses
+
+Whoever runs a domain's DNS decides where this server connects when it delivers to that domain
+or checks a dialback key for it. So without a route, federation only connects to public
+addresses: loopback, private, link-local, cloud metadata and reserved ones are skipped, and a
+domain that points only there fails as if it had no server. Otherwise a stranger could make the
+server probe its own machine and network on any port. Servers on a private network federate
+through `[s2s.routes]` or by listing their networks in `allow_networks`.
 
 ### Metrics behind a proxy
 

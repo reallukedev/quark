@@ -131,6 +131,12 @@ impl PeerPolicy {
         PeerPolicy { allow_private: c.allow_private, allow_loopback: c.allow_loopback, allow: c.allow.clone(), deny: c.deny.clone() }
     }
 
+    /// Public addresses plus `allow`: no private, loopback, link-local, metadata or reserved
+    /// ones. For connections whose address a remote party chooses (federation through DNS).
+    pub fn public_only(allow: Vec<Cidr>) -> PeerPolicy {
+        PeerPolicy { allow_private: false, allow_loopback: false, allow, deny: Vec::new() }
+    }
+
     /// Whether `ip` is allowed by an explicit choice (the allow list, or loopback when that's
     /// turned on) rather than by default, so even the server's own addresses may be reached.
     pub fn explicitly_allows(&self, ip: IpAddr) -> bool {

@@ -209,6 +209,12 @@ pub struct S2sSection {
     /// `"chat.example" = "10.0.0.5:5269"` (STARTTLS) or `"tls://10.0.0.5:5270"` (direct TLS).
     #[serde(default)]
     pub routes: BTreeMap<String, String>,
+    /// Networks other servers may be reached at through DNS besides public addresses, e.g.
+    /// `["10.0.0.0/8"]` for a federation inside a private network. Without a route, loopback,
+    /// private, link-local, cloud metadata and reserved addresses are refused, so a hostile
+    /// domain's DNS can't point this server at its own network. Routes are always followed.
+    #[serde(default)]
+    pub allow_networks: Vec<crate::turn::Cidr>,
     /// PEM files with certificates to trust for federation besides the public CAs: a private
     /// CA, or another server's self-signed certificate.
     #[serde(default)]
@@ -244,6 +250,7 @@ impl Default for S2sSection {
             idle_secs: default_s2s_idle(),
             blocked: Vec::new(),
             routes: BTreeMap::new(),
+            allow_networks: Vec::new(),
             trusted_certs: Vec::new(),
             dialback: true,
             require_valid_certs: false,

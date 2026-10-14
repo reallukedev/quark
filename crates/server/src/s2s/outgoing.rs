@@ -21,6 +21,7 @@ use super::{LinkInfo, S2s, Tls};
 use crate::config::Config;
 use crate::server::Server;
 use crate::transport::StreamError;
+use crate::turn::PeerPolicy;
 
 /// How long a peer may take to answer `<enable/>` (XEP-0198).
 const SM_ANSWER: Duration = Duration::from_secs(10);
@@ -110,11 +111,22 @@ pub(super) async fn open(s2s: &S2s, srv: &Arc<Server>, local: &str, remote: &str
     };
     let tls = s2s.tls(srv).await;
     let mut last = Fail::not_found(format!("Couldn't connect to {remote}."));
+    // A configured route is the admin's choice; anything DNS says only reaches public addresses.
+    let policy = route.is_none().then(|| PeerPolicy::public_only(cfg.s2s.allow_networks.clone()));
     for t in targets {
         let addrs = match dns::addrs(&s2s.resolver, &t).await {
             Ok(a) if !a.is_empty() => a,
             Ok(_) | Err(_) => continue,
         };
+        let addrs = match &policy {
+            Some(p) => dns::reachable(p, addrs),
+            None => addrs,
+        };
+        if addrs.is_empty() {
+            tracing::debug!(remote, host = %t.host, "only private or reserved addresses; not connecting");
+            last = Fail::refused(format!("{remote} points at an address this server doesn't connect to."));
+            continue;
+        }
         let tcp = match dns::connect(&addrs).await {
             Ok(tcp) => tcp,
             Err(e) => {

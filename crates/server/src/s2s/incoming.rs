@@ -450,14 +450,14 @@ impl Link {
         if let Some(h) = self.sm.as_mut() {
             *h = h.wrapping_add(1);
         }
-        match jid_attr(&el, "from") {
-            Ok(Some(f)) if self.authed.contains(f.domain()) => {}
+        let from = match jid_attr(&el, "from") {
+            Ok(Some(f)) if self.authed.contains(f.domain()) => f,
             Ok(Some(f)) => {
                 let text = format!("This stream isn't authenticated for {}.", f.domain());
                 return Some(Some(StreamError::with_text("invalid-from", text)));
             }
             _ => return Some(Some(StreamError::new("invalid-from"))),
-        }
+        };
         let to = match jid_attr(&el, "to") {
             Ok(Some(t)) => t,
             Ok(None) => return Some(Some(StreamError::new("improper-addressing"))),
@@ -477,8 +477,14 @@ impl Link {
         }
         match inbound(&self.srv, to.domain()) {
             Inbound::All => {}
-            // Push notifications still go out, so app servers' answers to them come in.
-            Inbound::Answers if el.name() == "iq" && matches!(el.attr("type"), Some("result" | "error")) => {}
+            // Push notifications still go out, so app servers' answers to them come in: only
+            // as answers to what this server asked (from whoever it asked), never routed on to
+            // people's sessions, which would let any server reach any account.
+            Inbound::Answers if el.name() == "iq" && matches!(el.attr("type"), Some("result" | "error")) => {
+                self.srv.count_in();
+                self.srv.answer_pending(&from, &el);
+                return None;
+            }
             Inbound::Answers | Inbound::Nothing => {
                 let text = format!("Chatting with other servers is turned off on {}.", to.domain());
                 self.refuse(error_reply(&el, &StanzaError::new(Condition::ServiceUnavailable).with_text(text)), to.domain());
@@ -538,7 +544,7 @@ impl Link {
                 let limit = Duration::from_secs(srv.config().s2s.timeout_secs.max(1));
                 let outcome = match tokio::time::timeout(limit, verify(&s2s, &srv, &to, &from, &id, key.trim())).await {
                     Ok(o) => o,
-                    Err(_) => Outcome::Error(StanzaError::new(Condition::RemoteServerTimeout)),
+                    Err(_) => Outcome::Error(unchecked(&from)),
                 };
                 let _ = tx.send(Verified { from, to, outcome }).await;
             });
@@ -584,10 +590,17 @@ impl Link {
 /// for any domain: that is all plain dialback promises (XEP-0220, Security Considerations), and the only way servers
 /// with self-signed certificates can federate. `s2s.require_valid_certs` refuses those; with
 /// `s2s.require_tls` the connection is at least encrypted, which keeps passive listeners out.
+///
+/// Whoever asks chooses where we connect (their domain's DNS), so every way of not getting an
+/// answer looks the same to them ([`unchecked`]): distinct texts for refused, unreachable, timed
+/// out or not XMPP would tell them which hosts and ports answer behind this server.
 async fn verify(s2s: &S2s, srv: &Arc<Server>, receiving: &str, originating: &str, stream_id: &str, key: &str) -> Outcome {
     let mut o = match super::outgoing::open(s2s, srv, receiving, originating).await {
         Ok(o) => o,
-        Err(f) => return Outcome::Error(f.err),
+        Err(f) => {
+            tracing::debug!(remote = originating, error = ?f.err.text, "couldn't reach the server to check a dialback key");
+            return Outcome::Error(unchecked(originating));
+        }
     };
     if !o.verified && srv.config().s2s.require_valid_certs {
         o.st.close(None).await;
@@ -596,7 +609,7 @@ async fn verify(s2s: &S2s, srv: &Arc<Server>, receiving: &str, originating: &str
     }
     let q = dialback::element("verify", receiving, originating).attr_set("id", stream_id).text(key);
     if o.st.send(&q).await.is_err() {
-        return Outcome::Error(StanzaError::new(Condition::RemoteServerNotFound));
+        return Outcome::Error(unchecked(originating));
     }
     let outcome = loop {
         match o.st.read_element().await {
@@ -604,15 +617,20 @@ async fn verify(s2s: &S2s, srv: &Arc<Server>, receiving: &str, originating: &str
                 break match r.attr("type") {
                     Some("valid") => Outcome::Valid,
                     Some("invalid") => Outcome::Invalid,
-                    _ => Outcome::Error(StanzaError::from_stanza(&r).unwrap_or_else(|| StanzaError::new(Condition::RemoteServerNotFound))),
+                    _ => Outcome::Error(StanzaError::from_stanza(&r).unwrap_or_else(|| unchecked(originating))),
                 };
             }
             Ok(_) => continue,
-            Err(_) => break Outcome::Error(StanzaError::new(Condition::RemoteServerNotFound)),
+            Err(_) => break Outcome::Error(unchecked(originating)),
         }
     };
     o.st.close(None).await;
     outcome
+}
+
+/// The one answer for a dialback key that couldn't be checked, whatever went wrong.
+fn unchecked(originating: &str) -> StanzaError {
+    StanzaError::new(Condition::RemoteServerNotFound).with_text(format!("Couldn't check the key with {originating}'s server."))
 }
 
 #[cfg(test)]

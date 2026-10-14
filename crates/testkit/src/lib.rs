@@ -84,6 +84,20 @@ impl TestServer {
         DOMAIN
     }
 
+    /// Stops the server and starts it again on the same data and config (on new ports), the
+    /// way a restart would. Clients of the old server are disconnected.
+    pub async fn restart(&mut self) -> anyhow::Result<()> {
+        self.srv.shut_down();
+        for s in self.srv.sessions.on_host(DOMAIN) {
+            s.close("system-shutdown", None);
+        }
+        let cfg = quark::run::load_config(&self._dir.path().join("quark.toml"))?;
+        let srv = quark::run::build(cfg)?;
+        self.listening = quark::run::start(&srv).await?;
+        self.srv = srv;
+        Ok(())
+    }
+
     /// The STARTTLS client port.
     pub fn c2s(&self) -> SocketAddr {
         self.listening.c2s[0]

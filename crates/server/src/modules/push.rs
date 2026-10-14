@@ -224,6 +224,18 @@ async fn remove(srv: &Server, account: &Jid, service: &Jid, node: Option<&str>) 
     Ok(())
 }
 
+/// A push notification this server sends to an app server (a pubsub publish of
+/// `<notification xmlns='urn:xmpp:push:0'/>`).
+pub fn is_notification(el: &Element) -> bool {
+    el.name() == "iq"
+        && el.attr("type") == Some("set")
+        && el
+            .get_child("pubsub", ns::PUBSUB)
+            .and_then(|p| p.get_child("publish", ns::PUBSUB))
+            .and_then(|p| p.get_child("item", ns::PUBSUB))
+            .is_some_and(|i| i.has_child("notification", ns::PUSH))
+}
+
 /// Sends one notification and drops the registration if the app server says it's gone.
 async fn notify(srv: Arc<Server>, account: Jid, reg: Registration, prio: Priority) {
     let iq = notification(&account, &reg, prio);

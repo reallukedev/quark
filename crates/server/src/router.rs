@@ -103,7 +103,12 @@ async fn dispatch(srv: &Arc<Server>, from: Jid, to: Jid, el: Element, session: O
         Dest::Component(c) => c.handle(srv, from, to, el).await,
         Dest::Remote => {
             let from_host = srv.host(from.domain()).or_else(|| srv.component_host(from.domain()));
-            let allowed = from_host.as_ref().is_some_and(|h| h.settings().federation);
+            // Push notifications to phone app servers (XEP-0357) go out even when chatting with
+            // other servers is off: they're the server's own traffic, not people's.
+            let allowed = from_host.as_ref().is_some_and(|h| {
+                let s = h.settings();
+                s.federation || (s.push && crate::modules::push::is_notification(&el))
+            });
             match srv.remote() {
                 Some(r) if allowed && !srv.config().s2s.blocked.iter().any(|b| b == to.domain()) => r.send(from.domain(), to.domain(), el),
                 _ => {

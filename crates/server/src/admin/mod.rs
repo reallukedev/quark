@@ -19,7 +19,6 @@ use serde_json::{json, Value};
 
 use crate::server::Server;
 
-pub use commands::{external_turn, ExternalTurn};
 pub use snapshot::client_name;
 
 /// The largest request accepted (account imports are the big ones).

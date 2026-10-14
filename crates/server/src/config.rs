@@ -272,7 +272,8 @@ pub struct TurnQuota {
     /// Relayed addresses open at once, in total.
     #[serde(default = "default_turn_allocations")]
     pub allocations: usize,
-    /// Relayed addresses open at once per account.
+    /// Relayed addresses open at once per account. Never more than an eighth of the relay port
+    /// range (and at least two), so a few accounts can't take every port.
     #[serde(default = "default_turn_per_user")]
     pub allocations_per_user: usize,
     /// Kilobits per second one relayed address may carry (both directions); 0 for no limit.
@@ -294,11 +295,14 @@ impl Default for TurnQuota {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TurnPeers {
-    /// Relay to private (LAN) addresses, so calls between phones on the home Wi-Fi work.
-    #[serde(default = "yes")]
+    /// Relay to private (LAN) addresses. Off by default: it would let any account reach every
+    /// device on the server's networks (routers, NAS boxes, docker services). Phones on the same
+    /// Wi-Fi still reach each other without it, through each other's relayed addresses, which
+    /// the relay connects internally.
+    #[serde(default)]
     pub allow_private: bool,
     /// Relay to loopback addresses. Only for tests: it exposes services on the server itself.
     #[serde(default)]
@@ -309,12 +313,6 @@ pub struct TurnPeers {
     /// Networks never relayed to.
     #[serde(default)]
     pub deny: Vec<crate::turn::Cidr>,
-}
-
-impl Default for TurnPeers {
-    fn default() -> Self {
-        TurnPeers { allow_private: true, allow_loopback: false, allow: Vec::new(), deny: Vec::new() }
-    }
 }
 
 impl Default for TurnSection {

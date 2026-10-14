@@ -3,6 +3,7 @@
 use quark_testkit::quark_core::{ns, Element};
 use quark_testkit::turn::TurnClient;
 use quark_testkit::{Client, TestServer};
+use serde_json::{json, Value};
 
 async fn alice(s: &TestServer) -> anyhow::Result<Client> {
     s.add_user("alice", "password-a").await?;
@@ -100,6 +101,35 @@ async fn an_external_relay_secret_switches_the_credentials_to_it() -> anyhow::Re
     quark::turn::set_external(&s.srv, None, None, None).await?;
     let r = services(&mut c, Some("turn")).await?;
     assert_eq!(find(&entries(&r), "turn", "udp").and_then(|e| e.attr("host")), Some("quark.test"));
+    Ok(())
+}
+
+/// One request over the admin socket, as `quark` and the MCP tools send it.
+async fn admin(s: &TestServer, req: Value) -> anyhow::Result<Value> {
+    let sock = s.srv.config().server.data_dir.join(quark::admin::SOCKET);
+    Ok(serde_json::from_str(&quark::admin::request(&sock, &req.to_string()).await?)?)
+}
+
+#[tokio::test]
+async fn turn_set_over_the_admin_socket_switches_discovery_to_the_external_relay() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    let mut c = alice(&s).await?;
+    let set = json!({ "cmd": "turn.set", "args": { "secret": " their-secret ", "host": "TURN.example.net", "port": 3479 } });
+    assert_eq!(admin(&s, set).await?["ok"], json!(true));
+    let r = services(&mut c, Some("turn")).await?;
+    let turn = find(&entries(&r), "turn", "udp").cloned().expect("a TURN service");
+    assert_eq!((turn.attr("host"), turn.attr("port")), (Some("turn.example.net"), Some("3479")));
+    let user = turn.attr("username").expect("username");
+    assert_eq!(turn.attr("password"), Some(quark::turn::rest_password("their-secret", user).as_str()));
+
+    // A null secret goes back to the built-in relay.
+    assert_eq!(admin(&s, json!({ "cmd": "turn.set", "args": { "secret": null } })).await?["ok"], json!(true));
+    let r = services(&mut c, Some("turn")).await?;
+    let port = s.listening.turn[0].port().to_string();
+    let turn = find(&entries(&r), "turn", "udp").cloned().expect("a TURN service");
+    assert_eq!((turn.attr("host"), turn.attr("port")), (Some("quark.test"), Some(port.as_str())));
+    let bad = admin(&s, json!({ "cmd": "turn.set", "args": { "secret": "x", "port": 70000 } })).await?;
+    assert_eq!(bad["ok"], json!(false));
     Ok(())
 }
 

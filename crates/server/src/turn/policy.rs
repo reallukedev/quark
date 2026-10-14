@@ -106,8 +106,9 @@ const BOGONS: &[Cidr] = &[
     Cidr::v6([0xff00, 0, 0, 0, 0, 0, 0, 0], 8),
 ];
 
-/// Private networks: allowed by default, because calls between two phones on the same home
-/// network go through here when their direct path fails.
+/// Private networks: refused unless `turn.peers.allow_private` is on, since they're the server's
+/// own LAN. Two phones on one home network don't need them: when their direct path fails they
+/// meet through their relayed addresses, which the relay connects without sending anywhere.
 const PRIVATE: &[Cidr] = &[
     Cidr::v4([10, 0, 0, 0], 8),
     Cidr::v4([172, 16, 0, 0], 12),
@@ -161,7 +162,7 @@ impl PeerPolicy {
 
 /// IPv4 written as IPv6 (`::ffff:127.0.0.1`, NAT64 `64:ff9b::7f00:1`) is checked as the IPv4
 /// address it reaches, so the rules can't be dodged by spelling.
-fn canonical(ip: IpAddr) -> IpAddr {
+pub(super) fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
@@ -225,9 +226,9 @@ mod tests {
     }
 
     #[test]
-    fn private_networks_follow_the_setting() {
-        let on = policy(|_| {});
-        let off = policy(|c| c.allow_private = false);
+    fn private_networks_follow_the_setting_and_are_off_by_default() {
+        let on = policy(|c| c.allow_private = true);
+        let off = policy(|_| {});
         for a in ["10.0.0.5", "172.20.1.1", "192.168.1.20", "100.64.0.1", "fd12::1"] {
             assert!(on.allows(ip(a)), "{a}");
             assert!(!off.allows(ip(a)), "{a}");

@@ -239,11 +239,12 @@ impl QuarkMcp {
         self.call("snapshot", json!({})).await
     }
 
-    /// The snapshot entry for `host`, or the only domain when none is given.
+    /// The snapshot entry for `host`, or the only domain when none is given. A blank name counts
+    /// as none, as in [`QuarkMcp::host`], so `""` from a client picks the only domain.
     fn pick_host<'a>(snap: &'a Value, host: Option<&str>) -> Result<&'a Value, String> {
         let hosts = snap.get("hosts").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
         let name = |h: &Value| h.get("host").and_then(Value::as_str).unwrap_or_default().to_string();
-        match host {
+        match host.map(str::trim).filter(|h| !h.is_empty()) {
             Some(want) => {
                 let want = want.trim().to_ascii_lowercase();
                 hosts.iter().find(|h| name(h) == want).ok_or_else(|| {
@@ -704,5 +705,14 @@ mod tests {
         assert_eq!(list.read_only_hint, Some(true));
         let create = QuarkMcp::create_account_tool_attr().annotations.expect("annotations");
         assert_eq!((create.read_only_hint, create.destructive_hint), (Some(false), Some(false)));
+    }
+
+    #[test]
+    fn a_blank_host_means_the_only_domain() {
+        let snap = json!({ "hosts": [{ "host": "quark.test" }] });
+        for h in [None, Some(""), Some("  ")] {
+            assert_eq!(QuarkMcp::pick_host(&snap, h).ok().and_then(|v| v["host"].as_str()), Some("quark.test"), "{h:?}");
+        }
+        assert!(QuarkMcp::pick_host(&snap, Some("elsewhere.test")).is_err());
     }
 }

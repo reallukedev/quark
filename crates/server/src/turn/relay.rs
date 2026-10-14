@@ -4,27 +4,38 @@
 //! shared listener (UDP) or the client's connection (TCP) and go straight out of the allocation's
 //! socket. Peer→client packets are read by one task per allocation into a buffer with headroom, so
 //! the ChannelData or Data indication header is written in front of the payload without copying.
+//!
+//! The hot path takes no relay-wide lock: allocations are found in sharded maps (by the client's
+//! 5-tuple, or by relayed port for traffic between two of our own allocations), each allocation
+//! guards its own state, and the config and the server's own addresses are lock-free snapshots.
+//! Only making and ending allocations touches the shared quota book.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
-use hmac::{Hmac, Mac};
+use dashmap::DashMap;
+use hmac::Mac;
 use md5::{Digest, Md5};
-use parking_lot::{Mutex, RwLock};
-use sha1::Sha1;
+use parking_lot::Mutex;
 use subtle::ConstantTimeEq;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
 
-use super::policy::PeerPolicy;
-use super::stun::{self, attr, method, Class, Message, Writer, HEADER, MAX_DATA_HEADER};
+use super::policy::{canonical, PeerPolicy};
+use super::stun::{self, attr, hmac_sha1, method, Class, Message, Writer, HEADER, MAX_DATA_HEADER};
 use crate::config::{TurnQuota, TurnSection};
 
 /// Default and minimum allocation lifetime (RFC 8656 §2.2).
 const DEFAULT_LIFETIME: u32 = 600;
+/// How long an allocation lives without ever getting a permission. Clients allocate on every
+/// call while gathering candidates and most of those are never used; this hands their ports
+/// back well before the granted lifetime, while leaving time for the other side to answer.
+const UNUSED_LIFETIME: Duration = Duration::from_secs(180);
 const PERMISSION_LIFETIME: Duration = Duration::from_secs(300);
 const CHANNEL_LIFETIME: Duration = Duration::from_secs(600);
 /// How long a nonce stays fresh. Clients refresh allocations every ~10 minutes, so an hour keeps
@@ -37,18 +48,53 @@ pub const HEADROOM: usize = MAX_DATA_HEADER;
 pub const PACKET_BUF: usize = HEADROOM + 65_535 + 4;
 const UDP_TRANSPORT: u8 = 17;
 
-/// Bytes per second unauthenticated UDP answers may exceed their requests by, per source address
-/// and in total. STUN answers are a little bigger than requests (a 401 carries a realm and a
-/// nonce), so a spoofed source could otherwise be used to amplify traffic towards a victim.
-const AMP_PER_IP: (u64, u64) = (1024, 4096);
-const AMP_TOTAL: (u64, u64) = (128 * 1024, 256 * 1024);
+/// Bytes per second unauthenticated UDP answers may exceed their requests by. STUN answers are a
+/// little bigger than requests (a 401 carries a realm and a nonce), so a spoofed source could
+/// otherwise be used to amplify traffic towards a victim. Each source (see [`source_prefix`]) has
+/// its own budget, all of them share one, and a reserve on top of that is kept for sources that
+/// recently proved they're real (an authenticated request), so a flood from many sources can't
+/// stop returning users from getting their challenges.
+const AMP_PER_SOURCE: (u64, u64) = (1024, 4096);
+const AMP_SHARED: (u64, u64) = (96 * 1024, 192 * 1024);
+const AMP_RESERVE: (u64, u64) = (32 * 1024, 64 * 1024);
 const AMP_TRACKED: usize = 16_384;
 
 /// Who a client is: its transport and address (the 5-tuple, as our side is fixed per listener).
+/// The address is as the socket reports it (IPv4-mapped on a dual-stack listener), so answers go
+/// back the way the request came; [`ClientKey::ip`] is the address it really has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClientKey {
     pub tcp: bool,
     pub addr: SocketAddr,
+}
+
+impl ClientKey {
+    /// The client's address with any IPv4-mapped spelling undone, for answers and policy.
+    pub fn unmapped(&self) -> SocketAddr {
+        SocketAddr::new(canonical_mapped(self.addr.ip()), self.addr.port())
+    }
+
+    fn ip(&self) -> IpAddr {
+        canonical_mapped(self.addr.ip())
+    }
+}
+
+/// `::ffff:a.b.c.d` as `a.b.c.d`. Only the mapped form: on a dual-stack socket that's how IPv4
+/// clients show up, while NAT64 addresses are real IPv6 clients.
+fn canonical_mapped(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// The unit one sender controls: an IPv4 address, or an IPv6 /64 (one subscriber's network, in
+/// which addresses are free to rotate).
+pub(super) fn source_prefix(ip: IpAddr) -> IpAddr {
+    match canonical_mapped(ip) {
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX))),
+        v4 => v4,
+    }
 }
 
 /// How to reach a client.
@@ -114,6 +160,8 @@ struct AllocState {
     permissions: Vec<(IpAddr, Instant)>,
     channels: Vec<Channel>,
     bucket: Bucket,
+    /// Whether a permission was ever installed; until then [`UNUSED_LIFETIME`] applies.
+    used: bool,
 }
 
 impl AllocState {
@@ -124,6 +172,20 @@ impl AllocState {
     fn prune(&mut self, now: Instant) {
         self.permissions.retain(|(_, e)| *e > now);
         self.channels.retain(|c| c.expires > now);
+    }
+}
+
+/// Where a relayed address is bound: its family and port. Relay sockets listen on every address
+/// of the family, so this is what a packet to any of the server's own addresses reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RelayPort {
+    v6: bool,
+    port: u16,
+}
+
+impl RelayPort {
+    fn of(a: SocketAddr) -> RelayPort {
+        RelayPort { v6: canonical(a.ip()).is_ipv6(), port: a.port() }
     }
 }
 
@@ -140,7 +202,10 @@ pub struct Allocation {
     user: Box<str>,
     /// The Allocate transaction, so a retransmitted Allocate gets the same answer.
     tid: [u8; 12],
+    created: Instant,
     state: Mutex<AllocState>,
+    /// Set when its socket stopped working; the sweeper then ends it.
+    dead: AtomicBool,
     pub(super) stop: Notify,
 }
 
@@ -190,55 +255,113 @@ impl Allocation {
             }
         }
     }
+
+    /// Marks the allocation broken (its socket keeps failing), for the sweeper to end.
+    pub(super) fn fail(&self) {
+        self.dead.store(true, Ordering::Relaxed);
+    }
+
+    fn relay_port(&self) -> RelayPort {
+        RelayPort::of(self.relayed)
+    }
 }
 
-#[derive(Default)]
-struct Tables {
-    by_client: HashMap<ClientKey, Arc<Allocation>>,
-    by_relay: HashMap<SocketAddr, Arc<Allocation>>,
+/// The quota book: who holds an allocation (or is getting one) and how many each account has.
+/// Checking and reserving happen under one lock, so racing requests can't both squeeze in.
+#[derive(Debug, Default)]
+struct Registry {
+    clients: HashSet<ClientKey>,
     per_user: HashMap<Box<str>, usize>,
 }
 
-impl Tables {
-    fn remove(&mut self, key: &ClientKey) -> Option<Arc<Allocation>> {
-        let a = self.by_client.remove(key)?;
-        self.by_relay.remove(&a.relayed);
-        if let Some(n) = self.per_user.get_mut(&a.user) {
+impl Registry {
+    fn reserve(&mut self, client: ClientKey, user: &str, total: usize, per_user: usize) -> Result<(), Refuse> {
+        if self.clients.contains(&client) {
+            return Err(Refuse(437, "Allocation Mismatch"));
+        }
+        if self.clients.len() >= total || self.per_user.get(user).copied().unwrap_or(0) >= per_user {
+            return Err(Refuse(486, "Allocation Quota Reached"));
+        }
+        self.clients.insert(client);
+        *self.per_user.entry(user.into()).or_insert(0) += 1;
+        Ok(())
+    }
+
+    fn release(&mut self, client: &ClientKey, user: &str) {
+        if !self.clients.remove(client) {
+            return;
+        }
+        if let Some(n) = self.per_user.get_mut(user) {
             *n = n.saturating_sub(1);
             if *n == 0 {
-                self.per_user.remove(&a.user);
+                self.per_user.remove(user);
             }
         }
-        a.stop.notify_one();
-        Some(a)
     }
 }
 
-struct AmpGuard {
-    per_ip: Mutex<HashMap<IpAddr, Bucket>>,
-    total: Mutex<Bucket>,
+struct AmpState {
+    per_source: HashMap<IpAddr, Bucket>,
+    shared: Bucket,
+    reserve: Bucket,
+    /// Sources that sent an authenticated request lately, until when, with their own budget.
+    verified: HashMap<IpAddr, (Instant, Bucket)>,
 }
 
+struct AmpGuard(Mutex<AmpState>);
+
 impl AmpGuard {
+    fn new(now: Instant) -> AmpGuard {
+        AmpGuard(Mutex::new(AmpState {
+            per_source: HashMap::new(),
+            shared: Bucket::new(AMP_SHARED.0, AMP_SHARED.1, now),
+            reserve: Bucket::new(AMP_RESERVE.0, AMP_RESERVE.1, now),
+            verified: HashMap::new(),
+        }))
+    }
+
+    /// Whether an answer `excess` bytes bigger than its request may go to `ip`.
     fn allow(&self, ip: IpAddr, excess: usize, now: Instant) -> bool {
-        let n = excess as u64;
-        {
-            let mut m = self.per_ip.lock();
-            if m.len() >= AMP_TRACKED && !m.contains_key(&ip) {
-                m.retain(|_, b| !b.is_full(now));
-                if m.len() >= AMP_TRACKED {
-                    return false;
-                }
+        let (n, src) = (excess as u64, source_prefix(ip));
+        let mut st = self.0.lock();
+        let st = &mut *st;
+        if let Some((until, b)) = st.verified.get_mut(&src) {
+            if *until > now {
+                return b.take(n, now) && (st.shared.take(n, now) || st.reserve.take(n, now));
             }
-            if !m.entry(ip).or_insert_with(|| Bucket::new(AMP_PER_IP.0, AMP_PER_IP.1, now)).take(n, now) {
+        }
+        if st.per_source.len() >= AMP_TRACKED && !st.per_source.contains_key(&src) {
+            st.per_source.retain(|_, b| !b.is_full(now));
+            if st.per_source.len() >= AMP_TRACKED {
                 return false;
             }
         }
-        self.total.lock().take(n, now)
+        st.per_source.entry(src).or_insert_with(|| Bucket::new(AMP_PER_SOURCE.0, AMP_PER_SOURCE.1, now)).take(n, now)
+            && st.shared.take(n, now)
+    }
+
+    /// Notes that `ip` answered a challenge (it's reachable there, so not spoofed).
+    fn verify(&self, ip: IpAddr, now: Instant) {
+        let src = source_prefix(ip);
+        let until = now + Duration::from_secs(NONCE_SECS);
+        let mut st = self.0.lock();
+        if let Some(v) = st.verified.get_mut(&src) {
+            v.0 = until;
+            return;
+        }
+        if st.verified.len() >= AMP_TRACKED {
+            st.verified.retain(|_, (u, _)| *u > now);
+            if st.verified.len() >= AMP_TRACKED {
+                return;
+            }
+        }
+        st.verified.insert(src, (until, Bucket::new(AMP_PER_SOURCE.0, AMP_PER_SOURCE.1, now)));
     }
 
     fn prune(&self, now: Instant) {
-        self.per_ip.lock().retain(|_, b| !b.is_full(now));
+        let mut st = self.0.lock();
+        st.per_source.retain(|_, b| !b.is_full(now));
+        st.verified.retain(|_, (u, _)| *u > now);
     }
 }
 
@@ -256,6 +379,37 @@ impl Limits {
     }
 }
 
+/// The server's own addresses: every interface's (and its broadcast address), the configured
+/// external IP, and the addresses relayed addresses are advertised at. A peer there is one of our
+/// own allocations or nobody, never another service on the box or a neighbour on its networks.
+#[derive(Debug, Default)]
+struct OwnAddrs(Vec<IpAddr>);
+
+impl OwnAddrs {
+    fn contains(&self, ip: IpAddr) -> bool {
+        self.0.contains(&canonical(ip))
+    }
+}
+
+/// Every address of every interface, or None when the system won't say.
+fn interface_addrs() -> Option<Vec<IpAddr>> {
+    match if_addrs::get_if_addrs() {
+        Ok(list) => Some(
+            list.into_iter()
+                .flat_map(|i| match i.addr {
+                    if_addrs::IfAddr::V4(a) => [Some(IpAddr::V4(a.ip)), a.broadcast.map(IpAddr::V4)],
+                    if_addrs::IfAddr::V6(a) => [Some(IpAddr::V6(a.ip)), a.broadcast.map(IpAddr::V6)],
+                })
+                .flatten()
+                .collect(),
+        ),
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list this machine's addresses for the call relay");
+            None
+        }
+    }
+}
+
 /// What handling a packet produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -266,6 +420,7 @@ pub enum Outcome {
 }
 
 /// Why a request failed after authentication (the answer carries MESSAGE-INTEGRITY).
+#[derive(Debug, PartialEq, Eq)]
 struct Refuse(u16, &'static str);
 
 pub struct Relay {
@@ -277,11 +432,12 @@ pub struct Relay {
     ports: (u16, u16),
     /// The shared UDP listener, for answering and forwarding to UDP clients.
     pub(super) udp: Arc<UdpSocket>,
-    limits: RwLock<Arc<Limits>>,
-    tables: Mutex<Tables>,
-    /// The server's own addresses that relayed addresses use. Packets to them go to our own
-    /// allocations or nowhere, never to other services on the box.
-    own_ips: RwLock<Vec<IpAddr>>,
+    limits: ArcSwap<Limits>,
+    /// Sharded maps, so packets for different allocations rarely meet on a lock.
+    by_client: DashMap<ClientKey, Arc<Allocation>>,
+    by_port: DashMap<RelayPort, Arc<Allocation>>,
+    registry: Mutex<Registry>,
+    own: ArcSwap<OwnAddrs>,
     amp: AmpGuard,
     pub(super) shutdown: tokio::sync::watch::Receiver<bool>,
 }
@@ -310,7 +466,7 @@ pub fn long_term_key(username: &str, realm: &str, password: &str) -> [u8; 16] {
 /// The TURN REST password for a username: base64(HMAC-SHA1(secret, username)).
 pub fn rest_password(secret: &str, username: &str) -> String {
     use base64::Engine;
-    let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(secret.as_bytes()).unwrap_or_else(|_| unreachable!("HMAC accepts any key length"));
+    let mut mac = hmac_sha1(secret.as_bytes());
     mac.update(username.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
@@ -325,27 +481,23 @@ impl Relay {
         limits: Limits,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Relay {
-        let mut own = Vec::new();
-        if !bind_ip.is_unspecified() {
-            own.push(bind_ip);
-        }
-        if let Some(ip) = limits.external_ip {
-            own.push(ip);
-        }
-        let now = Instant::now();
-        Relay {
+        let r = Relay {
             secret: secret.into(),
             realm: realm.into(),
             nonce_key: rand::random(),
             bind_ip,
             ports,
             udp,
-            limits: RwLock::new(Arc::new(limits)),
-            tables: Mutex::new(Tables::default()),
-            own_ips: RwLock::new(own),
-            amp: AmpGuard { per_ip: Mutex::new(HashMap::new()), total: Mutex::new(Bucket::new(AMP_TOTAL.0, AMP_TOTAL.1, now)) },
+            limits: ArcSwap::from_pointee(limits),
+            by_client: DashMap::new(),
+            by_port: DashMap::new(),
+            registry: Mutex::new(Registry::default()),
+            own: ArcSwap::from_pointee(OwnAddrs::default()),
+            amp: AmpGuard::new(Instant::now()),
             shutdown,
-        }
+        };
+        r.refresh_own_addrs();
+        r
     }
 
     pub fn secret(&self) -> &str {
@@ -357,59 +509,92 @@ impl Relay {
     }
 
     pub fn set_limits(&self, l: Limits) {
-        *self.limits.write() = Arc::new(l);
+        self.limits.store(Arc::new(l));
     }
 
     /// The longest lifetime a client can be granted, in seconds.
     pub fn max_lifetime(&self) -> u32 {
-        self.limits.read().quota.max_lifetime_secs.max(DEFAULT_LIFETIME)
+        self.limits.load().quota.max_lifetime_secs.max(DEFAULT_LIFETIME)
     }
 
     fn limits(&self) -> Arc<Limits> {
-        self.limits.read().clone()
+        self.limits.load_full()
+    }
+
+    /// Relayed addresses one account may hold: the configured quota, but never so many that a
+    /// few accounts could take every relay port (an eighth of the range, and at least two).
+    fn per_user_quota(&self, q: &TurnQuota) -> usize {
+        let span = usize::from(self.ports.1.saturating_sub(self.ports.0)) + 1;
+        q.allocations_per_user.min((span / 8).max(2))
     }
 
     pub fn allocation_count(&self) -> usize {
-        self.tables.lock().by_client.len()
+        self.by_client.len()
     }
 
     /// Drops a client's allocation (its TCP connection closed).
     pub fn remove_client(&self, key: &ClientKey) {
-        self.tables.lock().remove(key);
+        self.remove(key);
     }
 
     pub fn has_allocation(&self, key: &ClientKey) -> bool {
-        self.tables.lock().by_client.contains_key(key)
+        self.by_client.contains_key(key)
     }
 
-    /// Removes expired allocations, permissions and channels.
+    fn remove(&self, key: &ClientKey) -> Option<Arc<Allocation>> {
+        self.remove_where(key, |_| true)
+    }
+
+    /// Ends the client's allocation when `pred` holds for it (a sweep only ends the one it saw,
+    /// not a new one the client made since).
+    fn remove_where(&self, key: &ClientKey, pred: impl FnOnce(&Arc<Allocation>) -> bool) -> Option<Arc<Allocation>> {
+        let (_, a) = self.by_client.remove_if(key, |_, a| pred(a))?;
+        self.by_port.remove_if(&a.relay_port(), |_, b| Arc::ptr_eq(b, &a));
+        self.registry.lock().release(key, &a.user);
+        a.stop.notify_one();
+        Some(a)
+    }
+
+    /// Lists the machine's addresses again (interfaces come and go: DHCP, VPNs, containers).
+    pub fn refresh_own_addrs(&self) {
+        let Some(mut ips) = interface_addrs() else { return };
+        if !self.bind_ip.is_unspecified() {
+            ips.push(self.bind_ip);
+        }
+        ips.extend(self.limits.load().external_ip);
+        ips.extend(self.by_port.iter().map(|a| a.relayed.ip()));
+        let mut ips: Vec<IpAddr> = ips.into_iter().map(canonical).collect();
+        ips.sort_unstable();
+        ips.dedup();
+        self.own.store(Arc::new(OwnAddrs(ips)));
+    }
+
+    /// Removes expired, broken and long-unused allocations, and expired permissions and channels.
     pub fn sweep(&self, now: Instant) {
-        let mut t = self.tables.lock();
-        let expired: Vec<ClientKey> = t
-            .by_client
-            .iter()
-            .filter_map(|(k, a)| {
+        // Copied out first, so no shard stays locked while allocations are ended.
+        let all: Vec<Arc<Allocation>> = self.by_client.iter().map(|e| e.value().clone()).collect();
+        let expired: Vec<Arc<Allocation>> = all
+            .into_iter()
+            .filter(|a| {
                 let mut st = a.state.lock();
                 st.prune(now);
-                (st.expires <= now).then_some(*k)
+                st.expires <= now || (!st.used && a.created + UNUSED_LIFETIME <= now) || a.dead.load(Ordering::Relaxed)
             })
             .collect();
-        for k in &expired {
-            t.remove(k);
+        for a in &expired {
+            self.remove_where(&a.client, |b| Arc::ptr_eq(a, b));
         }
-        drop(t);
         if !expired.is_empty() {
-            tracing::debug!(count = expired.len(), "relay allocations expired");
+            tracing::debug!(count = expired.len(), "relay allocations ended");
         }
         self.amp.prune(now);
     }
 
     /// Removes every allocation (shutdown).
     pub fn clear(&self) {
-        let mut t = self.tables.lock();
-        let keys: Vec<ClientKey> = t.by_client.keys().copied().collect();
+        let keys: Vec<ClientKey> = self.by_client.iter().map(|e| *e.key()).collect();
         for k in &keys {
-            t.remove(k);
+            self.remove(k);
         }
     }
 
@@ -424,7 +609,7 @@ impl Relay {
     }
 
     fn nonce_mac(&self, exp: u32, ip: IpAddr) -> [u8; 20] {
-        let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(&self.nonce_key).unwrap_or_else(|_| unreachable!("HMAC accepts any key length"));
+        let mut mac = hmac_sha1(&self.nonce_key);
         mac.update(&exp.to_be_bytes());
         match ip {
             IpAddr::V4(v) => mac.update(&v.octets()),
@@ -476,9 +661,12 @@ impl Relay {
                 false
             }
             (Class::Request, method::ALLOCATE | method::REFRESH | method::CREATE_PERMISSION | method::CHANNEL_BIND) => {
-                let Some(key) = self.authenticate(&m, client.addr.ip(), out) else {
+                let Some(key) = self.authenticate(&m, client.ip(), out) else {
                     return self.unauthenticated(pkt.len(), client, out, now);
                 };
+                if !client.tcp {
+                    self.amp.verify(client.ip(), now);
+                }
                 let username = m.str_attr(attr::USERNAME).unwrap_or_default();
                 let r = match m.method {
                     method::ALLOCATE => self.allocate(&m, client, tcp_tx, username, &key, out, now),
@@ -517,7 +705,7 @@ impl Relay {
         if out.is_empty() {
             return Outcome::Nothing;
         }
-        if client.tcp || out.len() <= req_len || self.amp.allow(client.addr.ip(), out.len() - req_len, now) {
+        if client.tcp || out.len() <= req_len || self.amp.allow(client.ip(), out.len() - req_len, now) {
             Outcome::Reply
         } else {
             Outcome::Nothing
@@ -532,7 +720,7 @@ impl Relay {
             w
         } else {
             let mut w = Writer::new(out, method::BINDING, Class::Success, m.tid);
-            w.xor_addr(attr::XOR_MAPPED_ADDRESS, client.addr);
+            w.xor_addr(attr::XOR_MAPPED_ADDRESS, client.unmapped());
             w
         };
         // Nothing else: an unauthenticated answer stays as small as it can be.
@@ -577,7 +765,7 @@ impl Relay {
     }
 
     fn own_allocation(&self, client: ClientKey, username: &str) -> Result<Arc<Allocation>, Refuse> {
-        let a = self.tables.lock().by_client.get(&client).cloned().ok_or(Refuse(437, "Allocation Mismatch"))?;
+        let a = self.by_client.get(&client).map(|e| e.value().clone()).ok_or(Refuse(437, "Allocation Mismatch"))?;
         if &*a.username != username {
             return Err(Refuse(441, "Wrong Credentials"));
         }
@@ -595,14 +783,13 @@ impl Relay {
         out: &mut Vec<u8>,
         now: Instant,
     ) -> Result<(), Refuse> {
-        let existing = self.tables.lock().by_client.get(&client).cloned();
-        if let Some(a) = existing {
+        if let Some(a) = self.by_client.get(&client).map(|e| e.value().clone()) {
             // A retransmitted Allocate gets the same answer; anything else is a mismatch.
             if a.tid != m.tid || &*a.username != username {
                 return Err(Refuse(437, "Allocation Mismatch"));
             }
             let left = a.state.lock().expires.saturating_duration_since(now).as_secs() as u32;
-            allocate_success(out, m, key, a.relayed, client.addr, left);
+            allocate_success(out, m, key, a.relayed, client.unmapped(), left);
             return Ok(());
         }
         let (unknown, n) = m.unknown_required(KNOWN_TURN);
@@ -624,18 +811,20 @@ impl Relay {
         };
         let limits = self.limits();
         let user: Box<str> = username.split_once(':').map_or("", |(_, u)| u).into();
-        {
-            let t = self.tables.lock();
-            if t.by_client.len() >= limits.quota.allocations
-                || t.per_user.get(&user).copied().unwrap_or(0) >= limits.quota.allocations_per_user
-            {
-                return Err(Refuse(486, "Allocation Quota Reached"));
+        // Checked and counted in one go; handed back below if the allocation can't be made.
+        self.registry.lock().reserve(client, &user, limits.quota.allocations, self.per_user_quota(&limits.quota))?;
+        let made = self.bind_relay(v6, m.has(attr::EVEN_PORT)).and_then(|(socket, local)| {
+            let ip = self.advertised_ip(v6, client.unmapped(), &limits)?;
+            Ok((socket, SocketAddr::new(ip, local.port())))
+        });
+        let (socket, relayed) = match made {
+            Ok(v) => v,
+            Err(e) => {
+                self.registry.lock().release(&client, &user);
+                return Err(e);
             }
-        }
+        };
         let lifetime = lifetime(m, &limits.quota);
-        let even = m.has(attr::EVEN_PORT);
-        let (socket, local) = self.bind_relay(v6, even)?;
-        let relayed = SocketAddr::new(self.advertised_ip(v6, client.addr, &limits)?, local.port());
         let tx = match tcp_tx {
             Some(tx) => ClientTx::Tcp(tx.clone()),
             None => ClientTx::Udp(self.udp.clone()),
@@ -646,35 +835,31 @@ impl Relay {
             socket: Arc::new(socket),
             relayed,
             username: username.into(),
-            user: user.clone(),
+            user,
             tid: m.tid,
+            created: now,
             state: Mutex::new(AllocState {
                 expires: now + Duration::from_secs(u64::from(lifetime)),
                 permissions: Vec::new(),
                 channels: Vec::new(),
                 bucket: bandwidth_bucket(&limits.quota, now),
+                used: false,
             }),
+            dead: AtomicBool::new(false),
             stop: Notify::new(),
         });
-        {
-            let mut t = self.tables.lock();
-            // Checked again: another request may have raced us between the locks.
-            if t.by_client.contains_key(&client) {
-                return Err(Refuse(437, "Allocation Mismatch"));
-            }
-            t.by_client.insert(client, a.clone());
-            t.by_relay.insert(relayed, a.clone());
-            *t.per_user.entry(user).or_insert(0) += 1;
-        }
-        {
-            let mut own = self.own_ips.write();
-            if !own.contains(&relayed.ip()) {
-                own.push(relayed.ip());
-            }
+        self.by_port.insert(a.relay_port(), a.clone());
+        self.by_client.insert(client, a.clone());
+        if !self.own.load().contains(relayed.ip()) {
+            self.own.rcu(|o| {
+                let mut ips = o.0.clone();
+                ips.push(canonical(relayed.ip()));
+                OwnAddrs(ips)
+            });
         }
         tracing::debug!(client = %client.addr, tcp = client.tcp, relayed = %relayed, "relay allocation created");
         super::io::spawn_allocation(self.shutdown.clone(), a);
-        allocate_success(out, m, key, relayed, client.addr, lifetime);
+        allocate_success(out, m, key, relayed, client.unmapped(), lifetime);
         Ok(())
     }
 
@@ -695,7 +880,7 @@ impl Relay {
             if even && port % 2 == 1 {
                 continue;
             }
-            if let Ok(s) = bind_udp(SocketAddr::new(ip, port)) {
+            if let Ok(s) = bind_udp(SocketAddr::new(ip, port), false) {
                 let local = s.local_addr().map_err(|_| Refuse(500, "Server Error"))?;
                 return Ok((s, local));
             }
@@ -749,7 +934,7 @@ impl Relay {
         }
         let limits = self.limits();
         let granted = if m.u32_attr(attr::LIFETIME) == Some(0) {
-            self.tables.lock().remove(&client);
+            self.remove(&client);
             tracing::debug!(client = %client.addr, "relay allocation released");
             0
         } else {
@@ -763,10 +948,11 @@ impl Relay {
         Ok(())
     }
 
-    /// Whether a client may talk to `ip`: the policy allows it, or it's one of our own relayed
-    /// addresses (two callers on the same relay).
+    /// Whether a client may talk to `ip`: the policy allows it, or it's one of the server's own
+    /// addresses, where [`Relay::to_peer`] only delivers to our own relayed ports (two callers on
+    /// the same relay).
     fn peer_allowed(&self, ip: IpAddr, limits: &Limits) -> bool {
-        limits.policy.allows(ip) || self.own_ips.read().contains(&ip)
+        limits.policy.allows(ip) || self.own.load().contains(ip)
     }
 
     fn create_permission(
@@ -793,15 +979,23 @@ impl Relay {
             if n == peers.len() {
                 return Err(Refuse(508, "Insufficient Capacity"));
             }
-            peers[n] = p.ip();
-            n += 1;
+            if !peers[..n].contains(&p.ip()) {
+                peers[n] = p.ip();
+                n += 1;
+            }
         }
         if n == 0 {
             return Err(Refuse(400, "Bad Request"));
         }
         {
+            // All or nothing (RFC 8656 §9.2): room for every new one is checked before any is
+            // installed.
             let mut st = a.state.lock();
             st.prune(now);
+            let new = peers[..n].iter().filter(|ip| !st.permissions.iter().any(|(p, _)| p == *ip)).count();
+            if st.permissions.len() + new > MAX_PERMISSIONS {
+                return Err(Refuse(508, "Insufficient Capacity"));
+            }
             for ip in &peers[..n] {
                 permit(&mut st, *ip, now)?;
             }
@@ -857,7 +1051,7 @@ impl Relay {
 
     fn send_indication(&self, m: &Message, client: ClientKey, scratch: &mut [u8], now: Instant) {
         let (Some(peer), Some(data)) = (m.xor_addr(attr::XOR_PEER_ADDRESS), m.get(attr::DATA)) else { return };
-        let Some(a) = self.tables.lock().by_client.get(&client).cloned() else { return };
+        let Some(a) = self.by_client.get(&client).map(|e| e.value().clone()) else { return };
         {
             let mut st = a.state.lock();
             if !st.permitted(peer.ip(), now) || !st.bucket.take(data.len() as u64, now) {
@@ -868,7 +1062,7 @@ impl Relay {
     }
 
     fn channel_data(&self, client: ClientKey, ch: u16, data: &[u8], scratch: &mut [u8], now: Instant) {
-        let Some(a) = self.tables.lock().by_client.get(&client).cloned() else { return };
+        let Some(a) = self.by_client.get(&client).map(|e| e.value().clone()) else { return };
         let peer = {
             let mut st = a.state.lock();
             let Some(peer) = st.channels.iter().find(|c| c.number == ch && c.expires > now).map(|c| c.peer) else { return };
@@ -880,19 +1074,19 @@ impl Relay {
         self.to_peer(&a, peer, data, scratch, now);
     }
 
-    /// Sends client data to a peer. A peer that is another of our relayed addresses gets it
-    /// directly (no hairpin through the NAT); other addresses of this server get nothing.
+    /// Sends client data to a peer. A peer at one of the server's own addresses gets it only when
+    /// the port is one of our relayed ports, directly (no hairpin through the NAT); every other
+    /// port there gets nothing, unless the config allows that address explicitly.
     fn to_peer(&self, from: &Allocation, peer: SocketAddr, data: &[u8], scratch: &mut [u8], now: Instant) {
-        if self.own_ips.read().contains(&peer.ip()) {
-            let target = self.tables.lock().by_relay.get(&peer).cloned();
-            match target {
+        if self.own.load().contains(peer.ip()) {
+            match self.by_port.get(&RelayPort::of(peer)).map(|e| e.value().clone()) {
                 Some(t) if data.len() + HEADROOM + 4 <= scratch.len() => {
                     scratch[HEADROOM..HEADROOM + data.len()].copy_from_slice(data);
                     t.forward_to_client(scratch, data.len(), from.relayed, now);
                     return;
                 }
                 Some(_) => return,
-                None if !self.limits().policy.explicitly_allows(peer.ip()) => return,
+                None if !self.limits.load().policy.explicitly_allows(peer.ip()) => return,
                 None => {}
             }
         }
@@ -929,6 +1123,7 @@ fn permit(st: &mut AllocState, ip: IpAddr, now: Instant) -> Result<(), Refuse> {
         None if st.permissions.len() >= MAX_PERMISSIONS => return Err(Refuse(508, "Insufficient Capacity")),
         None => st.permissions.push((ip, exp)),
     }
+    st.used = true;
     Ok(())
 }
 
@@ -954,12 +1149,13 @@ fn finish(w: &mut Writer, m: &Message, key: Option<&[u8; 16]>) {
     }
 }
 
-/// A non-blocking UDP socket for tokio. IPv6 sockets are IPv6 only, so the policy sees the
-/// families it expects.
-pub fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+/// A non-blocking UDP socket for tokio. With `dual_stack`, an IPv6 socket takes IPv4 too (the
+/// listener on `[::]`); otherwise it's IPv6 only (relay sockets, so the policy sees the family an
+/// allocation was made for).
+pub fn bind_udp(addr: SocketAddr, dual_stack: bool) -> std::io::Result<UdpSocket> {
     let s = socket2::Socket::new(socket2::Domain::for_address(addr), socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
     if addr.is_ipv6() {
-        s.set_only_v6(true)?;
+        s.set_only_v6(!dual_stack)?;
     }
     s.set_nonblocking(true)?;
     s.bind(&addr.into())?;
@@ -974,11 +1170,167 @@ mod tests {
     use super::*;
 
     async fn relay() -> Relay {
+        relay_with((49152, 65535), |_| {}).await
+    }
+
+    async fn relay_with(ports: (u16, u16), f: impl FnOnce(&mut TurnSection)) -> Relay {
         let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let mut t = TurnSection::default();
         t.peers.allow_loopback = true;
+        f(&mut t);
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        Relay::new("s3cret", "quark.test", "127.0.0.1".parse().unwrap(), (49152, 65535), udp, Limits::new(&t), rx)
+        Relay::new("s3cret", "quark.test", "127.0.0.1".parse().unwrap(), ports, udp, Limits::new(&t), rx)
+    }
+
+    fn client(n: u16) -> ClientKey {
+        ClientKey { tcp: false, addr: SocketAddr::from(([203, 0, 113, 9], 5000 + n)) }
+    }
+
+    /// A request signed with valid credentials for `user`, as a client at `client` would send.
+    fn signed(r: &Relay, client: ClientKey, user: &str, method: u16, build: impl Fn(&mut Writer)) -> Vec<u8> {
+        let username = format!("{}:{user}", now_secs() + 3600);
+        let key = long_term_key(&username, "quark.test", &rest_password("s3cret", &username));
+        let nonce = r.nonce(client.ip(), now_secs());
+        let mut buf = Vec::new();
+        let mut w = Writer::new(&mut buf, method, Class::Request, rand::random());
+        build(&mut w);
+        w.attr(attr::USERNAME, username.as_bytes()).attr(attr::REALM, b"quark.test").attr(attr::NONCE, &nonce).integrity(&key);
+        buf
+    }
+
+    /// Sends `pkt` from `client`; the answer's error code, or None for a success.
+    fn ask(r: &Relay, client: ClientKey, pkt: &[u8]) -> Option<u16> {
+        let (mut out, mut scratch) = (Vec::new(), vec![0u8; PACKET_BUF]);
+        assert_eq!(r.handle(pkt, client, None, &mut out, &mut scratch), Outcome::Reply);
+        let m = Message::parse(&out).unwrap();
+        m.get(attr::ERROR_CODE).map(|e| u16::from(e[2]) * 100 + u16::from(e[3]))
+    }
+
+    fn allocate(r: &Relay, client: ClientKey, user: &str) -> Option<u16> {
+        let req = signed(r, client, user, method::ALLOCATE, |w| {
+            w.attr(attr::REQUESTED_TRANSPORT, &[17, 0, 0, 0]);
+        });
+        ask(r, client, &req)
+    }
+
+    fn permit_peers(r: &Relay, client: ClientKey, peers: &[SocketAddr]) -> Option<u16> {
+        let req = signed(r, client, "alice@quark.test", method::CREATE_PERMISSION, |w| {
+            for p in peers {
+                w.xor_addr(attr::XOR_PEER_ADDRESS, *p);
+            }
+        });
+        ask(r, client, &req)
+    }
+
+    fn permissions(r: &Relay, client: ClientKey) -> usize {
+        r.by_client.get(&client).map_or(0, |a| a.state.lock().permissions.len())
+    }
+
+    #[tokio::test]
+    async fn ipv4_clients_on_a_dual_stack_listener_learn_their_ipv4_address() {
+        let r = relay().await;
+        let mapped = ClientKey { tcp: false, addr: "[::ffff:203.0.113.9]:5000".parse().unwrap() };
+        let mut req = Vec::new();
+        Writer::new(&mut req, method::BINDING, Class::Request, [5; 12]);
+        let (mut out, mut scratch) = (Vec::new(), vec![0u8; PACKET_BUF]);
+        assert_eq!(r.handle(&req, mapped, None, &mut out, &mut scratch), Outcome::Reply);
+        let m = Message::parse(&out).unwrap();
+        assert_eq!(m.xor_addr(attr::XOR_MAPPED_ADDRESS), Some("203.0.113.9:5000".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn the_per_account_quota_is_held_to_a_share_of_the_port_range() {
+        // 16 ports: an account gets two of them, whatever the configured quota says.
+        let r = relay_with((61_200, 61_215), |_| {}).await;
+        assert_eq!(allocate(&r, client(1), "alice@quark.test"), None);
+        assert_eq!(allocate(&r, client(2), "alice@quark.test"), None);
+        assert_eq!(allocate(&r, client(3), "alice@quark.test"), Some(486));
+        assert_eq!(allocate(&r, client(4), "bob@quark.test"), None);
+        assert_eq!(r.per_user_quota(&TurnQuota::default()), 2);
+        assert_eq!(relay().await.per_user_quota(&TurnQuota::default()), 16);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn racing_allocations_never_exceed_the_quota() {
+        let r = relay_with((49152, 65535), |t| t.quota.allocations_per_user = 1).await;
+        let rt = tokio::runtime::Handle::current();
+        let ok = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for i in 0..16 {
+                let (r, rt, ok) = (&r, &rt, &ok);
+                sc.spawn(move || {
+                    let _rt = rt.enter();
+                    if allocate(r, client(i), "alice@quark.test").is_none() {
+                        ok.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(ok.load(Ordering::Relaxed), 1);
+        assert_eq!(r.allocation_count(), 1);
+        assert_eq!(r.registry.lock().clients.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_permission_installs_all_or_nothing() {
+        let r = relay().await;
+        let c = client(1);
+        assert_eq!(allocate(&r, c, "alice@quark.test"), None);
+        let peer = |i: usize| SocketAddr::from(([1, 1, (i / 200) as u8, (i % 200) as u8 + 1], 9));
+        for chunk in (0..MAX_PERMISSIONS - 1).collect::<Vec<_>>().chunks(8) {
+            let peers: Vec<SocketAddr> = chunk.iter().map(|i| peer(*i)).collect();
+            assert_eq!(permit_peers(&r, c, &peers), None);
+        }
+        assert_eq!(permissions(&r, c), MAX_PERMISSIONS - 1);
+        // One slot left, two new peers: neither is installed.
+        assert_eq!(permit_peers(&r, c, &[peer(500), peer(501)]), Some(508));
+        assert_eq!(permissions(&r, c), MAX_PERMISSIONS - 1);
+        // Refreshing existing ones alongside one new one fits.
+        assert_eq!(permit_peers(&r, c, &[peer(0), peer(500)]), None);
+        assert_eq!(permissions(&r, c), MAX_PERMISSIONS);
+    }
+
+    #[tokio::test]
+    async fn unused_allocations_end_early_and_used_ones_live_on() {
+        let r = relay().await;
+        assert_eq!(allocate(&r, client(1), "alice@quark.test"), None);
+        assert_eq!(allocate(&r, client(2), "bob@quark.test"), None);
+        assert_eq!(permit_peers(&r, client(1), &["8.8.8.8:9".parse().unwrap()]), None);
+        let later = Instant::now() + UNUSED_LIFETIME + Duration::from_secs(1);
+        r.sweep(later);
+        assert!(r.has_allocation(&client(1)));
+        assert!(!r.has_allocation(&client(2)));
+        assert!(!r.registry.lock().per_user.contains_key("bob@quark.test"));
+    }
+
+    #[tokio::test]
+    async fn broken_allocations_are_swept_and_their_quota_freed() {
+        let r = relay_with((49152, 65535), |t| t.quota.allocations_per_user = 1).await;
+        assert_eq!(allocate(&r, client(1), "alice@quark.test"), None);
+        if let Some(a) = r.by_client.get(&client(1)) {
+            a.fail();
+        }
+        r.sweep(Instant::now());
+        assert!(!r.has_allocation(&client(1)));
+        assert_eq!(allocate(&r, client(2), "alice@quark.test"), None);
+    }
+
+    #[tokio::test]
+    async fn own_addresses_include_every_interface() {
+        let r = relay().await;
+        let own = r.own.load();
+        assert!(own.contains("127.0.0.1".parse().unwrap()));
+        for ip in interface_addrs().unwrap_or_default() {
+            assert!(own.contains(ip), "{ip}");
+        }
+    }
+
+    #[test]
+    fn ipv6_sources_are_grouped_by_their_64() {
+        let a = source_prefix("2001:db8:1:2:aaaa::1".parse().unwrap());
+        assert_eq!(a, source_prefix("2001:db8:1:2:bbbb::9".parse().unwrap()));
+        assert_ne!(a, source_prefix("2001:db8:1:3::1".parse().unwrap()));
+        assert_eq!(source_prefix("::ffff:198.51.100.1".parse().unwrap()), source_prefix("198.51.100.1".parse().unwrap()));
     }
 
     #[test]
@@ -1029,9 +1381,33 @@ mod tests {
         let mut sent = 0;
         while r.amp.allow(ip, 80, now) {
             sent += 80;
-            assert!(sent <= AMP_PER_IP.1 as usize);
+            assert!(sent <= AMP_PER_SOURCE.1 as usize);
         }
         assert!(r.amp.allow("198.51.100.2".parse().unwrap(), 80, now));
+        // Rotating addresses within one IPv6 /64 doesn't buy more.
+        let mut sent = 0;
+        for i in 0u16.. {
+            if !r.amp.allow(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, i)), 80, now) {
+                break;
+            }
+            sent += 80;
+            assert!(sent <= AMP_PER_SOURCE.1 as usize);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flood_from_many_sources_leaves_returning_users_their_challenges() {
+        let r = relay().await;
+        let now = Instant::now();
+        let known: IpAddr = "192.0.2.77".parse().unwrap();
+        r.amp.verify(known, now);
+        // Enough sources to drain the shared budget.
+        for i in 0..(AMP_SHARED.1 / AMP_PER_SOURCE.1 + 8) as u32 {
+            let ip = IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + i));
+            while r.amp.allow(ip, 512, now) {}
+        }
+        assert!(!r.amp.allow("192.0.2.78".parse().unwrap(), 80, now));
+        assert!(r.amp.allow(known, 80, now));
     }
 
     #[tokio::test]

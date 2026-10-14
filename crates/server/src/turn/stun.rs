@@ -245,7 +245,7 @@ impl<'a> Message<'a> {
     }
 }
 
-fn hmac_sha1(key: &[u8]) -> Hmac<Sha1> {
+pub(crate) fn hmac_sha1(key: &[u8]) -> Hmac<Sha1> {
     // HMAC takes keys of any length.
     <Hmac<Sha1> as Mac>::new_from_slice(key).unwrap_or_else(|_| unreachable!("HMAC accepts any key length"))
 }

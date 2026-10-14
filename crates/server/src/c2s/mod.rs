@@ -54,6 +54,77 @@ impl AuthLimiter {
     }
 }
 
+/// Client connections that haven't signed in yet, over every transport (TCP, WebSocket, BOSH).
+/// Each one costs a task, buffers and a TLS session for up to `auth_timeout_secs` without anyone
+/// having proved who they are, so there are only so many at once: in all, and per address (an
+/// IPv6 /64 counts as one, since one host usually has a whole /64 to pick from).
+#[derive(Default)]
+pub struct PreAuth {
+    state: Mutex<PreAuthState>,
+}
+
+#[derive(Default)]
+struct PreAuthState {
+    total: usize,
+    per_ip: HashMap<IpAddr, usize>,
+}
+
+impl PreAuth {
+    /// A place for one more connection from `ip` (None: unknown, counted in the total only), or
+    /// None when the limits are reached. Limits are read each time, so a reload applies.
+    pub fn begin(self: &Arc<Self>, ip: Option<IpAddr>, total: usize, per_ip: usize) -> Option<PreAuthSlot> {
+        let key = ip.map(crate::s2s::ip_key);
+        let mut st = self.state.lock();
+        if st.total >= total {
+            return None;
+        }
+        if let Some(k) = key {
+            let n = st.per_ip.entry(k).or_insert(0);
+            if *n >= per_ip {
+                return None;
+            }
+            *n += 1;
+        }
+        st.total += 1;
+        Some(PreAuthSlot { owner: self.clone(), key })
+    }
+
+    /// Connections signing in right now.
+    pub fn count(&self) -> usize {
+        self.state.lock().total
+    }
+}
+
+/// One connection's place in [`PreAuth`], given back when it's dropped: once the connection has
+/// signed in (bound or resumed) or ends.
+pub struct PreAuthSlot {
+    owner: Arc<PreAuth>,
+    key: Option<IpAddr>,
+}
+
+impl Drop for PreAuthSlot {
+    fn drop(&mut self) {
+        let mut st = self.owner.state.lock();
+        st.total = st.total.saturating_sub(1);
+        if let Some(k) = self.key {
+            if let Some(n) = st.per_ip.get_mut(&k) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    st.per_ip.remove(&k);
+                }
+            }
+        }
+    }
+}
+
+impl Server {
+    /// A place for a new client connection from `ip` that hasn't signed in yet (see [`PreAuth`]).
+    pub fn begin_preauth(&self, ip: Option<IpAddr>) -> Option<PreAuthSlot> {
+        let l = &self.config().limits;
+        self.preauth.begin(ip, l.max_unauthenticated, l.max_unauthenticated_per_ip)
+    }
+}
+
 /// Accepts client connections. `direct_tls`: TLS from the first byte (XEP-0368).
 pub async fn accept_loop(srv: Arc<Server>, listener: TcpListener, direct_tls: bool) -> std::io::Result<()> {
     if let Ok(addr) = listener.local_addr() {
@@ -63,7 +134,7 @@ pub async fn accept_loop(srv: Arc<Server>, listener: TcpListener, direct_tls: bo
     let direct = srv.certs.server_config(&[b"xmpp-client"]);
     let mut shutdown = srv.shutdown_signal();
     loop {
-        let (tcp, _) = tokio::select! {
+        let (tcp, addr) = tokio::select! {
             r = listener.accept() => match r {
                 Ok(x) => x,
                 Err(e) => {
@@ -74,6 +145,11 @@ pub async fn accept_loop(srv: Arc<Server>, listener: TcpListener, direct_tls: bo
                 }
             },
             _ = shutdown.changed() => return Ok(()),
+        };
+        // Held from before the TLS handshake until the client has signed in.
+        let Some(slot) = srv.begin_preauth(Some(addr.ip())) else {
+            tracing::debug!(peer = %addr, "too many clients signing in; refusing one");
+            continue;
         };
         let srv = srv.clone();
         let (starttls, direct) = (starttls.clone(), direct.clone());
@@ -88,17 +164,25 @@ pub async fn accept_loop(srv: Arc<Server>, listener: TcpListener, direct_tls: bo
             } else {
                 Box::new(TcpTransport::plain(tcp, ns::CLIENT, cfg.limits.c2s_stanza_bytes, srv.certs.clone(), starttls))
             };
-            serve(srv, t).await;
+            serve_counted(srv, t, Some(slot)).await;
         });
     }
 }
 
-/// Runs a client connection from the first byte to the end of its session.
-pub async fn serve(srv: Arc<Server>, mut t: Box<dyn Transport>) {
+/// Runs a client connection from the first byte to the end of its session. The transport holds
+/// its own place among the connections signing in (see [`PreAuth`]).
+pub async fn serve(srv: Arc<Server>, t: Box<dyn Transport>) {
+    serve_counted(srv, t, None).await;
+}
+
+/// [`serve`], giving `slot` back once the client has signed in or the connection ends.
+async fn serve_counted(srv: Arc<Server>, mut t: Box<dyn Transport>, slot: Option<PreAuthSlot>) {
     srv.stats.c2s_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let limit = Duration::from_secs(srv.config().limits.auth_timeout_secs);
     let mut n = Negotiation::new(srv.clone());
-    let outcome = match tokio::time::timeout(limit, n.run(t.as_mut())).await {
+    let outcome = tokio::time::timeout(limit, n.run(t.as_mut())).await;
+    drop(slot);
+    let outcome = match outcome {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
             t.close(e.as_ref()).await;
@@ -712,5 +796,29 @@ impl Negotiation {
             inactive: false,
             sm: None,
         })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_ins_are_capped_in_all_and_per_address() {
+        let p = Arc::new(PreAuth::default());
+        let a: IpAddr = "203.0.113.5".parse().unwrap();
+        let held: Vec<_> = (0..3).map(|_| p.begin(Some(a), 5, 3).unwrap()).collect();
+        assert!(p.begin(Some(a), 5, 3).is_none());
+        // An IPv6 /64 is one address.
+        let v6 = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        let six: Vec<_> = (1..=2).map(|i| p.begin(v6(&format!("2001:db8:1:2::{i}")), 5, 2).unwrap()).collect();
+        assert!(p.begin(v6("2001:db8:1:2:ffff::9"), 5, 2).is_none());
+        assert!(p.begin(v6("2001:db8:1:3::1"), 5, 2).is_none(), "the total is reached");
+        assert_eq!(p.count(), 5);
+        drop(held);
+        assert!(p.begin(Some(a), 5, 3).is_some());
+        drop(six);
+        assert_eq!(p.count(), 0);
+        assert!(p.state.lock().per_ip.is_empty(), "addresses with nothing open are forgotten");
     }
 }

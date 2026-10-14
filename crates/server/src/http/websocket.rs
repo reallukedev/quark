@@ -20,7 +20,7 @@ use futures_util::{SinkExt, StreamExt};
 use quark_core::xml::{StreamEvent, XmlError};
 use quark_core::{ns, Element};
 
-use super::{AppState, Conn, Negotiating};
+use super::{AppState, Conn};
 use crate::sasl::ChannelBindings;
 use crate::server::Server;
 use crate::transport::{StanzaReader, StanzaWriter, StreamError, Transport};
@@ -44,7 +44,7 @@ pub(super) async fn handler(
         Err(e) => return (e.status(), "This is the XMPP WebSocket endpoint (RFC 7395). Chat apps connect here.\n").into_response(),
     };
     let peer = super::peer(&conn, &headers);
-    let Some(negotiating) = st.negotiations.begin(peer.ip) else {
+    let Some(negotiating) = st.srv.begin_preauth(Some(peer.ip)) else {
         return (StatusCode::TOO_MANY_REQUESTS, "Too many connections are signing in from your address. Try again in a minute.\n")
             .into_response();
     };
@@ -219,7 +219,7 @@ pub struct WsTransport {
     cb: ChannelBindings,
     sni: Option<String>,
     /// Counts against the address's sign-ins until the stream splits into a session.
-    negotiating: Option<Negotiating>,
+    negotiating: Option<crate::c2s::PreAuthSlot>,
 }
 
 #[async_trait]

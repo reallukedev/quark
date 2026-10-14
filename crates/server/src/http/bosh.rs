@@ -29,7 +29,7 @@ use rand::RngCore;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
 
-use super::{AppState, Conn, Negotiating, WebState};
+use super::{AppState, Conn, WebState};
 use crate::sasl::ChannelBindings;
 use crate::transport::{StanzaReader, StanzaWriter, StreamError, Transport};
 
@@ -198,7 +198,7 @@ async fn create(st: &Arc<WebState>, conn: &Conn, headers: &HeaderMap, el: Elemen
         return terminate("remote-connection-failed");
     }
     let peer = super::peer(conn, headers);
-    let Some(negotiating) = st.negotiations.begin(peer.ip) else {
+    let Some(negotiating) = st.srv.begin_preauth(Some(peer.ip)) else {
         tracing::debug!(ip = %peer.ip, "too many BOSH sessions signing in from one address");
         return terminate("policy-violation");
     };
@@ -609,7 +609,7 @@ struct BoshTransport {
     secure: bool,
     cb: ChannelBindings,
     /// Counts against the address's sign-ins until the stream splits into a session.
-    negotiating: Option<Negotiating>,
+    negotiating: Option<crate::c2s::PreAuthSlot>,
 }
 
 #[async_trait]

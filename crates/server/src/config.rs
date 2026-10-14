@@ -109,6 +109,16 @@ pub struct Limits {
     /// Stanzas queued for a slow client before it is disconnected.
     #[serde(default = "default_queue")]
     pub max_queue: usize,
+    /// Bytes of stanzas a session may hold for its client before it is disconnected: queued for
+    /// a slow connection, or kept for one that dropped until it resumes (XEP-0198).
+    #[serde(default = "default_queue_bytes")]
+    pub max_queue_bytes: usize,
+    /// Client connections signing in at once (TCP, WebSocket and BOSH together).
+    #[serde(default = "default_unauthenticated")]
+    pub max_unauthenticated: usize,
+    /// Client connections signing in at once from one address (an IPv6 /64 counts as one).
+    #[serde(default = "default_unauthenticated_per_ip")]
+    pub max_unauthenticated_per_ip: usize,
     /// Devices one account can have online at once.
     #[serde(default = "default_sessions")]
     pub max_sessions_per_account: usize,
@@ -129,6 +139,9 @@ impl Default for Limits {
             auth_timeout_secs: default_auth_timeout(),
             resume_secs: default_resume(),
             max_queue: default_queue(),
+            max_queue_bytes: default_queue_bytes(),
+            max_unauthenticated: default_unauthenticated(),
+            max_unauthenticated_per_ip: default_unauthenticated_per_ip(),
             max_sessions_per_account: default_sessions(),
             auth_failures_per_minute: default_auth_failures(),
             registrations_per_hour: default_registrations(),
@@ -396,6 +409,15 @@ fn default_resume() -> u64 {
 }
 fn default_queue() -> usize {
     10_000
+}
+fn default_queue_bytes() -> usize {
+    8 * 1024 * 1024
+}
+fn default_unauthenticated() -> usize {
+    2_000
+}
+fn default_unauthenticated_per_ip() -> usize {
+    64
 }
 fn default_sessions() -> usize {
     64

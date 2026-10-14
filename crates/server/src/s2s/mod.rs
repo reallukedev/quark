@@ -575,7 +575,7 @@ fn per_ip_cap(max_incoming: usize) -> usize {
 
 /// What connections are counted under: the address, or its /64 for IPv6, since one host
 /// usually has a whole /64 to pick from.
-fn ip_key(ip: IpAddr) -> IpAddr {
+pub(crate) fn ip_key(ip: IpAddr) -> IpAddr {
     match ip.to_canonical() {
         IpAddr::V6(v6) => {
             let s = v6.segments();

@@ -10,7 +10,6 @@ mod files;
 pub mod jpeg;
 mod websocket;
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
@@ -27,7 +26,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Extension, Router};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use parking_lot::Mutex;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tower::ServiceExt as _;
@@ -45,9 +43,6 @@ const MAX_CONNECTIONS: usize = 20_000;
 const BODY_LIMIT: usize = 1 << 20;
 /// How long open requests get to finish when the server stops.
 const DRAIN: Duration = Duration::from_secs(10);
-/// WebSocket streams and BOSH sessions one address may have signing in at once. Each holds a
-/// task, a parser and (for BOSH) a session until it binds or the sign-in timeout ends it.
-const NEGOTIATIONS_PER_IP: usize = 64;
 
 /// Facts about the TCP (or TLS) connection a request came in on.
 #[derive(Clone)]
@@ -135,42 +130,6 @@ fn metrics_allowed(token: Option<&str>, conn: &Conn, headers: &HeaderMap) -> boo
     is_private(peer(conn, headers).ip)
 }
 
-/// Web streams still signing in, per address.
-#[derive(Default, Clone)]
-pub(crate) struct Negotiations(Arc<Mutex<HashMap<IpAddr, usize>>>);
-
-impl Negotiations {
-    /// A place for one more stream from `ip`, or None when it has `NEGOTIATIONS_PER_IP` already.
-    pub fn begin(&self, ip: IpAddr) -> Option<Negotiating> {
-        let mut m = self.0.lock();
-        let n = m.entry(ip).or_insert(0);
-        if *n >= NEGOTIATIONS_PER_IP {
-            return None;
-        }
-        *n += 1;
-        Some(Negotiating { owner: self.clone(), ip })
-    }
-}
-
-/// One stream's place in [`Negotiations`]. The transports drop it when the stream binds or
-/// resumes (they split then) or ends.
-pub(crate) struct Negotiating {
-    owner: Negotiations,
-    ip: IpAddr,
-}
-
-impl Drop for Negotiating {
-    fn drop(&mut self) {
-        let mut m = self.owner.0.lock();
-        if let Some(n) = m.get_mut(&self.ip) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                m.remove(&self.ip);
-            }
-        }
-    }
-}
-
 /// Counters for things only the web side sees.
 #[derive(Default)]
 pub(crate) struct WebStats {
@@ -187,7 +146,6 @@ pub(crate) struct WebState {
     pub stats: WebStats,
     /// Open connections, across listeners (`MAX_CONNECTIONS` permits).
     pub connections: Arc<Semaphore>,
-    pub negotiations: Negotiations,
 }
 
 type AppState = State<Arc<WebState>>;
@@ -208,7 +166,6 @@ pub async fn start(srv: &Arc<Server>) -> anyhow::Result<Vec<std::net::SocketAddr
         bosh: bosh::Registry::default(),
         stats: WebStats::default(),
         connections: limit.clone(),
-        negotiations: Negotiations::default(),
     });
     let app = router(srv, state.clone());
     let tls = cfg.http.tls.then(|| srv.certs.server_config(&[b"http/1.1"]));
@@ -536,18 +493,6 @@ mod tests {
         assert!(!metrics_allowed(Some("s3cret"), &local, &headers(&[])));
         assert!(metrics_allowed(Some("s3cret"), &conn("203.0.113.5"), &headers(&[("authorization", "Bearer s3cret")])));
         assert!(!metrics_allowed(Some("s3cret"), &local, &headers(&[("authorization", "Bearer nope")])));
-    }
-
-    #[test]
-    fn negotiations_are_capped_per_address() {
-        let n = Negotiations::default();
-        let a: IpAddr = "203.0.113.5".parse().unwrap();
-        let held: Vec<_> = (0..NEGOTIATIONS_PER_IP).map(|_| n.begin(a).unwrap()).collect();
-        assert!(n.begin(a).is_none());
-        assert!(n.begin("203.0.113.6".parse().unwrap()).is_some(), "other addresses aren't affected");
-        drop(held);
-        assert!(n.begin(a).is_some());
-        assert!(n.0.lock().is_empty(), "addresses with nothing open are forgotten");
     }
 
     #[test]

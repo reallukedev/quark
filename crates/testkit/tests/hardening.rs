@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use quark::modules::roster;
 use quark_testkit::quark_core::{ns, Element, Jid};
-use quark_testkit::{presence, Client, TestServer, DOMAIN};
+use quark_testkit::{presence, Client, Options, TestServer, DOMAIN};
 
 const PW: &str = "password-1";
 const QUIET: Duration = Duration::from_millis(500);
@@ -166,5 +166,29 @@ async fn control_characters_end_the_stream_and_go_nowhere() -> anyhow::Result<()
     alice.send_raw(&format!("<message to='{}' type='chat' xmlns:p='urn:example:p' p:x='1'><body>ok</body></message>", jid("bob"))).await?;
     let got = bob.expect(|e| e.name() == "message").await?;
     assert_eq!(got.attr_ns("urn:example:p", "x"), Some("1"), "{got}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn connections_signing_in_are_capped_per_address() -> anyhow::Result<()> {
+    let s = TestServer::start_with(Options { extra_config: "[limits]\nmax_unauthenticated_per_ip = 2\n".into(), ..Default::default() }).await?;
+    s.add_user("alice", PW).await?;
+    let first = Client::connect(s.c2s(), s.domain()).await?;
+    let _second = Client::connect(s.c2s(), s.domain()).await?;
+    assert!(Client::connect(s.c2s(), s.domain()).await.is_err(), "a third connection signing in from one address is refused");
+    // Ending one gives its place back, and a signed-in session doesn't hold one.
+    drop(first);
+    let mut alice = None;
+    for _ in 0..50 {
+        if let Ok(c) = s.login("alice", PW).await {
+            alice = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut alice = alice.expect("signing in works again once a place is free");
+    let _third = Client::connect(s.c2s(), s.domain()).await?;
+    let r = alice.iq_get(Some(s.domain()), Element::new("ping", ns::PING)).await?;
+    assert_eq!(r.attr("type"), Some("result"), "{r}");
     Ok(())
 }

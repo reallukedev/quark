@@ -121,6 +121,8 @@ pub struct Server {
     pub certs: Arc<CertStore>,
     pub fast_tokens: crate::c2s::FastTokens,
     pub auth_limiter: crate::c2s::AuthLimiter,
+    /// Client connections still signing in, over every transport.
+    pub preauth: Arc<crate::c2s::PreAuth>,
     pub modules: Vec<Arc<dyn Module>>,
     iq_table: HashMap<IqTarget, HashMap<&'static str, Arc<dyn Module>>>,
     remote: OnceLock<Arc<dyn Remote>>,
@@ -169,6 +171,7 @@ impl Server {
             accounts: Accounts::new(db.clone()),
             fast_tokens: crate::c2s::FastTokens::new(db.clone()),
             auth_limiter: crate::c2s::AuthLimiter::default(),
+            preauth: Arc::default(),
             sessions: Sessions::default(),
             config: RwLock::new(Arc::new(config)),
             hosts: RwLock::new(HashMap::new()),

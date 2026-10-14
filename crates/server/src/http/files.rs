@@ -129,7 +129,10 @@ pub(super) async fn put(
     let mut claim = Claim { srv: Some(st.srv.clone()), token: token.clone() };
     let dir = upload::dir(srv);
     let part = dir.join(format!(".{token}.part"));
-    let strip = srv.config().http.strip_photo_metadata && essence(&slot.ctype) == "image/jpeg";
+    // Every upload goes through the scrubber, whatever type or name it claims: a photo sent as
+    // `photo.bin` or `application/octet-stream` carries its location just the same. It only
+    // acts on bytes that start with the JPEG start-of-image marker and passes the rest untouched.
+    let strip = srv.config().http.strip_photo_metadata;
     let received = tokio::time::timeout(deadline(slot.size), receive(body, &part, slot.size, strip)).await;
     let stored = match received {
         Ok(Ok(n)) => n,

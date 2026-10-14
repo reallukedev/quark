@@ -151,7 +151,8 @@ token set, only the token counts: local requests need it as well.
 
 ### Photo metadata
 
-With `strip_photo_metadata = true`, JPEG uploads lose EXIF (camera, time, GPS), XMP, IPTC and
+With `strip_photo_metadata = true`, JPEG uploads (recognised by their content, whatever name or
+type they're sent with) lose EXIF (camera, time, GPS), XMP, IPTC and
 comments as they stream in (the orientation is kept). It's off by default because the stored file
 then differs from what was sent: clients that share a file's hash and size with its link
 (XEP-0446/0447 stateless file sharing, used by Dino and Gajim) check the download against them and

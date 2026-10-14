@@ -63,6 +63,8 @@ pub const CONCURRENT_UPLOADS: i64 = 4;
 pub const STATE_SLOT: i64 = 0;
 pub const STATE_UPLOADING: i64 = 1;
 pub const STATE_STORED: i64 = 2;
+/// A failed upload's files are being removed ([`abort_upload`]); the slot is unused again after.
+pub const STATE_RELEASING: i64 = 3;
 
 /// Where uploaded files live: `<data_dir>/uploads/<token>`.
 pub fn dir(srv: &Server) -> PathBuf {
@@ -251,16 +253,22 @@ pub(crate) async fn begin_upload(srv: &Server, token: &str) -> Result<Begin, DbE
         .await
 }
 
-/// Gives the slot back after a failed upload, so the client can try again while it's valid.
-/// Removes what the upload left on disk first (its file too, if it was renamed into place but
-/// never marked stored), and only while the slot is still marked uploading: then no other
-/// upload of it can be running, and a finished one is never touched.
+/// Gives the slot back after a failed upload, so the client can try again while it's valid,
+/// removing what the upload left on disk (its file too, if it was renamed into place but never
+/// marked stored).
+///
+/// The slot moves from uploading to releasing in one statement before any file is touched, and
+/// only then are files removed: a finish that commits first leaves nothing to release (its file
+/// stays), one that comes after finds the slot no longer uploading and fails. While releasing,
+/// no new upload of the slot can start and write a part file this would remove.
 pub(crate) async fn abort_upload(srv: &Server, token: &str) {
-    match slot(srv, token).await {
-        Ok(Some(s)) if s.state == STATE_UPLOADING => {}
+    let t = token.to_string();
+    let claimed = srv.db.write(move |tx| tx.execute("UPDATE uploads SET state = 3 WHERE token = ?1 AND state = 1", [t])).await;
+    match claimed {
+        Ok(1) => {}
         Ok(_) => return,
         Err(e) => {
-            tracing::warn!(error = %e, "couldn't look up an upload slot to release");
+            tracing::warn!(error = %e, "couldn't release an upload slot");
             return;
         }
     }
@@ -268,7 +276,8 @@ pub(crate) async fn abort_upload(srv: &Server, token: &str) {
     let _ = tokio::fs::remove_file(dir.join(format!(".{token}.part"))).await;
     let _ = tokio::fs::remove_file(dir.join(token)).await;
     let t = token.to_string();
-    if let Err(e) = srv.db.write(move |tx| tx.execute("UPDATE uploads SET state = 0 WHERE token = ?1 AND state = 1", [t])).await {
+    if let Err(e) = srv.db.write(move |tx| tx.execute("UPDATE uploads SET state = 0 WHERE token = ?1 AND state = 3", [t])).await {
+        // Left releasing: the expiry sweep or the next start cleans it up.
         tracing::warn!(error = %e, "couldn't release an upload slot");
     }
 }
@@ -279,7 +288,7 @@ pub(crate) async fn reset_interrupted(srv: &Server) {
     let tokens: Vec<String> = match srv
         .db
         .write(|tx| {
-            let mut st = tx.prepare("UPDATE uploads SET state = 0 WHERE state = 1 RETURNING token")?;
+            let mut st = tx.prepare("UPDATE uploads SET state = 0 WHERE state IN (1, 3) RETURNING token")?;
             let rows = st.query_map([], |r| r.get(0))?;
             rows.collect()
         })
@@ -351,7 +360,7 @@ pub async fn sweep(srv: &Arc<Server>, now: i64) -> usize {
             }
             // Slots never used, and uploads that died halfway a day ago.
             t.execute("DELETE FROM uploads WHERE state = 0 AND slot_expires < ?1", [now])?;
-            let mut st = t.prepare_cached("DELETE FROM uploads WHERE state = 1 AND slot_expires < ?1 RETURNING token")?;
+            let mut st = t.prepare_cached("DELETE FROM uploads WHERE state IN (1, 3) AND slot_expires < ?1 RETURNING token")?;
             let rows = st.query_map([now - DAY_MS], |r| r.get(0))?;
             for r in rows {
                 gone.push(r?);
@@ -390,7 +399,7 @@ pub async fn sweep(srv: &Arc<Server>, now: i64) -> usize {
     let known: std::collections::HashSet<String> = match srv
         .db
         .read(|c| {
-            let mut st = c.prepare("SELECT token FROM uploads WHERE state IN (1, 2)")?;
+            let mut st = c.prepare("SELECT token FROM uploads WHERE state IN (1, 2, 3)")?;
             let rows = st.query_map([], |r| r.get(0))?;
             rows.collect()
         })
@@ -704,5 +713,74 @@ mod tests {
         assert_eq!(pct("a b/ü.jpg"), "a%20b%2F%C3%BC.jpg");
         assert!(valid_token("0123456789abcdef0123456789abcdef"));
         assert!(!valid_token("../0123456789abcdef0123456789abc"));
+    }
+
+    async fn server(dir: &std::path::Path) -> Arc<Server> {
+        let path = dir.join("quark.toml");
+        let text =
+            format!("[server]\ndata_dir = {:?}\n[tls]\ncert_dir = {:?}\n[[host]]\ndomain = \"a.test\"\n", dir.join("data"), dir.join("certs"));
+        std::fs::write(&path, text).unwrap();
+        let srv = crate::run::build(crate::run::load_config(&path).unwrap()).unwrap();
+        srv.accounts.create("a.test", "sam", "password", crate::accounts::Role::Member).await.unwrap();
+        tokio::fs::create_dir_all(super::dir(&srv)).await.unwrap();
+        srv
+    }
+
+    async fn new_slot(srv: &Server, token: &str) {
+        let (t, now) = (token.to_string(), quark_core::time::now_ms());
+        srv.db
+            .write(move |tx| {
+                tx.execute(
+                    "INSERT INTO uploads (token, host, user, name, ctype, size, state, created, slot_expires)
+                     VALUES (?1, 'a.test', 'sam', 'f.txt', 'text/plain', 3, 0, ?2, ?3)",
+                    params![t, now, now + SLOT_MS],
+                )
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn state(srv: &Server, token: &str) -> i64 {
+        slot(srv, token).await.unwrap().unwrap().state
+    }
+
+    #[tokio::test]
+    async fn releasing_a_slot_never_touches_a_stored_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let srv = server(tmp.path()).await;
+        let dir = super::dir(&srv);
+        let t = "0123456789abcdef0123456789abcdef";
+        new_slot(&srv, t).await;
+        assert_eq!(begin_upload(&srv, t).await.unwrap(), Begin::Ok);
+        tokio::fs::write(dir.join(t), b"abc").await.unwrap();
+        assert!(finish_upload(&srv, t, 3).await.unwrap());
+        // A release that lost the race to the finish leaves the stored file alone.
+        abort_upload(&srv, t).await;
+        assert_eq!(state(&srv, t).await, STATE_STORED);
+        assert!(dir.join(t).exists());
+
+        // A failed upload's part file goes, and the slot can be used again.
+        let u = "fedcba9876543210fedcba9876543210";
+        new_slot(&srv, u).await;
+        assert_eq!(begin_upload(&srv, u).await.unwrap(), Begin::Ok);
+        tokio::fs::write(dir.join(format!(".{u}.part")), b"ab").await.unwrap();
+        abort_upload(&srv, u).await;
+        assert_eq!(state(&srv, u).await, STATE_SLOT);
+        assert!(!dir.join(format!(".{u}.part")).exists());
+        assert_eq!(begin_upload(&srv, u).await.unwrap(), Begin::Ok);
+    }
+
+    #[tokio::test]
+    async fn a_slot_being_released_can_neither_finish_nor_start_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let srv = server(tmp.path()).await;
+        let t = "0123456789abcdef0123456789abcdef";
+        new_slot(&srv, t).await;
+        assert_eq!(begin_upload(&srv, t).await.unwrap(), Begin::Ok);
+        let tt = t.to_string();
+        srv.db.write(move |tx| tx.execute("UPDATE uploads SET state = 3 WHERE token = ?1", [tt])).await.unwrap();
+        assert!(!finish_upload(&srv, t, 3).await.unwrap(), "the release removes the file, so it can't be marked stored");
+        assert_eq!(begin_upload(&srv, t).await.unwrap(), Begin::Taken);
+        assert_eq!(state(&srv, t).await, STATE_RELEASING);
     }
 }

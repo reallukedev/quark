@@ -1387,7 +1387,7 @@ dependencies = [
  "qrcode",
  "quark-core",
  "quark-mcp",
- "rand 0.8.8",
+ "rand 0.9.5",
  "rcgen",
  "rusqlite",
  "rustix",
@@ -1418,7 +1418,7 @@ name = "quark-core"
 version = "0.1.0"
 dependencies = [
  "quick-xml",
- "rand 0.8.8",
+ "rand 0.9.5",
  "stringprep",
  "thiserror 2.0.21",
  "tokio",
@@ -1428,7 +1428,7 @@ dependencies = [
 name = "quark-mcp"
 version = "0.1.0"
 dependencies = [
- "rand 0.8.8",
+ "rand 0.9.5",
  "rmcp",
  "schemars",
  "serde",
@@ -1450,7 +1450,7 @@ dependencies = [
  "pbkdf2",
  "quark",
  "quark-core",
- "rand 0.8.8",
+ "rand 0.9.5",
  "rcgen",
  "rustls",
  "serde_json",

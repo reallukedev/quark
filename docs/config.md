@@ -72,6 +72,34 @@ public_host = "turn.example.com"   # optional, defaults to the calls host
 external_ip = "203.0.113.7"        # optional, when behind NAT
 relay_min = 49160
 relay_max = 49200
+
+[turn.quota]
+allocations = 1000            # relayed addresses open at once, in total
+allocations_per_user = 16     # per account, but at most an eighth of the port range (min 2)
+kbps = 10000                  # per relayed address, both directions; 0 for no limit
+max_lifetime_secs = 3600
+
+[turn.peers]
+allow_private = false         # relay to 10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7
+allow_loopback = false        # tests only
+allow = []                    # networks always allowed, e.g. ["10.1.0.0/16"]
+deny = []                     # networks never relayed to
 ```
+
+The relay only sends where `turn.peers` allows. Loopback, link-local, cloud metadata endpoints,
+multicast and reserved ranges are always refused. So are all of the machine's own addresses
+(every interface, docker bridges included, re-listed every 30 seconds), except the relay's own
+relayed ports, which is how two callers on the same server reach each other.
+
+Private networks are off by default. Turning `allow_private` on lets any account send UDP to
+every device on the server's networks (the router, a NAS, containers). Calls don't need it: two
+phones on the same home Wi-Fi either connect directly or, when that fails, meet through their
+relayed addresses on this server. Turn it on, or better list the networks in `allow`, only if
+peers really live on a private network the server can route to, such as a VPN.
+
+Relayed addresses that never get a permission end after 3 minutes, so the ones phones open while
+setting up a call and don't use give their ports back quickly. The listener on `[::]` also takes
+IPv4 (UDP and TCP). TCP connections must authenticate within 30 seconds and one address (or IPv6
+/64) may have at most 16 open.
 
 Check a file without starting: `quark check-config /path/to/quark.toml` (errors carry the line).

@@ -372,3 +372,38 @@ async fn the_snapshot_reports_the_relay_running() -> anyhow::Result<()> {
     assert_eq!(udp(&s).port(), tcp(&s).port());
     Ok(())
 }
+
+/// One of this machine's non-loopback IPv4 addresses, if it has one.
+fn lan_ipv4() -> Option<std::net::IpAddr> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("192.0.2.1:9").ok()?;
+    Some(s.local_addr().ok()?.ip()).filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+}
+
+#[tokio::test]
+async fn services_on_the_machines_other_addresses_are_never_reached() -> anyhow::Result<()> {
+    // The relay listens on 127.0.0.1 here, but the box has other addresses (the LAN, docker
+    // bridges). Even with private peers allowed, nothing goes to them but our own relayed ports.
+    let Some(lan) = lan_ipv4() else { return Ok(()) };
+    let s = server("\n[turn.peers]\nallow_private = true\n").await?;
+    let mut c = client(&s, "alice@quark.test").await?;
+    c.allocate().await?;
+    let service = UdpSocket::bind("0.0.0.0:0").await?;
+    let target = SocketAddr::new(lan, service.local_addr()?.port());
+    assert_eq!(c.create_permission(target).await?.class(), Class::Success);
+    c.send_indication(target, b"knock knock").await?;
+    let mut buf = [0u8; 64];
+    assert!(tokio::time::timeout(QUIET, service.recv_from(&mut buf)).await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn private_peers_are_refused_by_default() -> anyhow::Result<()> {
+    let s = server("").await?;
+    let mut c = client(&s, "alice@quark.test").await?;
+    c.allocate().await?;
+    for p in ["192.168.1.20:5000", "10.0.0.5:5000", "172.17.0.2:80"] {
+        assert_eq!(c.create_permission(p.parse()?).await?.code(), Some(403), "{p}");
+    }
+    Ok(())
+}

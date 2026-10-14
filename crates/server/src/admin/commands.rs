@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use quark_core::{ns, Element, Jid};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::ApiError;
@@ -513,32 +513,6 @@ async fn reload(srv: &Arc<Server>) -> R {
 
 // ------------------------------------------------------------------------------ calls
 
-/// An external TURN relay (coturn's `use-auth-secret`), set with `turn.set`. Read by external
-/// service discovery (XEP-0215) to hand out credentials.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExternalTurn {
-    pub secret: String,
-    /// Where phones reach it; the domain when None.
-    pub host: Option<String>,
-    /// 3478 when None.
-    pub port: Option<u16>,
-}
-
-const TURN_SCOPE: &str = "calls";
-const TURN_KEY: &str = "turn_external";
-
-/// The external TURN relay, when one is set.
-pub async fn external_turn(srv: &Server) -> Option<ExternalTurn> {
-    match srv.kv_get(TURN_SCOPE, TURN_KEY).await {
-        Ok(Some(v)) => serde_json::from_slice(&v).ok(),
-        Ok(None) => None,
-        Err(e) => {
-            tracing::warn!(error = %e, "couldn't read the external TURN settings");
-            None
-        }
-    }
-}
-
 #[derive(Deserialize)]
 struct TurnSet {
     #[serde(default)]
@@ -550,9 +524,10 @@ struct TurnSet {
 }
 
 async fn turn_set(srv: &Server, a: TurnSet) -> R {
-    let secret = a.secret.filter(|s| !s.is_empty());
+    // Trimmed as `turn::set_external` stores it, so what's checked is what's kept.
+    let secret = a.secret.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let Some(secret) = secret else {
-        srv.kv_set(TURN_SCOPE, TURN_KEY, None).await?;
+        crate::turn::set_external(srv, None, None, None).await?;
         return Ok(json!(true));
     };
     if secret.len() > 1024 || secret.chars().any(char::is_control) {
@@ -569,8 +544,8 @@ async fn turn_set(srv: &Server, a: TurnSet) -> R {
         Some(p @ 1..=65535) => Some(p as u16),
         Some(_) => return Err(ApiError::invalid("The port is between 1 and 65535.")),
     };
-    let v = serde_json::to_vec(&ExternalTurn { secret, host, port }).map_err(ApiError::internal)?;
-    srv.kv_set(TURN_SCOPE, TURN_KEY, Some(v)).await?;
+    // Stored where external service discovery reads it (see `crate::turn`).
+    crate::turn::set_external(srv, Some(&secret), host.as_deref(), port).await?;
     Ok(json!(true))
 }
 

@@ -18,6 +18,7 @@ mcp = ["dep:quark-mcp"]
 quark-core.workspace = true
 quark-mcp = { path = "../mcp", optional = true }
 anyhow = "1"
+arc-swap = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
@@ -27,10 +28,12 @@ futures-util = { version = "0.3", features = ["sink"] }
 hex = "0.4"
 hickory-resolver = "0.24"
 hmac = "0.12"
+if-addrs = "0.15"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 md-5 = "0.10"
 crc32fast = "1"
+dashmap = "6"
 miniz_oxide = "0.8"
 parking_lot = "0.12"
 pbkdf2 = "0.12"

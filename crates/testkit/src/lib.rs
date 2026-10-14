@@ -131,7 +131,7 @@ impl TestServer {
     /// way a restart would. Clients of the old server are disconnected.
     pub async fn restart(&mut self) -> anyhow::Result<()> {
         self.srv.shut_down();
-        for s in self.srv.sessions.on_host(DOMAIN) {
+        for s in self.srv.sessions.on_host(&self.domain) {
             s.close("system-shutdown", None);
         }
         let cfg = quark::run::load_config(&self._dir.path().join("quark.toml"))?;
@@ -187,14 +187,15 @@ impl TestServer {
             "both" => Subscription::Both,
             _ => Subscription::None,
         };
-        roster::save(&self.srv, DOMAIN, user, &it).await?;
+        roster::save(&self.srv, &self.domain, user, &it).await?;
         Ok(())
     }
 
     /// Two local accounts that see each other's presence.
     pub async fn make_contacts(&self, a: &str, b: &str) -> anyhow::Result<()> {
-        self.roster_set(a, &format!("{b}@{DOMAIN}"), "both").await?;
-        self.roster_set(b, &format!("{a}@{DOMAIN}"), "both").await
+        let d = &self.domain;
+        self.roster_set(a, &format!("{b}@{d}"), "both").await?;
+        self.roster_set(b, &format!("{a}@{d}"), "both").await
     }
 
     /// Changes the domain's settings live.
@@ -741,8 +742,7 @@ impl ScramClient {
             "SCRAM-SHA-512" => "sha512",
             m => bail!("unknown mechanism {m}"),
         };
-        let nonce: String = (0..24).map(|_| rand::random::<char>()).filter(char::is_ascii_alphanumeric).take(16).collect();
-        let nonce = if nonce.len() < 8 { "fallbacknonce1234".to_string() } else { nonce };
+        let nonce: String = rand::Rng::sample_iter(rand::thread_rng(), rand::distributions::Alphanumeric).take(24).map(char::from).collect();
         let (gs2, cb) =
             if plus { ("p=tls-exporter,,".to_string(), Some(exporter.context("-PLUS needs TLS 1.3")?)) } else { ("n,,".to_string(), None) };
         let client_first_bare = format!("n={user},r={nonce}");
@@ -890,4 +890,33 @@ pub fn message(to: &str, kind: &str, body: &str) -> Element {
 /// Builds a `<presence/>`.
 pub fn presence(to: Option<&str>, kind: Option<&str>) -> Element {
     Element::new("presence", ns::CLIENT).attr_opt("to", to).attr_opt("type", kind)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scram_nonces_are_random() {
+        let a = ScramClient::new("SCRAM-SHA-256", "sam", "pw", None).unwrap();
+        let b = ScramClient::new("SCRAM-SHA-256", "sam", "pw", None).unwrap();
+        assert_eq!(a.nonce.len(), 24);
+        assert!(a.nonce.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_ne!(a.nonce, b.nonce);
+    }
+
+    #[tokio::test]
+    async fn helpers_use_the_servers_own_domain() {
+        let mut s = TestServer::start_with(Options { domain: Some("other.test".into()), ..Default::default() }).await.unwrap();
+        s.add_user("amy", "password1").await.unwrap();
+        s.add_user("ben", "password1").await.unwrap();
+        s.make_contacts("amy", "ben").await.unwrap();
+        let items = quark::modules::roster::items(&s.srv, "other.test", "amy").await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].contact.to_string(), "ben@other.test");
+        let mut c = s.login("amy", "password1").await.unwrap();
+        s.restart().await.unwrap();
+        let e = c.recv().await.unwrap();
+        assert!(e.name() == "error" && e.has_child("system-shutdown", ns::STREAMS), "the old session was closed: {e}");
+    }
 }

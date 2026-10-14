@@ -1107,6 +1107,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
 name = "quark"
 version = "0.1.0"
 dependencies = [
@@ -1122,6 +1128,7 @@ dependencies = [
  "hmac",
  "parking_lot",
  "pbkdf2",
+ "qrcode",
  "quark-core",
  "rand 0.8.8",
  "rcgen",
@@ -1160,6 +1167,7 @@ name = "quark-testkit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64",
  "hmac",
  "pbkdf2",
@@ -1167,6 +1175,7 @@ dependencies = [
  "quark-core",
  "rand 0.8.8",
  "rustls",
+ "serde_json",
  "sha1",
  "sha2",
  "tempfile",

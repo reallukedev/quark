@@ -231,6 +231,30 @@ pub trait Module: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// disco#info or disco#items (by `cx.payload`'s namespace) for a `node` on the server domain
+    /// this module owns, e.g. ad-hoc commands (XEP-0050 §2). None when it isn't this module's.
+    async fn server_node(&self, _cx: &IqCtx<'_>, _node: &str) -> Option<Vec<Element>> {
+        None
+    }
+
+    /// Account export (XEP-0227): this module's data for an account, as children of its
+    /// `<user/>` element (e.g. a PEP `<pubsub/>`, a MAM `<archive/>`).
+    async fn export_account(&self, _srv: &Arc<Server>, _host: &Host, _user: &str) -> Result<Vec<Element>, crate::db::DbError> {
+        Ok(Vec::new())
+    }
+
+    /// Account import (XEP-0227): takes what it owns among `user`'s children (the account exists
+    /// by now) and ignores the rest. Returns notes for the admin about anything left out.
+    async fn import_account(
+        &self,
+        _srv: &Arc<Server>,
+        _host: &Host,
+        _user: &str,
+        _data: &Element,
+    ) -> Result<Vec<String>, crate::db::DbError> {
+        Ok(Vec::new())
+    }
+
     /// Stream features for a signed-in client (`<sm/>`, `<csi/>`, `<ver/>`…).
     fn stream_features(&self, _host: &Host) -> Vec<Element> {
         Vec::new()

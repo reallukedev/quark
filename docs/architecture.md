@@ -45,6 +45,8 @@ A module can:
 - react to `Event`s (session started/ended, available presence, subscription changes,
   account created/deleted, settings changed),
 - run background tasks in `start()`.
+- carry their per-account data in account exports and imports (XEP-0227,
+  `export_account()` / `import_account()`; see `admin/pie.rs`).
 
 Rules of thumb:
 

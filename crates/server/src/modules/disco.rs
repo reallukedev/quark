@@ -43,6 +43,13 @@ impl Module for Disco {
         }
         let node = cx.payload.attr("node");
         let server = cx.to.node().is_none();
+        if let Some(n) = node.filter(|_| server) {
+            for m in &cx.srv.modules {
+                if let Some(children) = m.server_node(cx, n).await {
+                    return ok(Element::new("query", cx.payload.ns()).attr_set("node", n).children_from(children));
+                }
+            }
+        }
         if cx.payload.ns() == ns::DISCO_INFO {
             return ok(Element::new("query", ns::DISCO_INFO).attr_opt("node", node).children_from(info(cx, server)));
         }

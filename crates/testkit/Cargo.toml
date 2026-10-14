@@ -27,7 +27,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.29"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-rcgen = "0.13"
+rcgen = "0.14"
 
 [dev-dependencies]
 axum = "0.8"

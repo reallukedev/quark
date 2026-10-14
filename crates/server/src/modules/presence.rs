@@ -53,14 +53,21 @@ pub async fn from_client_broadcast(srv: &Arc<Server>, host: &Arc<Host>, session:
     let priority = el.child_text("priority", ns::CLIENT).and_then(|p| p.trim().parse::<i32>().ok()).map_or(0, |p| p.clamp(-128, 127) as i8);
     el.remove_attr("to");
     let caps = el.get_child("c", ns::CAPS).and_then(|c| Some((c.attr("node")?.to_string(), c.attr("ver")?.to_string())));
-    let initial = {
+    let (initial, flush_offline) = {
         let mut p = session.presence.lock();
         let initial = !p.available;
         p.available = true;
         p.priority = priority;
         p.last = Some(el.clone());
         p.caps = caps;
-        initial
+        // Offline messages go to the first presence with priority ≥ 0, whether that's the
+        // initial one or a later one from a session that started out hidden.
+        p.offline_owed |= initial;
+        let flush = p.offline_owed && priority >= 0;
+        if flush {
+            p.offline_owed = false;
+        }
+        (initial, flush)
     };
     let me = &session.jid;
     let bare = me.to_bare();
@@ -125,9 +132,9 @@ pub async fn from_client_broadcast(srv: &Arc<Server>, host: &Arc<Host>, session:
             p.set_attr("to", me.to_string());
             session.send(p);
         }
-        if priority >= 0 {
-            super::offline::flush(srv, host, session).await;
-        }
+    }
+    if flush_offline {
+        super::offline::flush(srv, host, session).await;
     }
     srv.emit(&Event::Available { jid: me.clone(), presence: el }).await;
 }

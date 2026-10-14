@@ -39,6 +39,9 @@ pub struct Presence {
     pub directed: HashSet<Jid>,
     /// XEP-0115 caps `ver` and `node`, for PEP notifications.
     pub caps: Option<(String, String)>,
+    /// Went available but hasn't been handed offline messages yet: it hid behind a negative
+    /// priority, and gets them once its priority is ≥ 0.
+    pub offline_owed: bool,
 }
 
 #[derive(Debug, Default)]

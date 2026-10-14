@@ -140,8 +140,14 @@ fn reply_error(session: &Arc<SessionHandle>, el: &Element, err: StanzaError) {
 }
 
 async fn local(srv: &Arc<Server>, host: &Arc<Host>, from: Jid, to: Jid, mut el: Element, session: Option<&Arc<SessionHandle>>) {
-    // Inbound filters (blocking, privacy) apply to stanzas for accounts, not to the server.
-    if to.node().is_some() && from.to_bare() != to.to_bare() {
+    // Inbound filters (blocking, privacy) apply to stanzas for accounts, not to the server, and
+    // only to accounts that exist: a made-up name gets its refusal below without any module
+    // loading (and keeping) state for it. Asked from memory; if that fails, the filters run.
+    let filtered = match to.node() {
+        Some(user) if from.to_bare() != to.to_bare() => srv.accounts.exists(&host.domain, user).await.unwrap_or(true),
+        _ => false,
+    };
+    if filtered {
         let cx = StanzaCtx { srv, host, from: &from, to: &to, session };
         for m in &srv.modules {
             match m.stanza_in(&cx, &mut el).await {
@@ -326,6 +332,25 @@ pub async fn deliver_message(srv: &Arc<Server>, host: &Arc<Host>, from: &Jid, to
         }
         return;
     }
+    // What gets refused or dropped is decided before the hooks run, so nothing is archived or
+    // pushed to a phone that the sender is told didn't arrive (or that nobody ever sees).
+    if to.resource().is_some() && srv.sessions.get(to).is_none() {
+        // RFC 6121 §8.5.3.2.1: chat goes to the account; groupchat and headline are dropped;
+        // normal (and anything else) is refused.
+        match kind.as_str() {
+            "chat" => {}
+            "groupchat" | "headline" | "error" => return,
+            _ => return bounce(srv, &msg, StanzaError::service_unavailable()).await,
+        }
+    }
+    if to.resource().is_none() {
+        if kind == "groupchat" {
+            return bounce(srv, &msg, StanzaError::service_unavailable()).await;
+        }
+        if matches!(kind.as_str(), "headline" | "error") && !srv.sessions.available_of(&bare).iter().any(|s| s.priority() >= 0) {
+            return;
+        }
+    }
     if hooks {
         let cx = StanzaCtx { srv, host, from, to, session: None };
         for m in &srv.modules {
@@ -350,8 +375,7 @@ pub async fn deliver_message(srv: &Arc<Server>, host: &Arc<Host>, from: &Jid, to
             s.send(msg);
             return;
         }
-        // RFC 6121 §8.5.3.2.1: chat goes to the account; groupchat and headline are dropped;
-        // normal (and anything else) is refused.
+        // The session went away while the hooks ran: the same rules as above.
         match kind.as_str() {
             "chat" => {}
             "groupchat" | "headline" | "error" => return,

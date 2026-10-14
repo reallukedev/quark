@@ -5,10 +5,12 @@
 //! blocked JID reaches the account, and nothing the account sends, or the server sends for it
 //! (presence, PEP), reaches the blocked JID.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use lru::LruCache;
 use parking_lot::Mutex;
 use quark_core::stanza::IqType;
 use quark_core::{ns, Condition, Element, Jid, StanzaError};
@@ -53,12 +55,24 @@ pub const REASON_ABUSE: &str = "urn:xmpp:reporting:abuse";
 
 pub struct Blocking;
 
-#[derive(Default)]
+/// Block lists kept in memory, least recently used dropped first. Only lists of accounts that
+/// exist are kept; one dropped is read again from the database when next needed.
+const CACHED_LISTS: NonZeroUsize = match NonZeroUsize::new(20_000) {
+    Some(n) => n,
+    None => NonZeroUsize::MIN,
+};
+
 struct State {
-    /// Blocked JIDs (normalized strings) by account; absent until first needed.
-    lists: Mutex<HashMap<Jid, Arc<HashSet<String>>>>,
+    /// Blocked JIDs (normalized strings) by account.
+    lists: Mutex<LruCache<Jid, Arc<HashSet<String>>>>,
     /// Devices (full JIDs) that fetched the blocklist and so get pushes (XEP-0191 §3.2).
     interested: Mutex<HashSet<Jid>>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        State { lists: Mutex::new(LruCache::new(CACHED_LISTS)), interested: Mutex::default() }
+    }
 }
 
 fn db_error(e: DbError) -> StanzaError {
@@ -93,6 +107,10 @@ async fn list(srv: &Server, account: &Jid) -> Result<Arc<HashSet<String>>, DbErr
         return Ok(l.clone());
     }
     let (h, u) = (account.domain().to_string(), account.node().unwrap_or_default().to_string());
+    // No such account (a made-up name someone wrote to): nothing blocked, and nothing cached.
+    if !srv.accounts.exists(&h, &u).await? {
+        return Ok(Arc::default());
+    }
     let items: HashSet<String> = srv
         .db
         .read(move |c| {
@@ -102,7 +120,7 @@ async fn list(srv: &Server, account: &Jid) -> Result<Arc<HashSet<String>>, DbErr
         })
         .await?;
     // A block saved while this was loading already put the newer list in place.
-    let l = st.lists.lock().entry(account).or_insert_with(|| Arc::new(items)).clone();
+    let l = st.lists.lock().get_or_insert(account, || Arc::new(items)).clone();
     Ok(l)
 }
 
@@ -304,7 +322,7 @@ async fn block(cx: &IqCtx<'_>, account: &Jid) -> IqResult {
             srv.route(p).await;
         }
     }
-    srv.ext::<State>().lists.lock().insert(account.clone(), Arc::new(updated));
+    srv.ext::<State>().lists.lock().put(account.clone(), Arc::new(updated));
     push(srv, account, items_element("block", &jids));
     ok_empty()
 }
@@ -332,7 +350,7 @@ async fn unblock(cx: &IqCtx<'_>, account: &Jid) -> IqResult {
         })
         .await
         .map_err(db_error)?;
-    srv.ext::<State>().lists.lock().insert(account.clone(), Arc::new(updated.clone()));
+    srv.ext::<State>().lists.lock().put(account.clone(), Arc::new(updated.clone()));
 
     // Contacts who may see the account's presence again get its current presence (§3.4).
     let gone: HashSet<String> = old.difference(&updated).cloned().collect();
@@ -454,11 +472,11 @@ impl Module for Blocking {
                 st.interested.lock().remove(jid);
                 let bare = jid.to_bare();
                 if !srv.sessions.is_online(&bare) {
-                    st.lists.lock().remove(&bare);
+                    st.lists.lock().pop(&bare);
                 }
             }
             Event::AccountDeleted { jid } => {
-                srv.ext::<State>().lists.lock().remove(&jid.to_bare());
+                srv.ext::<State>().lists.lock().pop(&jid.to_bare());
             }
             _ => {}
         }
@@ -493,6 +511,24 @@ mod tests {
         assert!(!matches(&l, &j("carol@ok.example")));
         assert!(!matches(&l, &j("bob@good.example")));
         assert!(!matches(&HashSet::new(), &j("eve@evil.example")));
+    }
+
+    #[tokio::test]
+    async fn made_up_accounts_leave_no_cached_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = crate::run::test_server(dir.path(), "");
+        srv.accounts.create("a.test", "sam", "correct horse", crate::accounts::Role::Member).await.unwrap();
+        for i in 0..200 {
+            let ghost = j(&format!("ghost{i}@a.test"));
+            // Through the router (stanza_in) and asked directly.
+            let m = Element::new("message", ns::CLIENT).attr_set("from", "eve@evil.example/x").attr_set("to", ghost.to_string());
+            srv.route(m).await;
+            assert!(!is_blocked(&srv, &ghost, &j("eve@evil.example")).await);
+        }
+        assert_eq!(srv.ext::<State>().lists.lock().len(), 0, "nothing kept for accounts that don't exist");
+        assert!(!is_blocked(&srv, &j("sam@a.test"), &j("eve@evil.example")).await);
+        assert_eq!(srv.ext::<State>().lists.lock().len(), 1);
+        assert_eq!(srv.ext::<State>().lists.lock().cap(), CACHED_LISTS);
     }
 
     #[test]

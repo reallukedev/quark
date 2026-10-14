@@ -37,6 +37,7 @@ if-addrs = "0.15"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 ipnet = "2"
+lru = "0.16"
 idna = "1"
 md-5 = "0.10"
 crc32fast = "1"

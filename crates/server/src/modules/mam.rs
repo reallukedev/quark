@@ -69,6 +69,8 @@ const SEQ_BITS: u32 = 12;
 /// Results per page when the client doesn't say, and at most.
 const DEFAULT_PAGE: usize = 50;
 const MAX_PAGE: usize = 250;
+/// The most matching messages counted for RSM `<count/>`; past this the count is left out.
+const COUNT_LIMIT: i64 = 10_000;
 /// Ids in one `ids` filter.
 const MAX_IDS: usize = 250;
 /// JIDs in each preferences list.
@@ -841,7 +843,8 @@ fn fts_query(s: &str) -> Result<String, StanzaError> {
 
 struct Page {
     items: Vec<(i64, Element)>,
-    count: i64,
+    /// How many messages match, when counted (see `COUNT_LIMIT`).
+    count: Option<i64>,
     complete: bool,
 }
 
@@ -878,7 +881,7 @@ async fn run(srv: &Server, archive: &Jid, q: Query) -> Result<Page, StanzaError>
 fn run_sql(c: &rusqlite::Connection, aid: Option<i64>, q: &Query) -> Result<Page, QueryError> {
     let Some(aid) = aid else {
         if q.must_exist.is_empty() {
-            return Ok(Page { items: Vec::new(), count: 0, complete: true });
+            return Ok(Page { items: Vec::new(), count: Some(0), complete: true });
         }
         return Err(QueryError::UnknownId);
     };
@@ -921,10 +924,21 @@ fn run_sql(c: &rusqlite::Connection, aid: Option<i64>, q: &Query) -> Result<Page
         filter.push_str(" AND id IN (SELECT rowid FROM mam_fts WHERE mam_fts MATCH ?)");
         args.push(Value::Text(f.clone()));
     }
-    let count: i64 =
-        c.prepare_cached(&format!("SELECT count(*) FROM mam{filter}"))?.query_row(rusqlite::params_from_iter(args.iter()), |r| r.get(0))?;
+    // RSM's count is optional (XEP-0059 §2.6), and counting a large archive means reading every
+    // matching row: it's given on the first page of a query (or when only the count is asked
+    // for), counted at most to COUNT_LIMIT, and left out past that. Later pages, positioned by
+    // an id, don't need it again.
+    let first_page = q.after.is_none() && !matches!(q.before, Some(Some(_))) && q.index.is_none_or(|i| i == 0);
+    let count = if first_page || q.max == 0 {
+        let n: i64 = c
+            .prepare_cached(&format!("SELECT count(*) FROM (SELECT 1 FROM mam{filter} LIMIT {})", COUNT_LIMIT + 1))?
+            .query_row(rusqlite::params_from_iter(args.iter()), |r| r.get(0))?;
+        Some(n).filter(|&n| n <= COUNT_LIMIT)
+    } else {
+        None
+    };
     if q.max == 0 {
-        return Ok(Page { items: Vec::new(), count, complete: count == 0 });
+        return Ok(Page { items: Vec::new(), count, complete: count == Some(0) });
     }
 
     let mut sql = format!("SELECT id, xml FROM mam{filter}");
@@ -1001,7 +1015,9 @@ pub async fn query(srv: &Arc<Server>, archive: &Jid, iq: &Element, to: &Jid) -> 
         set.append(Element::new("first", ns::RSM).text(f).attr_opt("index", index.map(|i| i.to_string())));
         set.append(Element::new("last", ns::RSM).text(l));
     }
-    set.append(Element::new("count", ns::RSM).text(page.count.to_string()));
+    if let Some(n) = page.count {
+        set.append(Element::new("count", ns::RSM).text(n.to_string()));
+    }
     let mut fin = Element::new("fin", ns::MAM).attr_opt("queryid", queryid);
     if page.complete {
         fin.set_attr("complete", "true");
@@ -1171,6 +1187,40 @@ mod tests {
 
     fn el(xml: &str) -> Element {
         Element::parse(xml).unwrap()
+    }
+
+    /// An archive (id 1) with `n` messages, ids 1..=n.
+    fn archive_with(n: i64) -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        c.execute_batch(MIGRATION.steps[0]).unwrap();
+        c.execute("INSERT INTO mam_archives (id, jid, host, user) VALUES (1, 'sam@a.test', 'a.test', 'sam')", []).unwrap();
+        let xml = codec::pack(&el("<message xmlns='jabber:client'><body>hi</body></message>"));
+        let mut st = c.prepare("INSERT INTO mam (id, archive, with_bare, xml) VALUES (?1, 1, 'kim@a.test', ?2)").unwrap();
+        c.execute_batch("BEGIN").unwrap();
+        for id in 1..=n {
+            st.execute(params![id, xml]).unwrap();
+        }
+        c.execute_batch("COMMIT").unwrap();
+        drop(st);
+        c
+    }
+
+    #[test]
+    fn counts_are_given_on_first_pages_and_capped() {
+        let c = archive_with(3);
+        let q = |after: Option<i64>, max: usize| Query { max, after, ..Default::default() };
+        let page = |q: Query| run_sql(&c, Some(1), &q).ok().unwrap();
+        assert_eq!(page(q(None, 2)).count, Some(3));
+        assert_eq!(page(q(Some(1), 2)).count, None, "a later page isn't counted again");
+        let only_count = page(q(Some(1), 0));
+        assert_eq!((only_count.count, only_count.complete), (Some(3), false), "the whole set, when only the count is asked for");
+
+        let big = archive_with(COUNT_LIMIT + 5);
+        let p = run_sql(&big, Some(1), &q(None, 2)).ok().unwrap();
+        assert_eq!((p.count, p.items.len(), p.complete), (None, 2, false), "past the limit the count is left out");
+        let p = run_sql(&big, Some(1), &q(None, 0)).ok().unwrap();
+        assert_eq!((p.count, p.complete), (None, false));
     }
 
     #[test]

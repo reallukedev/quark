@@ -49,6 +49,20 @@ pub fn build(cfg: Config) -> anyhow::Result<Arc<Server>> {
     Ok(Server::new(cfg, db)?)
 }
 
+/// A server for `a.test` with its files in `dir`, not listening, for unit tests. `extra` is
+/// TOML appended to the config.
+#[cfg(test)]
+pub(crate) fn test_server(dir: &Path, extra: &str) -> Arc<Server> {
+    let path = dir.join("quark.toml");
+    let text = format!(
+        "{extra}\n[server]\ndata_dir = {:?}\n[tls]\ncert_dir = {:?}\n[[host]]\ndomain = \"a.test\"\n",
+        dir.join("data"),
+        dir.join("certs")
+    );
+    std::fs::write(&path, text).expect("writing a test config");
+    build(load_config(&path).expect("a valid test config")).expect("a test server")
+}
+
 /// The addresses the server listens on (useful with port 0 in tests).
 #[derive(Debug, Clone, Default)]
 pub struct Listening {

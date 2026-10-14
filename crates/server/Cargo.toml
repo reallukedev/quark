@@ -46,7 +46,7 @@ miniz_oxide = "0.8"
 parking_lot = "0.12"
 pbkdf2 = "0.12"
 rand = "0.8"
-rcgen = "0.13"
+rcgen = "0.14"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # PEM parsing (`PemObject`) needs 1.9 or later.

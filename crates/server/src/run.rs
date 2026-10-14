@@ -111,7 +111,9 @@ pub async fn run(config: PathBuf) -> anyhow::Result<()> {
 
 pub fn init_logging(filter: &str) {
     let env = tracing_subscriber::EnvFilter::try_from_env("QUARK_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter));
-    let _ = tracing_subscriber::fmt().with_env_filter(env).with_target(false).try_init();
+    // Colours only on a terminal: log files and `docker logs` get plain text.
+    let ansi = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let _ = tracing_subscriber::fmt().with_env_filter(env).with_target(false).with_ansi(ansi).with_writer(std::io::stderr).try_init();
 }
 
 async fn wait_for_signal() {

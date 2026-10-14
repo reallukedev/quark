@@ -30,6 +30,20 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const CONCURRENT: usize = 16;
 
 pub const SOCKET: &str = "admin.sock";
+
+/// Where the admin socket lives for a data folder: `<data_dir>/admin.sock`, unless that path is
+/// too long for a Unix socket address (about 104 bytes), in which case a name in the temp folder
+/// derived from the data folder, so the server and `quark ctl` agree without talking.
+pub fn socket_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    use sha2::Digest;
+    let p = data_dir.join(SOCKET);
+    // Leave room for the temporary name used while binding.
+    if p.as_os_str().len() <= 90 {
+        return p;
+    }
+    let h = sha2::Sha256::digest(data_dir.as_os_str().as_encoded_bytes());
+    std::env::temp_dir().join(format!("quark-{}.sock", hex::encode(&h[..6])))
+}
 pub const TOKEN: &str = "admin.token";
 
 /// A refused request: a stable `code` and a sentence for people.
@@ -144,7 +158,7 @@ pub async fn start(srv: &Arc<Server>) -> anyhow::Result<Vec<std::net::SocketAddr
     let d = dir.clone();
     tokio::task::spawn_blocking(move || load_or_create_token(&d)).await??;
     #[cfg(unix)]
-    unix::listen(srv, &dir.join(SOCKET))?;
+    unix::listen(srv, &socket_path(&dir))?;
     #[cfg(not(unix))]
     tracing::warn!("the admin socket needs a Unix system; use the HTTP admin API instead");
     Ok(Vec::new())
@@ -264,7 +278,7 @@ pub async fn ctl(config: &std::path::Path) -> i32 {
         return 2;
     }
     let text = String::from_utf8_lossy(&input);
-    let socket = data_dir_for(config).join(SOCKET);
+    let socket = socket_path(&data_dir_for(config));
     #[cfg(unix)]
     {
         match request(&socket, &text).await {

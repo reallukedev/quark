@@ -96,5 +96,5 @@ fn admin_socket(config: &std::path::Path) -> PathBuf {
             .map(PathBuf::from)
             .unwrap_or_else(|| quark::config::ServerSection::default().data_dir),
     };
-    data_dir.join("admin.sock")
+    quark::admin::socket_path(&data_dir)
 }

@@ -22,6 +22,10 @@ pub static MIGRATION: Migration = Migration {
 };
 
 const MAX_BYTES: usize = 64 * 1024;
+/// Distinct elements one account may keep, and their total size: clients store a handful
+/// (bookmarks, a few app settings); without a cap an account could fill the disk.
+const MAX_ITEMS: i64 = 256;
+const MAX_TOTAL_BYTES: i64 = 1024 * 1024;
 
 /// What an account stored under `ns` and element `name`, inside a database closure.
 pub fn load(c: &rusqlite::Connection, host: &str, user: &str, ns: &str, name: &str) -> rusqlite::Result<Option<Element>> {
@@ -32,20 +36,40 @@ pub fn load(c: &rusqlite::Connection, host: &str, user: &str, ns: &str, name: &s
     Ok(xml.and_then(|x| Element::parse(&x).ok()))
 }
 
+/// What [`store`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    Yes,
+    /// The element alone is over the size limit.
+    TooBig,
+    /// The account's storage is full (items or total size).
+    Full,
+}
+
 /// Stores `data` (whitespace stripped) under its namespace and name, inside a database
-/// closure. False, with nothing stored, when it's over the size limit.
-pub fn store(c: &rusqlite::Connection, host: &str, user: &str, data: &Element) -> rusqlite::Result<bool> {
+/// closure. The account's quota is counted in the same transaction, so parallel sets can't
+/// overshoot it.
+pub fn store(c: &rusqlite::Connection, host: &str, user: &str, data: &Element) -> rusqlite::Result<Stored> {
     let mut v = data.clone();
     v.strip_whitespace();
     let xml = v.to_xml();
     if xml.len() > MAX_BYTES {
-        return Ok(false);
+        return Ok(Stored::TooBig);
+    }
+    let (count, total): (i64, i64) = c.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(length(CAST(xml AS BLOB))), 0) FROM private_xml
+         WHERE host = ?1 AND user = ?2 AND NOT (ns = ?3 AND name = ?4)",
+        params![host, user, v.ns(), v.name()],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if count >= MAX_ITEMS || total + xml.len() as i64 > MAX_TOTAL_BYTES {
+        return Ok(Stored::Full);
     }
     c.prepare_cached(
         "INSERT INTO private_xml (host, user, ns, name, xml) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(host, user, ns, name) DO UPDATE SET xml = excluded.xml",
     )?
     .execute(params![host, user, v.ns(), v.name(), xml])?;
-    Ok(true)
+    Ok(Stored::Yes)
 }
 
 pub struct Private;
@@ -88,9 +112,15 @@ impl Module for Private {
                 let mut v = item.clone();
                 v.strip_whitespace();
                 let data = v.clone();
-                let fits = cx.srv.db.write(move |t| store(t, &h, &u, &data)).await.map_err(|_| StanzaError::internal())?;
-                if !fits {
-                    return Err(StanzaError::new(quark_core::Condition::NotAcceptable).with_text("That's too much to store."));
+                match cx.srv.db.write(move |t| store(t, &h, &u, &data)).await.map_err(|_| StanzaError::internal())? {
+                    Stored::Yes => {}
+                    Stored::TooBig => {
+                        return Err(StanzaError::new(quark_core::Condition::NotAcceptable).with_text("That's too much to store."))
+                    }
+                    Stored::Full => {
+                        return Err(StanzaError::new(quark_core::Condition::ResourceConstraint)
+                            .with_text("Private storage for this account is full. Remove something first."))
+                    }
                 }
                 cx.srv.emit(&super::Event::PrivateChanged { jid: me, data: v }).await;
                 ok_empty()

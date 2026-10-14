@@ -36,6 +36,7 @@ mod blocking;
 mod bosh;
 mod carbons;
 mod extdisco;
+mod hardening;
 mod http;
 mod invites;
 mod mam;

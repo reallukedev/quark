@@ -109,6 +109,46 @@ const ACK_EVERY: u32 = 5;
 const HIBERNATION_QUEUE: usize = 5_000;
 /// Writes between flushes while draining a burst.
 const DRAIN_BATCH: usize = 64;
+/// Longest a single write or flush may take. A client that stops reading (but keeps the TCP
+/// connection open) fills its socket buffer and would otherwise park the actor in a write
+/// forever, where neither new stanzas nor an admin's sign-out can reach it.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A writer whose writes and flushes fail with `TimedOut` after `limit`, so the session treats
+/// a stuck connection like a dropped one.
+pub struct TimedWriter {
+    inner: Box<dyn StanzaWriter>,
+    limit: Duration,
+}
+
+impl TimedWriter {
+    pub fn boxed(inner: Box<dyn StanzaWriter>, limit: Duration) -> Box<dyn StanzaWriter> {
+        Box::new(TimedWriter { inner, limit })
+    }
+}
+
+async fn timed(limit: Duration, f: impl std::future::Future<Output = std::io::Result<()>>) -> std::io::Result<()> {
+    tokio::time::timeout(limit, f)
+        .await
+        .unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the client stopped reading")))
+}
+
+#[async_trait::async_trait]
+impl StanzaWriter for TimedWriter {
+    async fn write(&mut self, el: &Element) -> std::io::Result<()> {
+        timed(self.limit, self.inner.write(el)).await
+    }
+    async fn flush(&mut self) -> std::io::Result<()> {
+        timed(self.limit, self.inner.flush()).await
+    }
+    async fn keepalive(&mut self) -> std::io::Result<()> {
+        timed(self.limit, self.inner.keepalive()).await
+    }
+    async fn close(&mut self, err: Option<&StreamError>) {
+        // Transports bound their own close; this bounds it again for any that don't.
+        let _ = tokio::time::timeout(self.limit, self.inner.close(err)).await;
+    }
+}
 
 /// Registers and runs a new session. Returns its handle once it's in the registry.
 pub fn spawn(s: Start) -> Arc<SessionHandle> {
@@ -137,7 +177,8 @@ pub fn spawn(s: Start) -> Arc<SessionHandle> {
         rx,
         queued,
         inbound: Some(in_rx),
-        writer: Some(s.writer),
+        writer: Some(TimedWriter::boxed(s.writer, WRITE_TIMEOUT)),
+        write_failed: false,
         sm,
         csi: Vec::new(),
         hibernate_until: None,
@@ -208,6 +249,9 @@ struct Actor {
     queued: Arc<AtomicUsize>,
     inbound: Option<mpsc::Receiver<ReaderEvent>>,
     writer: Option<Box<dyn StanzaWriter>>,
+    /// A write or flush failed (or timed out): the connection is as good as gone even though
+    /// the reader may never notice (a client that stopped reading but still sends nothing).
+    write_failed: bool,
     sm: Option<Sm>,
     /// Stanzas held back while the app is in the background (CSI, XEP-0352).
     csi: Vec<Element>,
@@ -267,6 +311,7 @@ impl Actor {
                 Next::Expired => Some(End::Final),
                 Next::Tick => self.on_tick().await,
             };
+            let end = end.or_else(|| self.write_failure());
             if let Some(end) = end {
                 match end {
                     End::Lost if self.resumable() => self.hibernate(),
@@ -278,7 +323,8 @@ impl Actor {
                 while n < DRAIN_BATCH {
                     let Ok(m) = self.rx.try_recv() else { break };
                     n += 1;
-                    if let Some(end) = self.on_msg(m).await {
+                    let end = self.on_msg(m).await;
+                    if let Some(end) = end.or_else(|| self.write_failure()) {
                         if matches!(end, End::Final) || !self.resumable() {
                             self.finish().await;
                             return;
@@ -289,8 +335,24 @@ impl Actor {
                 }
             }
             self.flush().await;
+            if self.write_failure().is_some() {
+                if !self.resumable() {
+                    break;
+                }
+                self.hibernate();
+            }
         }
         self.finish().await;
+    }
+
+    /// `End::Lost` once after a write failed; the reader is dropped with the writer, which
+    /// closes the connection.
+    fn write_failure(&mut self) -> Option<End> {
+        if !std::mem::take(&mut self.write_failed) {
+            return None;
+        }
+        tracing::debug!(jid = %self.handle.jid, "couldn't write to the client; treating the connection as lost");
+        self.lost()
     }
 
     fn resumable(&self) -> bool {
@@ -503,8 +565,8 @@ impl Actor {
     async fn write_raw(&mut self, el: &Element) {
         if let Some(w) = self.writer.as_mut() {
             if w.write(el).await.is_err() {
-                // The reader will report the drop; stop writing until then.
                 self.writer = None;
+                self.write_failed = true;
             }
         }
     }
@@ -513,6 +575,7 @@ impl Actor {
         if let Some(w) = self.writer.as_mut() {
             if w.flush().await.is_err() {
                 self.writer = None;
+                self.write_failed = true;
             }
         }
     }
@@ -535,7 +598,7 @@ impl Actor {
         }
         let resumed = Element::new("resumed", ns::SM).attr_set("h", sm.in_h.to_string()).attr_opt("previd", sm.id.clone());
         let replay: Vec<Element> = sm.unacked.iter().cloned().collect();
-        let mut w = req.writer;
+        let mut w = TimedWriter::boxed(req.writer, WRITE_TIMEOUT);
         let first = match req.wrap {
             Some(success) => success.child(resumed),
             None => resumed,
@@ -564,8 +627,15 @@ impl Actor {
         if let Some(mut w) = self.writer.take() {
             w.close(None).await;
         }
+        // Replaced by a new sign-in on the same resource: that JID is online and belongs to the
+        // new session now, so contacts must not see it leave and modules must not drop its state.
+        let replaced = self.srv.sessions.replaced(&self.handle);
         self.srv.sessions.remove(&self.handle);
-        crate::modules::presence::session_ended(&self.srv, &self.host, &self.handle).await;
+        if replaced {
+            self.handle.presence.lock().available = false;
+        } else {
+            crate::modules::presence::session_ended(&self.srv, &self.host, &self.handle).await;
+        }
         // Messages the client never confirmed go to the account's other devices or offline storage.
         let unacked = self.sm.take().map(|s| s.unacked).unwrap_or_default();
         let held = std::mem::take(&mut self.csi);
@@ -577,7 +647,9 @@ impl Actor {
         if let Some(n) = self.handle.jid.node() {
             let _ = self.srv.accounts.touch(&self.host.domain, n, quark_core::time::now_ms()).await;
         }
-        self.srv.emit(&crate::modules::Event::SessionEnded { jid: self.handle.jid.clone() }).await;
+        if !replaced {
+            self.srv.emit(&crate::modules::Event::SessionEnded { jid: self.handle.jid.clone() }).await;
+        }
     }
 }
 
@@ -668,6 +740,74 @@ mod tests {
         }
         assert!(sm.ack(0));
         assert_eq!(sm.unacked.len(), 1);
+    }
+
+    /// A connection whose writes never finish (a client that stopped reading) and that never
+    /// sends anything.
+    struct Stuck;
+
+    #[async_trait::async_trait]
+    impl StanzaWriter for Stuck {
+        async fn write(&mut self, _el: &Element) -> std::io::Result<()> {
+            std::future::pending().await
+        }
+        async fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn keepalive(&mut self) -> std::io::Result<()> {
+            std::future::pending().await
+        }
+        async fn close(&mut self, _err: Option<&StreamError>) {}
+    }
+
+    #[async_trait::async_trait]
+    impl StanzaReader for Stuck {
+        async fn read(&mut self) -> Result<Option<StreamEvent>, XmlError> {
+            std::future::pending().await
+        }
+        fn bytes_read(&self) -> u64 {
+            0
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_stops_reading_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quark.toml");
+        let text = format!(
+            "[server]\ndata_dir = {:?}\n[tls]\ncert_dir = {:?}\n[[host]]\ndomain = \"a.test\"\n",
+            dir.path().join("data"),
+            dir.path().join("certs")
+        );
+        std::fs::write(&path, text).unwrap();
+        let srv = crate::run::build(crate::run::load_config(&path).unwrap()).unwrap();
+        let host = srv.host("a.test").unwrap();
+        let jid = Jid::parse("sam@a.test/phone").unwrap();
+        let info = SessionInfo { ip: None, secure: true, since: 0, transport: "tcp", client: None };
+        let start = Start {
+            srv: srv.clone(),
+            host,
+            jid: jid.clone(),
+            info,
+            writer: Box::new(Stuck),
+            reader: Box::new(Stuck),
+            prelude: Vec::new(),
+            carbons: false,
+            inactive: false,
+            sm: None,
+        };
+        let handle = spawn(start);
+        handle.send(Element::new("message", ns::CLIENT).text_child("body", ns::CLIENT, "hi"));
+        tokio::time::sleep(WRITE_TIMEOUT - Duration::from_secs(1)).await;
+        assert!(srv.sessions.get(&jid).is_some(), "still trying to write");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        for _ in 0..100 {
+            if srv.sessions.get(&jid).is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(srv.sessions.get(&jid).is_none(), "the stuck session was removed");
     }
 
     #[test]

@@ -19,8 +19,8 @@ async fn session_creation_reports_its_parameters_and_features() -> anyhow::Resul
     assert_eq!(b.attr("hold"), Some("1"));
     assert_eq!(b.attr("requests"), Some("2"));
     assert_eq!(b.attr("from"), Some(s.domain()));
-    assert_eq!(b.attr("xmpp:version"), Some("1.0"));
-    assert_eq!(b.attr("xmpp:restartlogic"), Some("true"));
+    assert_eq!(b.attr_ns(ns::XBOSH, "version"), Some("1.0"));
+    assert_eq!(b.attr_ns(ns::XBOSH, "restartlogic"), Some("true"));
     assert!(b.attr("authid").is_some_and(|a| !a.is_empty()));
     assert!(b.attr("inactivity").is_some());
     let f = c.features.clone().expect("features in the creation response");

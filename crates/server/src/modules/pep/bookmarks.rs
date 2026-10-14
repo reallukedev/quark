@@ -238,8 +238,8 @@ impl State {
         if to_private && private_now != Some(doc) {
             let (oo, d) = (o.clone(), doc.clone());
             match srv.db.write(move |t| private::store(t, &oo.host, &oo.user, &d)).await {
-                Ok(true) => {}
-                Ok(false) => tracing::debug!("pep: legacy bookmarks too big for private storage"),
+                Ok(private::Stored::Yes) => {}
+                Ok(_) => tracing::debug!("pep: legacy bookmarks don't fit in private storage"),
                 Err(e) => tracing::warn!(error = %e, "pep: writing legacy bookmarks"),
             }
         }

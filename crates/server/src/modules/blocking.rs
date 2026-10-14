@@ -138,6 +138,22 @@ pub async fn outbound_allowed(srv: &Server, from: &Jid, to: &Jid, el: &Element) 
     !is_blocked(srv, &account, to).await
 }
 
+/// Both block lists for a stanza the server hands a session itself instead of routing it (a
+/// contact's presence at sign-in): the sender's ([`outbound_allowed`]) and the recipient's, as
+/// [`Blocking::stanza_in`] would check it.
+pub async fn allowed_between(srv: &Server, from: &Jid, to: &Jid, el: &Element) -> bool {
+    if !outbound_allowed(srv, from, to, el).await {
+        return false;
+    }
+    if from.node().is_none() && srv.host(from.domain()).is_some() {
+        return true;
+    }
+    match local_account(srv, to) {
+        Some(account) if account != from.to_bare() => !is_blocked(srv, &account, from).await,
+        _ => true,
+    }
+}
+
 fn blocked_error() -> StanzaError {
     StanzaError::new(Condition::NotAcceptable)
         .with_text("You've blocked this contact. Unblock them to send them anything.")

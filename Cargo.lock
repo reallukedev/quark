@@ -1368,6 +1368,7 @@ dependencies = [
  "rand 0.8.8",
  "rcgen",
  "rusqlite",
+ "rustix",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -1395,6 +1396,7 @@ name = "quark-core"
 version = "0.1.0"
 dependencies = [
  "quick-xml",
+ "rand 0.8.8",
  "stringprep",
  "thiserror 2.0.21",
  "tokio",

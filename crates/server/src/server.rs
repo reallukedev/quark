@@ -98,10 +98,17 @@ pub struct Stats {
     pub auth_failures: AtomicU64,
 }
 
-/// IQs the server sent and is waiting on.
+/// IQs the server sent and is waiting on, by id, with the JID that has to answer.
 #[derive(Default)]
 struct Pending {
-    map: parking_lot::Mutex<HashMap<String, oneshot::Sender<Element>>>,
+    map: parking_lot::Mutex<HashMap<String, (Jid, oneshot::Sender<Element>)>>,
+}
+
+/// Whether an answer from `from` can be the reply to a request sent to `asked` (RFC 6120
+/// §8.2.3: the reply comes from the entity asked). Asking an account's bare JID, any of its
+/// devices may answer for it.
+fn answers_for(asked: &Jid, from: &Jid) -> bool {
+    from == asked || (asked.is_bare() && asked.node().is_some() && from.to_bare() == *asked)
 }
 
 pub struct Server {
@@ -363,10 +370,18 @@ impl Server {
 
     /// Sends an IQ from the server and waits for the answer (result or error).
     pub async fn request(self: &Arc<Self>, mut iq: Element, timeout: Duration) -> Result<Element, StanzaError> {
+        // Without a `to` the router sends it to the sender's domain (see `router::route`).
+        let asked = match quark_core::stanza::jid_attr(&iq, "to") {
+            Ok(Some(to)) => to,
+            _ => match quark_core::stanza::jid_attr(&iq, "from").ok().flatten().and_then(|f| Jid::domain_jid(f.domain()).ok()) {
+                Some(d) => d,
+                None => return Err(StanzaError::internal()),
+            },
+        };
         let id = quark_core::new_id();
         iq.set_attr("id", id.clone());
         let (tx, rx) = oneshot::channel();
-        self.pending.map.lock().insert(id.clone(), tx);
+        self.pending.map.lock().insert(id.clone(), (asked, tx));
         self.route(iq).await;
         let r = tokio::time::timeout(timeout, rx).await;
         self.pending.map.lock().remove(&id);
@@ -377,12 +392,24 @@ impl Server {
         }
     }
 
-    /// Hands an IQ result or error to whoever is waiting on it. False when nobody was.
-    pub(crate) fn answer_pending(&self, iq: &Element) -> bool {
+    /// Hands an IQ result or error from `from` to whoever is waiting on it. False when nobody
+    /// was, or when `from` isn't who was asked: knowing (or guessing) an id isn't enough to
+    /// answer for someone else.
+    pub(crate) fn answer_pending(&self, from: &Jid, iq: &Element) -> bool {
         let Some(id) = iq.attr("id") else { return false };
-        match self.pending.map.lock().remove(id) {
+        let tx = {
+            let mut map = self.pending.map.lock();
+            match map.get(id) {
+                Some((asked, _)) if answers_for(asked, from) => map.remove(id).map(|(_, tx)| tx),
+                _ => None,
+            }
+        };
+        match tx {
             Some(tx) => tx.send(iq.clone()).is_ok(),
-            None => false,
+            None => {
+                tracing::debug!(%from, id, "ignoring an IQ answer nobody here waits for");
+                false
+            }
         }
     }
 

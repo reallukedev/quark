@@ -23,13 +23,13 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use parking_lot::Mutex;
-use quark_core::xml::{escape, StreamEvent, XmlError};
+use quark_core::xml::{escape, Node, StreamEvent, XmlError};
 use quark_core::{ns, Element};
 use rand::RngCore;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
 
-use super::{AppState, Conn, WebState};
+use super::{AppState, Conn, Negotiating, WebState};
 use crate::sasl::ChannelBindings;
 use crate::transport::{StanzaReader, StanzaWriter, StreamError, Transport};
 
@@ -50,6 +50,12 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const FEATURES_WAIT: Duration = Duration::from_secs(10);
 const INBOUND_QUEUE: usize = 32;
 const REAP_EVERY: Duration = Duration::from_secs(5);
+/// Recent rids whose latest request is remembered, so a resent one can take over (more than a
+/// client can have open: `hold + 1` held plus `WINDOW` queued).
+const TICKETS: usize = 8;
+/// Longest a session goes unseen while a request is legitimately open: its payload handed over,
+/// then held for the answer. Past this the reaper ends it whatever its counters say.
+const STUCK: Duration = Duration::from_secs(INACTIVITY + MAX_WAIT + BODY_TIMEOUT.as_secs() + FEATURES_WAIT.as_secs());
 
 #[derive(Default)]
 pub(crate) struct Registry {
@@ -87,7 +93,13 @@ struct Inner {
     /// Serialized elements waiting for a response.
     out: Vec<String>,
     out_bytes: usize,
+    /// Requests waiting in `respond`; a [`Held`] guard keeps the count, so a request hyper
+    /// drops (the client went away) leaves it too.
     held: usize,
+    /// The latest request for each recent rid, by ticket (numbered as they arrive). A resent
+    /// request takes its rid over and the one it replaced answers empty (XEP-0124 §14.3).
+    latest: VecDeque<(u64, u64)>,
+    tickets: u64,
     /// Held requests with a `rid` below this return now (a newer one took over).
     release_below: u64,
     last_seen: Instant,
@@ -185,6 +197,11 @@ async fn create(st: &Arc<WebState>, conn: &Conn, headers: &HeaderMap, el: Elemen
         tracing::warn!("too many BOSH sessions; refusing a new one");
         return terminate("remote-connection-failed");
     }
+    let peer = super::peer(conn, headers);
+    let Some(negotiating) = st.negotiations.begin(peer.ip) else {
+        tracing::debug!(ip = %peer.ip, "too many BOSH sessions signing in from one address");
+        return terminate("policy-violation");
+    };
     let wait = el.attr("wait").and_then(|w| w.parse::<u64>().ok()).unwrap_or(MAX_WAIT).min(MAX_WAIT);
     let hold = el.attr("hold").and_then(|h| h.parse::<u64>().ok()).unwrap_or(1).min(1);
     let mut raw = [0u8; 16];
@@ -202,6 +219,8 @@ async fn create(st: &Arc<WebState>, conn: &Conn, headers: &HeaderMap, el: Elemen
             out: Vec::new(),
             out_bytes: 0,
             held: 0,
+            latest: VecDeque::new(),
+            tickets: 0,
             release_below: 0,
             last_seen: Instant::now(),
             cache: VecDeque::new(),
@@ -214,8 +233,14 @@ async fn create(st: &Arc<WebState>, conn: &Conn, headers: &HeaderMap, el: Elemen
     });
     st.bosh.map.lock().insert(sid, session.clone());
     st.stats.bosh_sessions.fetch_add(1, Ordering::Relaxed);
-    let peer = super::peer(conn, headers);
-    let t = BoshTransport { session: session.clone(), rx, ip: peer.ip, secure: peer.secure, cb: ChannelBindings::default() };
+    let t = BoshTransport {
+        session: session.clone(),
+        rx,
+        ip: peer.ip,
+        secure: peer.secure,
+        cb: ChannelBindings::default(),
+        negotiating: Some(negotiating),
+    };
     tokio::spawn(crate::c2s::serve(srv.clone(), Box::new(t)));
     let version = xbosh_attr(&el, "version").unwrap_or("1.0").to_string();
     let open = StreamEvent::Open { attrs: vec![("to".into(), to), ("version".into(), version)], default_ns: ns::CLIENT.into() };
@@ -223,19 +248,76 @@ async fn create(st: &Arc<WebState>, conn: &Conn, headers: &HeaderMap, el: Elemen
         return terminate("internal-server-error");
     }
     drop(tx);
-    session.respond(st, rid, true, true, Instant::now() + FEATURES_WAIT.max(session.wait)).await
+    let ticket = session.claim(rid);
+    session.respond(st, rid, ticket, true, true, Instant::now() + FEATURES_WAIT.max(session.wait)).await
+}
+
+/// Ends the hand-over of one request's payload, however it ends: hyper drops a request's
+/// future when its client goes away, so this runs on drop.
+struct Handoff<'a> {
+    session: &'a Session,
+    rid: u64,
+}
+
+impl Drop for Handoff<'_> {
+    fn drop(&mut self) {
+        {
+            let mut s = self.session.st.lock();
+            s.busy = false;
+            s.next_rid = self.rid.wrapping_add(1);
+            s.release_below = self.rid;
+        }
+        self.session.changed.notify_waiters();
+    }
+}
+
+/// Counts one request waiting in `respond`, until it answers or is dropped.
+struct Held<'a>(&'a Session);
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        {
+            let mut s = self.0.st.lock();
+            s.held = s.held.saturating_sub(1);
+            s.last_seen = Instant::now();
+        }
+        // Writers waiting for room, and resends waiting for this rid, can go on.
+        self.0.changed.notify_waiters();
+    }
 }
 
 impl Session {
+    /// Numbers a request for `rid` and makes it the one that answers for that rid; one already
+    /// held for it is woken to step aside.
+    fn claim(&self, rid: u64) -> u64 {
+        let ticket = {
+            let mut s = self.st.lock();
+            s.tickets += 1;
+            let ticket = s.tickets;
+            s.latest.retain(|(r, _)| *r != rid);
+            s.latest.push_back((rid, ticket));
+            if s.latest.len() > TICKETS {
+                s.latest.pop_front();
+            }
+            ticket
+        };
+        self.changed.notify_waiters();
+        ticket
+    }
+
     /// A request on an existing session.
-    async fn request(self: &Arc<Self>, st: &Arc<WebState>, rid: u64, el: Element) -> Response {
+    async fn request(self: &Arc<Self>, st: &Arc<WebState>, rid: u64, mut el: Element) -> Response {
+        let ticket = self.claim(rid);
+        let empty = || xml_response(format!("<body xmlns='{}'/>", ns::BOSH));
+        let terminating = el.attr("type") == Some("terminate");
+        let restart = xbosh_attr(&el, "restart") == Some("true");
         // Wait for this request's turn: earlier rids are handed over first.
         let deadline = Instant::now() + self.wait.max(Duration::from_secs(5));
-        loop {
+        let resent = loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            {
+            let seen = {
                 let mut s = self.st.lock();
                 if s.ended.is_some() {
                     // Whatever the stream said last goes out with the terminate.
@@ -244,10 +326,17 @@ impl Session {
                     st.bosh.remove(&self.sid);
                     return xml_response(body);
                 }
-                if rid < s.next_rid || (rid == s.next_rid && s.busy) {
-                    // A resent request: the answer it missed, if we still have it.
-                    let cached = s.cache.iter().find(|(r, _)| *r == rid).map(|(_, b)| b.clone());
-                    return xml_response(cached.unwrap_or_else(|| format!("<body xmlns='{}'/>", ns::BOSH)));
+                if rid < s.next_rid {
+                    // A resent request: the answer it missed, if we still have it. If its
+                    // original is still open, this one takes over and waits for the output in
+                    // its place (the client has given up on the original's connection).
+                    if let Some((_, b)) = s.cache.iter().find(|(r, _)| *r == rid) {
+                        return xml_response(b.clone());
+                    }
+                    if s.next_rid - rid <= self.hold + 1 {
+                        break true;
+                    }
+                    return empty();
                 }
                 if rid > s.next_rid + WINDOW {
                     drop(s);
@@ -255,68 +344,81 @@ impl Session {
                     st.bosh.remove(&self.sid);
                     return terminate("item-not-found");
                 }
-                if rid == s.next_rid {
+                if rid == s.next_rid && !s.busy {
                     s.busy = true;
                     s.last_seen = Instant::now();
-                    break;
+                    break false;
                 }
-            }
+                // Earlier rids are missing, or this rid's payload is being handed over by its
+                // original right now (then this is a resend, answered once that's done).
+                s.next_rid
+            };
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                if rid <= seen {
+                    return empty();
+                }
                 // The requests before this one never came.
                 self.end(End::Dropped("item-not-found"));
                 st.bosh.remove(&self.sid);
                 return terminate("item-not-found");
             }
-        }
+        };
 
-        let terminating = el.attr("type") == Some("terminate");
-        let restart = xbosh_attr(&el, "restart") == Some("true");
-        let mut events: Vec<StreamEvent> = Vec::new();
-        if restart {
-            let from = self.st.lock().from.clone();
-            events.push(StreamEvent::Open {
-                attrs: vec![("to".into(), from), ("version".into(), "1.0".into())],
-                default_ns: ns::CLIENT.into(),
+        if !resent {
+            let mut events: Vec<StreamEvent> = Vec::new();
+            if restart {
+                let from = self.st.lock().from.clone();
+                events.push(StreamEvent::Open {
+                    attrs: vec![("to".into(), from), ("version".into(), "1.0".into())],
+                    default_ns: ns::CLIENT.into(),
+                });
+            } else {
+                for n in el.take_children() {
+                    if let Node::Element(mut c) = n {
+                        c.rewrite_ns(ns::BOSH, ns::CLIENT);
+                        events.push(StreamEvent::Stanza(c));
+                    }
+                }
+            }
+            if terminating {
+                events.push(StreamEvent::Close);
+            }
+            // The hand-over runs in a task of its own: a client that goes away mid-request
+            // must not cut its payload in half, nor leave the session busy for good.
+            let me = self.clone();
+            let handoff = tokio::spawn(async move {
+                let _done = Handoff { session: &me, rid };
+                let fed = me.feed(events).await;
+                if !fed {
+                    me.end(End::Dropped("policy-violation"));
+                } else if terminating {
+                    me.end(End::Client);
+                }
+                fed
             });
-        } else {
-            for c in el.children() {
-                let mut c = c.clone();
-                c.rewrite_ns(ns::BOSH, ns::CLIENT);
-                events.push(StreamEvent::Stanza(c));
+            let fed = handoff.await.unwrap_or(false);
+            if !fed {
+                st.bosh.remove(&self.sid);
+                return terminate("policy-violation");
+            }
+            if terminating {
+                st.bosh.remove(&self.sid);
+                return xml_response(format!("<body xmlns='{}' type='terminate'/>", ns::BOSH));
             }
         }
-        if terminating {
-            events.push(StreamEvent::Close);
-        }
-        let fed = self.feed(events).await;
-        {
-            let mut s = self.st.lock();
-            s.busy = false;
-            s.next_rid = rid.wrapping_add(1);
-            s.release_below = rid;
-        }
-        self.changed.notify_waiters();
-        if !fed {
-            self.end(End::Dropped("policy-violation"));
-            st.bosh.remove(&self.sid);
-            return terminate("policy-violation");
-        }
-        if terminating {
-            self.end(End::Client);
-            st.bosh.remove(&self.sid);
-            return xml_response(format!("<body xmlns='{}' type='terminate'/>", ns::BOSH));
-        }
         if restart {
-            return self.respond(st, rid, false, true, Instant::now() + FEATURES_WAIT.max(self.wait)).await;
+            return self.respond(st, rid, ticket, false, true, Instant::now() + FEATURES_WAIT.max(self.wait)).await;
         }
-        self.respond(st, rid, false, false, Instant::now() + self.wait).await
+        self.respond(st, rid, ticket, false, false, Instant::now() + self.wait).await
     }
 
-    /// Hands events to the stream, in order. False when the stream is gone or stopped reading.
+    /// Hands events to the stream, in order, within `BODY_TIMEOUT` in all. False when the
+    /// stream is gone or stopped reading.
     async fn feed(&self, events: Vec<StreamEvent>) -> bool {
         let Some(tx) = self.inbound.lock().clone() else { return events.is_empty() };
+        let deadline = Instant::now() + BODY_TIMEOUT;
         for ev in events {
-            match tokio::time::timeout(BODY_TIMEOUT, tx.send(ev)).await {
+            match tokio::time::timeout_at(deadline, tx.send(ev)).await {
                 Ok(Ok(())) => {}
                 _ => return false,
             }
@@ -324,38 +426,53 @@ impl Session {
         true
     }
 
-    /// Holds the request until there's output, a newer request takes over, or `deadline`.
-    /// `creation`: the first response, with the session's attributes. `features`: wait for the
-    /// stream features even when the client polls.
-    async fn respond(self: &Arc<Self>, st: &Arc<WebState>, rid: u64, creation: bool, features: bool, deadline: Instant) -> Response {
+    /// Holds the request until there's output, a newer request takes over, a resend of the
+    /// same rid replaces it, or `deadline`. `creation`: the first response, with the session's
+    /// attributes. `features`: wait for the stream features even when the client polls.
+    async fn respond(
+        self: &Arc<Self>,
+        st: &Arc<WebState>,
+        rid: u64,
+        ticket: u64,
+        creation: bool,
+        features: bool,
+        deadline: Instant,
+    ) -> Response {
         self.st.lock().held += 1;
+        let held = Held(self);
         // Polling clients get an answer right away, except while their features are coming.
         let deadline = if self.hold == 0 && !features { Instant::now() } else { deadline };
+        let owns = |s: &Inner| s.latest.iter().any(|&(r, t)| r == rid && t == ticket);
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             let ready = {
                 let s = self.st.lock();
-                !s.out.is_empty() || s.ended.is_some() || s.release_below > rid
+                !s.out.is_empty() || s.ended.is_some() || s.release_below > rid || !owns(&s)
             };
             if ready || tokio::time::timeout_at(deadline, notified).await.is_err() {
                 break;
             }
         }
-        let (body, ended) = {
+        let answer = {
             let mut s = self.st.lock();
-            s.held -= 1;
-            s.last_seen = Instant::now();
-            let body = self.body(&mut s, creation);
-            s.cache.push_back((rid, body.clone()));
-            if s.cache.len() > CACHED_RESPONSES {
-                s.cache.pop_front();
+            if owns(&s) {
+                let body = self.body(&mut s, creation);
+                s.cache.push_back((rid, body.clone()));
+                if s.cache.len() > CACHED_RESPONSES {
+                    s.cache.pop_front();
+                }
+                Some((body, s.ended.is_some()))
+            } else {
+                None
             }
-            (body, s.ended.is_some())
         };
-        // Writers waiting for room can go on.
-        self.changed.notify_waiters();
+        drop(held);
+        let Some((body, ended)) = answer else {
+            // A resend took this rid over; the output is its to deliver.
+            return xml_response(format!("<body xmlns='{}'/>", ns::BOSH));
+        };
         if ended {
             st.bosh.remove(&self.sid);
         }
@@ -465,8 +582,12 @@ pub(super) fn spawn_reaper(st: Arc<WebState>) {
             for s in sessions {
                 let (idle, gone) = {
                     let i = s.st.lock();
-                    let idle = i.ended.is_none() && i.held == 0 && !i.busy && i.last_seen.elapsed() > Duration::from_secs(INACTIVITY);
-                    let gone = i.ended.as_ref().is_some_and(|(_, at)| i.held == 0 && at.elapsed() > REAP_EVERY);
+                    let unseen = i.last_seen.elapsed();
+                    // The guards keep `held` and `busy` right; `STUCK` is the backstop should
+                    // anything still leave them set.
+                    let idle =
+                        i.ended.is_none() && ((i.held == 0 && !i.busy && unseen > Duration::from_secs(INACTIVITY)) || unseen > STUCK);
+                    let gone = i.ended.as_ref().is_some_and(|(_, at)| (i.held == 0 && at.elapsed() > REAP_EVERY) || at.elapsed() > STUCK);
                     (idle, gone)
                 };
                 if idle {
@@ -487,6 +608,8 @@ struct BoshTransport {
     ip: IpAddr,
     secure: bool,
     cb: ChannelBindings,
+    /// Counts against the address's sign-ins until the stream splits into a session.
+    negotiating: Option<Negotiating>,
 }
 
 #[async_trait]
@@ -543,7 +666,8 @@ impl Transport for BoshTransport {
     }
 
     fn split(self: Box<Self>) -> (Box<dyn StanzaReader>, Box<dyn StanzaWriter>) {
-        let me = *self;
+        let mut me = *self;
+        me.negotiating = None;
         (Box::new(BoshReader { rx: me.rx, session: me.session.clone() }), Box::new(BoshWriter { session: me.session }))
     }
 }

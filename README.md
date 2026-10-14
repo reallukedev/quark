@@ -65,7 +65,7 @@ moderation (XEP-0425), room avatars, persistent rooms, direct and mediated invit
 and access models — OMEMO keys, avatars (XEP-0084, synced with vCard XEP-0398), nicknames,
 bookmarks 2 (XEP-0402, synced with legacy XEP-0048/0411), vCard4.
 
-**Files and web:** HTTP file upload (XEP-0363) with quotas and photo metadata stripping,
+**Files and web:** HTTP file upload (XEP-0363) with quotas and optional photo metadata stripping,
 WebSocket (RFC 7395), BOSH (XEP-0206), host-meta (XEP-0156), invite landing pages with QR codes.
 
 **Calls:** a built-in STUN/TURN relay (RFC 8489/8656) with external service discovery
@@ -88,7 +88,7 @@ administration (XEP-0050/0133), ping, time, version, last activity, account expo
 - No passwords stored, only SCRAM keys; usernames can't be probed through SCRAM.
 - Write batching per connection, CSI batching on phones, backpressure on slow clients and fast
   ones, bounded queues everywhere, compressed archives with SQLite FTS5 search.
-- Uploads strip location and camera data from photos as they stream in.
+- Uploads can strip location and camera data from photos as they stream in (`http.strip_photo_metadata`).
 - Stranger filter: link-carrying messages from unknown remote senders are rate-limited and never
   wake phones.
 

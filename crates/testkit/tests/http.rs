@@ -80,6 +80,34 @@ async fn metrics_are_for_local_scrapers_only() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn metrics_through_a_proxy_that_hides_the_client_are_refused() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    // The proxy's loopback address says nothing about who's behind it.
+    let r = http_request(s.web(), "GET", "/metrics", &[("X-Forwarded-Proto", "https")], b"").await?;
+    assert_eq!(r.status, 404);
+    // A proxy that names a private client is believed.
+    let r = http_request(s.web(), "GET", "/metrics", &[("X-Forwarded-For", "10.1.2.3"), ("X-Forwarded-Proto", "https")], b"").await?;
+    assert_eq!(r.status, 200);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_metrics_token_lets_scrapers_in_from_anywhere_and_no_one_else() -> anyhow::Result<()> {
+    let s =
+        TestServer::start_with(Options { extra_config: "[http]\nmetrics_token = \"scrape-me\"\n".into(), ..Default::default() }).await?;
+    let r = http_request(s.web(), "GET", "/metrics", &[], b"").await?;
+    assert_eq!(r.status, 401, "local requests need the token too");
+    assert_eq!(r.header("www-authenticate"), Some("Bearer"));
+    let wrong = [("Authorization", "Bearer nope")];
+    assert_eq!(http_request(s.web(), "GET", "/metrics", &wrong, b"").await?.status, 401);
+    let r =
+        http_request(s.web(), "GET", "/metrics", &[("Authorization", "Bearer scrape-me"), ("X-Forwarded-For", "203.0.113.5")], b"").await?;
+    assert_eq!(r.status, 200);
+    assert!(r.text().contains("# TYPE quark_http_connections gauge"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn metrics_can_be_turned_off() -> anyhow::Result<()> {
     let s = TestServer::start_with(Options { extra_config: "[http]\nmetrics = false\n".into(), ..Default::default() }).await?;
     assert_eq!(http_request(s.web(), "GET", "/metrics", &[], b"").await?.status, 404);

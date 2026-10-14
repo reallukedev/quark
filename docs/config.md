@@ -58,7 +58,9 @@ self_signed_fallback = true
 [http]
 public_url = "https://chat.example.com"   # default https://<domain>
 admin_api = false                         # POST /admin/api with the token in <data_dir>/admin.token
-metrics = true                            # /metrics for loopback and private addresses
+metrics = true                            # /metrics for loopback and private addresses (see below)
+metrics_token = "long-random-string"      # optional: /metrics then needs "Authorization: Bearer <token>", from anywhere
+strip_photo_metadata = false              # strip EXIF/GPS from JPEG uploads (breaks shared file hashes; see below)
 
 [s2s]
 require_tls = true
@@ -101,5 +103,25 @@ Relayed addresses that never get a permission end after 3 minutes, so the ones p
 setting up a call and don't use give their ports back quickly. The listener on `[::]` also takes
 IPv4 (UDP and TCP). TCP connections must authenticate within 30 seconds and one address (or IPv6
 /64) may have at most 16 open.
+
+### Metrics behind a proxy
+
+Without `metrics_token`, `/metrics` answers direct requests from loopback and private addresses,
+and requests from a proxy on such an address whose `X-Forwarded-For` names a private client. A
+request with other proxy headers (`X-Forwarded-Proto`, `X-Real-IP`, `Forwarded`, `Via`) but no
+`X-Forwarded-For` is refused, since the proxy's own address says nothing about the client. A proxy
+that adds no headers at all (nginx's default `proxy_pass`) looks exactly like a local scraper, so
+if yours forwards `/metrics` that way, set `metrics_token` (or don't route `/metrics` through it).
+With a token set, only the token counts: local requests need it as well.
+
+### Photo metadata
+
+With `strip_photo_metadata = true`, JPEG uploads lose EXIF (camera, time, GPS), XMP, IPTC and
+comments as they stream in (the orientation is kept). It's off by default because the stored file
+then differs from what was sent: clients that share a file's hash and size with its link
+(XEP-0446/0447 stateless file sharing, used by Dino and Gajim) check the download against them and
+reject it as corrupt. Most phone apps (Conversations, Monal, Siskin) strip location data before
+uploading anyway. Turn it on when you'd rather protect people whose apps don't, and accept that
+those hash checks fail for JPEGs.
 
 Check a file without starting: `quark check-config /path/to/quark.toml` (errors carry the line).

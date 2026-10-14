@@ -23,7 +23,8 @@ use crate::server::{Host, Server};
 
 pub static MIGRATION: Migration = Migration {
     module: "upload",
-    steps: &["CREATE TABLE uploads (
+    steps: &[
+        "CREATE TABLE uploads (
         token TEXT PRIMARY KEY,
         host TEXT NOT NULL,
         user TEXT NOT NULL,
@@ -39,7 +40,11 @@ pub static MIGRATION: Migration = Migration {
         FOREIGN KEY (host, user) REFERENCES accounts(host, user) ON DELETE CASCADE
     ) WITHOUT ROWID;
     CREATE INDEX uploads_by_user ON uploads (host, user, created);
-    CREATE INDEX uploads_by_state ON uploads (state, created);"],
+    CREATE INDEX uploads_by_state ON uploads (state, created);",
+        // 1 when the client named the type in its slot request (so the PUT must match it); 0
+        // when it was guessed from the file name.
+        "ALTER TABLE uploads ADD COLUMN ctype_given INTEGER NOT NULL DEFAULT 0",
+    ],
 };
 
 /// How long an upload URL works.
@@ -52,6 +57,8 @@ const MIN_QUOTA: u64 = 1 << 30;
 const MAX_NAME_CHARS: usize = 120;
 const DAY_MS: i64 = 86_400_000;
 const SWEEP_EVERY: Duration = Duration::from_secs(3600);
+/// Uploads one account may have streaming in at once.
+pub const CONCURRENT_UPLOADS: i64 = 4;
 
 pub const STATE_SLOT: i64 = 0;
 pub const STATE_UPLOADING: i64 = 1;
@@ -185,6 +192,8 @@ pub(crate) struct Slot {
     pub host: String,
     pub name: String,
     pub ctype: String,
+    /// The client named `ctype` itself (rather than it being guessed from the name).
+    pub ctype_given: bool,
     pub size: u64,
     pub state: i64,
     pub created: i64,
@@ -194,15 +203,16 @@ pub(crate) async fn slot(srv: &Server, token: &str) -> Result<Option<Slot>, DbEr
     let t = token.to_string();
     srv.db
         .read(move |c| {
-            c.prepare_cached("SELECT host, name, ctype, size, state, created FROM uploads WHERE token = ?1")?
+            c.prepare_cached("SELECT host, name, ctype, ctype_given, size, state, created FROM uploads WHERE token = ?1")?
                 .query_row([t], |r| {
                     Ok(Slot {
                         host: r.get(0)?,
                         name: r.get(1)?,
                         ctype: r.get(2)?,
-                        size: r.get::<_, i64>(3)?.max(0) as u64,
-                        state: r.get(4)?,
-                        created: r.get(5)?,
+                        ctype_given: r.get::<_, i64>(3)? != 0,
+                        size: r.get::<_, i64>(4)?.max(0) as u64,
+                        state: r.get(5)?,
+                        created: r.get(6)?,
                     })
                 })
                 .optional()
@@ -210,21 +220,81 @@ pub(crate) async fn slot(srv: &Server, token: &str) -> Result<Option<Slot>, DbEr
         .await
 }
 
-/// Claims a slot for one upload at a time. False when it's taken, used or expired.
-pub(crate) async fn begin_upload(srv: &Server, token: &str) -> Result<bool, DbError> {
+/// Whether an upload may start.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Begin {
+    Ok,
+    /// The slot is taken, used or expired.
+    Taken,
+    /// The account has `CONCURRENT_UPLOADS` running already.
+    Busy,
+}
+
+/// Claims a slot for one upload at a time, and at most `CONCURRENT_UPLOADS` per account.
+pub(crate) async fn begin_upload(srv: &Server, token: &str) -> Result<Begin, DbError> {
     let (t, now) = (token.to_string(), quark_core::time::now_ms());
     srv.db
         .write(move |tx| {
-            tx.execute("UPDATE uploads SET state = 1 WHERE token = ?1 AND state = 0 AND slot_expires > ?2", params![t, now]).map(|n| n == 1)
+            let running: Option<i64> = tx
+                .prepare_cached(
+                    "SELECT COUNT(o.token) FROM uploads s LEFT JOIN uploads o ON o.host = s.host AND o.user = s.user AND o.state = 1
+                     WHERE s.token = ?1 GROUP BY s.token",
+                )?
+                .query_row([&t], |r| r.get(0))
+                .optional()?;
+            if running.is_some_and(|n| n >= CONCURRENT_UPLOADS) {
+                return Ok(Begin::Busy);
+            }
+            let n = tx.execute("UPDATE uploads SET state = 1 WHERE token = ?1 AND state = 0 AND slot_expires > ?2", params![t, now])?;
+            Ok(if n == 1 { Begin::Ok } else { Begin::Taken })
         })
         .await
 }
 
 /// Gives the slot back after a failed upload, so the client can try again while it's valid.
+/// Removes what the upload left on disk first (its file too, if it was renamed into place but
+/// never marked stored), and only while the slot is still marked uploading: then no other
+/// upload of it can be running, and a finished one is never touched.
 pub(crate) async fn abort_upload(srv: &Server, token: &str) {
+    match slot(srv, token).await {
+        Ok(Some(s)) if s.state == STATE_UPLOADING => {}
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't look up an upload slot to release");
+            return;
+        }
+    }
+    let dir = dir(srv);
+    let _ = tokio::fs::remove_file(dir.join(format!(".{token}.part"))).await;
+    let _ = tokio::fs::remove_file(dir.join(token)).await;
     let t = token.to_string();
     if let Err(e) = srv.db.write(move |tx| tx.execute("UPDATE uploads SET state = 0 WHERE token = ?1 AND state = 1", [t])).await {
         tracing::warn!(error = %e, "couldn't release an upload slot");
+    }
+}
+
+/// At start, before the web listener takes uploads: none can be running, so slots a restart
+/// cut off go back to unused, without the partial files that would block a new try.
+pub(crate) async fn reset_interrupted(srv: &Server) {
+    let tokens: Vec<String> = match srv
+        .db
+        .write(|tx| {
+            let mut st = tx.prepare("UPDATE uploads SET state = 0 WHERE state = 1 RETURNING token")?;
+            let rows = st.query_map([], |r| r.get(0))?;
+            rows.collect()
+        })
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't release interrupted upload slots");
+            return;
+        }
+    };
+    let dir = dir(srv);
+    for t in tokens.iter().filter(|t| valid_token(t)) {
+        let _ = tokio::fs::remove_file(dir.join(format!(".{t}.part"))).await;
+        let _ = tokio::fs::remove_file(dir.join(t)).await;
     }
 }
 
@@ -296,7 +366,27 @@ pub async fn sweep(srv: &Arc<Server>, now: i64) -> usize {
             return 0;
         }
     };
-    // Files whose rows went with a deleted account are found by listing the folder.
+    // Files whose rows went with a deleted account are found by listing the folder, before
+    // asking which rows exist: an upload claims its slot before it creates its file, so any
+    // file listed here that belongs to a running upload is known by the time we ask. (Asking
+    // first would miss an upload that starts in between and delete its file.)
+    let dir = dir(srv);
+    let listed: Vec<(String, std::path::PathBuf)> = {
+        let dir = dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+            entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_str()?.to_string();
+                    let token = name.strip_prefix('.').and_then(|n| n.strip_suffix(".part")).unwrap_or(&name).to_string();
+                    valid_token(&token).then(|| (token, e.path()))
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    };
     let known: std::collections::HashSet<String> = match srv
         .db
         .read(|c| {
@@ -312,7 +402,6 @@ pub async fn sweep(srv: &Arc<Server>, now: i64) -> usize {
             return 0;
         }
     };
-    let dir = dir(srv);
     let removed = tokio::task::spawn_blocking(move || {
         let mut removed = 0;
         for t in &gone {
@@ -321,12 +410,8 @@ pub async fn sweep(srv: &Arc<Server>, now: i64) -> usize {
             }
             let _ = std::fs::remove_file(dir.join(format!(".{t}.part")));
         }
-        let Ok(entries) = std::fs::read_dir(&dir) else { return removed };
-        for e in entries.flatten() {
-            let name = e.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let token = name.strip_prefix('.').and_then(|n| n.strip_suffix(".part")).unwrap_or(name);
-            if valid_token(token) && !known.contains(token) && std::fs::remove_file(e.path()).is_ok() {
+        for (token, path) in &listed {
+            if !known.contains(token) && std::fs::remove_file(path).is_ok() {
                 removed += 1;
             }
         }
@@ -497,7 +582,9 @@ impl UploadService {
                 .with_app(app));
         }
         let name = sanitize_filename(raw_name);
-        let ctype = req.attr("content-type").and_then(clean_ctype).unwrap_or_else(|| guess_type(&name).to_string());
+        let given = req.attr("content-type").and_then(clean_ctype);
+        let ctype_given = given.is_some();
+        let ctype = given.unwrap_or_else(|| guess_type(&name).to_string());
 
         let mut raw = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut raw);
@@ -526,9 +613,9 @@ impl UploadService {
                     return Ok(Grant::Quota(used.max(0) as u64));
                 }
                 tx.prepare_cached(
-                    "INSERT INTO uploads (token, host, user, name, ctype, size, state, created, slot_expires) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
+                    "INSERT INTO uploads (token, host, user, name, ctype, ctype_given, size, state, created, slot_expires) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9)",
                 )?
-                .execute(params![t, h, u, n, c, isize, now, expires])?;
+                .execute(params![t, h, u, n, c, ctype_given, isize, now, expires])?;
                 Ok(Grant::Ok)
             })
             .await

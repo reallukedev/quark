@@ -212,6 +212,25 @@ impl Scrubber {
         }
     }
 
+    /// Ends the stream: bytes held back waiting for the rest of a marker go out as they came,
+    /// so a cut-off file is stored as cut off, not shorter. A metadata segment cut off midway
+    /// (EXIF, XMP, anything but a color profile) stays dropped.
+    pub fn finish(self, out: &mut Vec<u8>) {
+        match self.st {
+            St::Start(1) | St::MarkerCode | St::ScanFf => out.push(0xFF),
+            St::Length { marker, hi } => {
+                out.extend_from_slice(&[0xFF, marker]);
+                out.extend(hi);
+            }
+            St::Collect { marker: 0xE2, left, buf } if buf.starts_with(b"ICC_PROFILE\0") || b"ICC_PROFILE\0".starts_with(&buf) => {
+                let len = buf.len() + left + 2;
+                out.extend_from_slice(&[0xFF, 0xE2, (len >> 8) as u8, len as u8]);
+                out.extend_from_slice(&buf);
+            }
+            _ => {}
+        }
+    }
+
     /// A segment with no payload is finished as soon as its length is read.
     fn after_segment_if_empty(&mut self, out: &mut Vec<u8>) {
         let empty = matches!(self.st, St::Copy { left: 0, .. } | St::Skip { left: 0 } | St::Collect { left: 0, .. });
@@ -397,6 +416,48 @@ mod tests {
             assert_eq!(run(&data, 1), data);
             assert_eq!(run(&data, 100), data);
         }
+    }
+
+    fn run_to_end(input: &[u8], chunk: usize) -> Vec<u8> {
+        let mut s = Scrubber::new();
+        let mut out = Vec::new();
+        for c in input.chunks(chunk) {
+            s.push(c, &mut out);
+        }
+        s.finish(&mut out);
+        out
+    }
+
+    #[test]
+    fn cut_off_files_keep_every_byte_without_metadata() {
+        // Nothing to strip here, so every prefix must come out exactly as it went in, however
+        // it's cut: the bytes held for an unfinished marker, length or profile go out at the end.
+        let mut input = vec![0xFF, 0xD8];
+        for s in [
+            seg(0xE0, b"JFIF\0\x01\x02\0\0\x01\0\x01\0\0"),
+            seg(0xE2, b"ICC_PROFILE\0\x01\x01profile"),
+            seg(0xDB, &[0u8; 65]),
+            seg(0xC0, &[8, 0, 16, 0, 16, 1, 1, 0x11, 0]),
+            seg(0xDA, &[1, 1, 0, 0, 63, 0]),
+        ] {
+            input.extend_from_slice(&s);
+        }
+        input.extend_from_slice(&[0x12, 0xFF, 0x00, 0x34, 0xFF, 0xD0, 0x56, 0xFF, 0xD9]);
+        for cut in 0..=input.len() {
+            for chunk in [1, 3, 64] {
+                assert_eq!(run_to_end(&input[..cut], chunk), &input[..cut], "cut at {cut}, chunk size {chunk}");
+            }
+        }
+        assert_eq!(run_to_end(&[0xFF], 1), [0xFF]);
+    }
+
+    #[test]
+    fn a_cut_off_exif_segment_stays_dropped() {
+        let mut input = vec![0xFF, 0xD8];
+        input.extend_from_slice(&seg(0xE1, &exif(6)));
+        let cut = input.len() - 5;
+        let out = run_to_end(&input[..cut], 4);
+        assert_eq!(out, [0xFF, 0xD8]);
     }
 
     #[test]

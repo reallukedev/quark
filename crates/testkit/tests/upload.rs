@@ -1,7 +1,12 @@
 //! HTTP File Upload (XEP-0363): discovery, slots, PUT, GET with ranges, limits and expiry.
 
+use std::net::SocketAddr;
+use std::time::Duration;
+
 use quark_testkit::quark_core::{ns, Element};
-use quark_testkit::{http_request, Client, TestServer};
+use quark_testkit::{http_request, Client, Options, TestServer};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 const SERVICE: &str = "upload.quark.test";
 
@@ -220,15 +225,159 @@ async fn files_of_deleted_accounts_are_swept() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A PUT that sends its headers and the first bytes of the body, and leaves the rest for later.
+async fn start_put(addr: SocketAddr, path: &str, length: usize, first: &[u8]) -> anyhow::Result<TcpStream> {
+    let mut tcp = TcpStream::connect(addr).await?;
+    let head = format!("PUT {path} HTTP/1.1\r\nHost: quark.test\r\nConnection: close\r\nContent-Length: {length}\r\n\r\n");
+    tcp.write_all(head.as_bytes()).await?;
+    tcp.write_all(first).await?;
+    tcp.flush().await?;
+    Ok(tcp)
+}
+
+/// PUTs `data` until it's taken (a slot given back by a dropped upload frees up shortly after).
+async fn put_eventually(addr: SocketAddr, put: &str, data: &[u8]) -> anyhow::Result<u16> {
+    let mut status = 0;
+    for _ in 0..50 {
+        status = http_request(addr, "PUT", put, &[], data).await?.status;
+        if status == 201 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(status)
+}
+
 #[tokio::test]
-async fn jpeg_location_metadata_is_stripped() -> anyhow::Result<()> {
+async fn an_upload_cut_off_midway_gives_its_slot_back() -> anyhow::Result<()> {
     let s = TestServer::start().await?;
     s.add_user("alice", "password-a").await?;
     let mut alice = s.login("alice", "password-a").await?;
+    let data = vec![7u8; 1000];
+    let (put, get) = slot(&mut alice, "a.bin", data.len() as u64, None).await?;
+    let token = get.split('/').nth(2).unwrap().to_string();
+    let part = s.srv.config().server.data_dir.join("uploads").join(format!(".{token}.part"));
+    let tcp = start_put(s.web(), &put, data.len(), &data[..100]).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(part.exists(), "the upload is under way");
+    // The phone loses its connection.
+    drop(tcp);
+    assert_eq!(put_eventually(s.web(), &put, &data).await?, 201, "the slot was given back, not left in use");
+    assert!(!part.exists());
+    assert_eq!(http_request(s.web(), "GET", &get, &[], b"").await?.body, data);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_upload_dropped_by_a_shutdown_cleans_up_and_its_slot_works_after_a_restart() -> anyhow::Result<()> {
+    let mut s = TestServer::start().await?;
+    s.add_user("alice", "password-a").await?;
+    let mut alice = s.login("alice", "password-a").await?;
+    let data = vec![9u8; 1000];
+    let (put, get) = slot(&mut alice, "a.bin", data.len() as u64, None).await?;
+    let token = get.split('/').nth(2).unwrap().to_string();
+    let part = s.srv.config().server.data_dir.join("uploads").join(format!(".{token}.part"));
+    let _tcp = start_put(s.web(), &put, data.len(), &data[..100]).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(part.exists());
+    // The server stops; after the drain the unfinished request is dropped, not answered.
+    s.srv.shut_down();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while part.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(!part.exists(), "the dropped upload removed its partial file");
+    s.restart().await?;
+    assert_eq!(http_request(s.web(), "PUT", &put, &[], &data).await?.status, 201, "the slot is usable again");
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_account_can_run_only_a_few_uploads_at_once() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    s.add_user("alice", "password-a").await?;
+    s.add_user("bob", "password-b").await?;
+    let mut alice = s.login("alice", "password-a").await?;
+    let mut running = Vec::new();
+    for i in 0..4 {
+        let (put, _) = slot(&mut alice, &format!("{i}.bin"), 100, None).await?;
+        running.push(start_put(s.web(), &put, 100, &[1; 10]).await?);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (put, _) = slot(&mut alice, "5.bin", 3, None).await?;
+    assert_eq!(http_request(s.web(), "PUT", &put, &[], b"abc").await?.status, 429);
+    let mut bob = s.login("bob", "password-b").await?;
+    let (bobs, _) = slot(&mut bob, "b.bin", 3, None).await?;
+    assert_eq!(http_request(s.web(), "PUT", &bobs, &[], b"abc").await?.status, 201, "other accounts aren't affected");
+    // One of the four gives up, which makes room.
+    drop(running.pop());
+    assert_eq!(put_eventually(s.web(), &put, b"abc").await?, 201);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_sweep_leaves_running_uploads_alone() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    s.add_user("alice", "password-a").await?;
+    let mut alice = s.login("alice", "password-a").await?;
+    let dir = s.srv.config().server.data_dir.join("uploads");
+    let orphan = dir.join(".0123456789abcdef0123456789abcdef.part");
+    std::fs::write(&orphan, b"left behind")?;
+    let data = vec![3u8; 500];
+    let (put, get) = slot(&mut alice, "run.bin", 500, None).await?;
+    let mut tcp = start_put(s.web(), &put, 500, &data[..200]).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(quark::modules::upload::sweep(&s.srv, quark_testkit::quark_core::time::now_ms()).await, 1, "only the orphan goes");
+    assert!(!orphan.exists());
+    tcp.write_all(&data[200..]).await?;
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), tcp.read_to_end(&mut raw)).await??;
+    assert!(raw.starts_with(b"HTTP/1.1 201"), "{}", String::from_utf8_lossy(&raw));
+    assert_eq!(http_request(s.web(), "GET", &get, &[], b"").await?.body, data);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_guessed_type_does_not_bind_the_upload() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    s.add_user("alice", "password-a").await?;
+    let mut alice = s.login("alice", "password-a").await?;
+    // The client named no type; the server guessed image/jpeg from the name, for serving only.
+    let (put, get) = slot(&mut alice, "photo.jpg", 4, None).await?;
+    let r = http_request(s.web(), "PUT", &put, &[("Content-Type", "application/octet-stream")], b"\xFF\xD8\xFF\xD9").await?;
+    assert_eq!(r.status, 201, "{}", r.text());
+    assert_eq!(http_request(s.web(), "GET", &get, &[], b"").await?.header("content-type"), Some("image/jpeg"));
+    Ok(())
+}
+
+/// A JPEG whose EXIF carries a location.
+fn jpeg_with_gps() -> Vec<u8> {
     let exif = b"Exif\0\0MM\0\x2a\0\0\0\x08\0\x01\x88\x25\0\x04\0\0\0\x01\0\0\0\x1a\0\0\0\0GPS 52.52N 13.40E";
     let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1, 0, (exif.len() + 2) as u8];
     jpeg.extend_from_slice(exif);
     jpeg.extend_from_slice(&[0xFF, 0xDA, 0, 8, 1, 1, 0, 0, 63, 0, 0x11, 0x22, 0xFF, 0xD9]);
+    jpeg
+}
+
+#[tokio::test]
+async fn photos_are_stored_exactly_as_sent_by_default() -> anyhow::Result<()> {
+    // Clients check the file against the hash and size they shared with the link (XEP-0447).
+    let s = TestServer::start().await?;
+    s.add_user("alice", "password-a").await?;
+    let mut alice = s.login("alice", "password-a").await?;
+    let jpeg = jpeg_with_gps();
+    let (put, get) = slot(&mut alice, "IMG_0002.JPG", jpeg.len() as u64, Some("image/jpeg")).await?;
+    assert_eq!(http_request(s.web(), "PUT", &put, &[("Content-Type", "image/jpeg")], &jpeg).await?.status, 201);
+    assert_eq!(http_request(s.web(), "GET", &get, &[], b"").await?.body, jpeg);
+    Ok(())
+}
+
+#[tokio::test]
+async fn jpeg_location_metadata_is_stripped() -> anyhow::Result<()> {
+    let s = TestServer::start_with(Options { extra_config: "[http]\nstrip_photo_metadata = true\n".into(), ..Default::default() }).await?;
+    s.add_user("alice", "password-a").await?;
+    let mut alice = s.login("alice", "password-a").await?;
+    let jpeg = jpeg_with_gps();
     let (put, get) = slot(&mut alice, "IMG_0001.JPG", jpeg.len() as u64, Some("image/jpeg")).await?;
     assert_eq!(http_request(s.web(), "PUT", &put, &[("Content-Type", "image/jpeg")], &jpeg).await?.status, 201);
     let r = http_request(s.web(), "GET", &get, &[], b"").await?;

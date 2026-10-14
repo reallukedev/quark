@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -17,10 +18,17 @@ use futures_util::StreamExt;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use super::AppState;
-use crate::modules::upload::{self, Slot, STATE_SLOT, STATE_STORED};
+use crate::modules::upload::{self, Begin, Slot, STATE_SLOT, STATE_STORED};
+use crate::server::Server;
 
 /// How long an upload may stall between two chunks.
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
+/// The slowest an upload may average, in bytes per second (a weak phone link manages several
+/// times this), so a slot can't be held open for days at a trickle.
+const MIN_THROUGHPUT: u64 = 16 * 1024;
+/// Never longer than this, whatever the size: a half-day stays well inside the day the sweep
+/// gives an unfinished upload before it removes the slot.
+const MAX_UPLOAD_TIME: Duration = Duration::from_secs(12 * 3600);
 const WRITE_BUFFER: usize = 256 * 1024;
 const READ_BUFFER: usize = 64 * 1024;
 const YEAR_SECS: i64 = 365 * 86_400;
@@ -98,28 +106,40 @@ pub(super) async fn put(
     if length != slot.size {
         return refuse((StatusCode::BAD_REQUEST, "The upload must be exactly as big as the slot said."));
     }
+    // A type the client named in its slot request binds the PUT; one we guessed from the file
+    // name doesn't (the client never promised it, and may well send `image/jpg` or none).
     if let Some(ct) = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
-        if essence(ct) != essence(&slot.ctype) && essence(&slot.ctype) != "application/octet-stream" {
+        if slot.ctype_given && essence(ct) != essence(&slot.ctype) && essence(&slot.ctype) != "application/octet-stream" {
             return refuse((StatusCode::BAD_REQUEST, "The upload's Content-Type doesn't match the slot."));
         }
     }
     match upload::begin_upload(srv, &token).await {
-        Ok(true) => {}
-        Ok(false) => return refuse((StatusCode::CONFLICT, "This slot is in use or has expired.")),
+        Ok(Begin::Ok) => {}
+        Ok(Begin::Taken) => return refuse((StatusCode::CONFLICT, "This slot is in use or has expired.")),
+        Ok(Begin::Busy) => {
+            return refuse((StatusCode::TOO_MANY_REQUESTS, "This account has several uploads running already. Wait for one to finish."))
+        }
         Err(e) => {
             tracing::warn!(error = %e, "couldn't claim an upload slot");
             return refuse((StatusCode::INTERNAL_SERVER_ERROR, "The server couldn't take the file."));
         }
     }
+    // From here on the slot is ours; if this future is dropped (the client went away, or the
+    // server stopped before the upload finished), the guard gives it back.
+    let mut claim = Claim { srv: Some(st.srv.clone()), token: token.clone() };
     let dir = upload::dir(srv);
     let part = dir.join(format!(".{token}.part"));
-    let jpeg = essence(&slot.ctype) == "image/jpeg";
-    let stored = match receive(body, &part, slot.size, jpeg).await {
-        Ok(n) => n,
-        Err(r) => {
-            let _ = tokio::fs::remove_file(&part).await;
-            upload::abort_upload(srv, &token).await;
+    let strip = srv.config().http.strip_photo_metadata && essence(&slot.ctype) == "image/jpeg";
+    let received = tokio::time::timeout(deadline(slot.size), receive(body, &part, slot.size, strip)).await;
+    let stored = match received {
+        Ok(Ok(n)) => n,
+        Ok(Err(r)) => {
+            claim.release().await;
             return refuse(r);
+        }
+        Err(_) => {
+            claim.release().await;
+            return refuse((StatusCode::REQUEST_TIMEOUT, "The upload took too long."));
         }
     };
     let finished = async {
@@ -128,27 +148,64 @@ pub(super) async fn put(
     };
     match finished.await {
         Ok(true) => {
+            claim.keep();
             st.stats.uploads.fetch_add(1, Ordering::Relaxed);
             st.stats.upload_bytes.fetch_add(slot.size, Ordering::Relaxed);
             with_cors((StatusCode::CREATED, "Stored.\n").into_response())
         }
         Ok(false) => {
+            claim.keep();
             let _ = tokio::fs::remove_file(dir.join(&token)).await;
             refuse((StatusCode::GONE, "This slot no longer exists."))
         }
         Err(e) => {
             tracing::warn!(error = %e, "couldn't store an upload");
-            let _ = tokio::fs::remove_file(&part).await;
-            let _ = tokio::fs::remove_file(dir.join(&token)).await;
-            upload::abort_upload(srv, &token).await;
+            claim.release().await;
             refuse((StatusCode::INTERNAL_SERVER_ERROR, "The server couldn't store the file."))
         }
     }
 }
 
+/// The slot of an upload in progress. Unless kept, it's released (files removed, slot back to
+/// unused) however the upload ends, a dropped request future included.
+struct Claim {
+    srv: Option<Arc<Server>>,
+    token: String,
+}
+
+impl Claim {
+    /// The upload is done with the slot (stored, or the row is gone).
+    fn keep(&mut self) {
+        self.srv = None;
+    }
+
+    async fn release(&mut self) {
+        if let Some(srv) = self.srv.take() {
+            upload::abort_upload(&srv, &self.token).await;
+        }
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let Some(srv) = self.srv.take() else { return };
+        let token = std::mem::take(&mut self.token);
+        // Drop can't wait; the release runs on its own (when the runtime is still there).
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move { upload::abort_upload(&srv, &token).await });
+        }
+    }
+}
+
+/// How long an upload of `size` bytes may take in all: a minute, plus the time at
+/// `MIN_THROUGHPUT`, at most `MAX_UPLOAD_TIME`. Per-chunk stalls are caught sooner.
+fn deadline(size: u64) -> Duration {
+    (Duration::from_secs(60) + Duration::from_secs(size / MIN_THROUGHPUT)).min(MAX_UPLOAD_TIME)
+}
+
 /// Streams the body to `part`, never holding more than a chunk in memory. Returns the bytes
-/// written, which is less than `size` when JPEG metadata was stripped.
-async fn receive(body: Body, part: &Path, size: u64, jpeg: bool) -> Result<u64, Refusal> {
+/// written, which is less than `size` when JPEG metadata was stripped (`strip`).
+async fn receive(body: Body, part: &Path, size: u64, strip: bool) -> Result<u64, Refusal> {
     let internal = (StatusCode::INTERNAL_SERVER_ERROR, "The server couldn't store the file.");
     let file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(part).await.map_err(|e| {
         tracing::warn!(error = %e, path = %part.display(), "couldn't create an upload file");
@@ -156,7 +213,7 @@ async fn receive(body: Body, part: &Path, size: u64, jpeg: bool) -> Result<u64, 
     })?;
     let mut w = tokio::io::BufWriter::with_capacity(WRITE_BUFFER, file);
     let mut stream = body.into_data_stream();
-    let mut scrubber = jpeg.then(super::jpeg::Scrubber::new);
+    let mut scrubber = strip.then(super::jpeg::Scrubber::new);
     let mut scrubbed = Vec::new();
     let (mut got, mut written) = (0u64, 0u64);
     loop {
@@ -183,6 +240,13 @@ async fn receive(body: Body, part: &Path, size: u64, jpeg: bool) -> Result<u64, 
     }
     if got != size {
         return Err((StatusCode::BAD_REQUEST, "The upload is smaller than the slot said."));
+    }
+    if let Some(s) = scrubber {
+        // Bytes the scrubber held back waiting for more (a cut-off marker, say) still belong.
+        scrubbed.clear();
+        s.finish(&mut scrubbed);
+        w.write_all(&scrubbed).await.map_err(|_| internal)?;
+        written += scrubbed.len() as u64;
     }
     w.flush().await.map_err(|_| internal)?;
     w.get_ref().sync_data().await.map_err(|_| internal)?;
@@ -372,6 +436,14 @@ mod tests {
         assert_eq!(parse_range("items=0-1", 100), Range::Full);
         assert_eq!(parse_range("bytes=x-y", 100), Range::Full);
         assert_eq!(parse_range("bytes=0-0", 0), Range::Unsatisfiable);
+    }
+
+    #[test]
+    fn upload_deadlines_scale_with_size() {
+        assert_eq!(deadline(10), Duration::from_secs(60));
+        // 100 MiB at 16 KiB/s: 6400 s, plus the minute.
+        assert_eq!(deadline(100 << 20), Duration::from_secs(6460));
+        assert_eq!(deadline(u64::MAX), MAX_UPLOAD_TIME);
     }
 
     #[test]

@@ -114,6 +114,8 @@ pub struct Server {
     remote: OnceLock<Arc<dyn Remote>>,
     pending: Pending,
     pub stats: Stats,
+    /// The built-in call relay, once started.
+    pub turn: crate::turn::TurnState,
     pub started_at: i64,
     shutdown: watch::Sender<bool>,
 }
@@ -164,6 +166,7 @@ impl Server {
             remote: OnceLock::new(),
             pending: Pending::default(),
             stats: Stats::default(),
+            turn: crate::turn::TurnState::default(),
             started_at: quark_core::time::now_ms(),
             shutdown,
         });

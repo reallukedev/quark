@@ -27,6 +27,8 @@ use tokio::net::TcpStream;
 
 pub use quark_core;
 
+pub mod turn;
+
 /// The domain every test server serves.
 pub const DOMAIN: &str = "quark.test";
 

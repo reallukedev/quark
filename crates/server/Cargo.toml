@@ -21,6 +21,8 @@ futures-util = { version = "0.3", features = ["sink"] }
 hex = "0.4"
 hickory-resolver = "0.24"
 hmac = "0.12"
+md-5 = "0.10"
+crc32fast = "1"
 parking_lot = "0.12"
 pbkdf2 = "0.12"
 rand = "0.8"

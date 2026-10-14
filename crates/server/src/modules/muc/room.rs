@@ -1261,7 +1261,7 @@ impl Room {
         }
         o.voice_asked = Some(Instant::now());
         let real = o.primary().map(|s| s.jid.to_string()).unwrap_or_default();
-        let form = super::form::Form::new("form", "http://jabber.org/protocol/muc#request")
+        let form = crate::modules::forms::Form::new("form", "http://jabber.org/protocol/muc#request")
             .title("Voice request")
             .instructions("To let this person talk, tick \"Grant voice\" and submit. To ignore the request, cancel.")
             .field("muc#role", "text-single", "Requested role", Some("participant"))
@@ -1498,7 +1498,7 @@ impl Room {
     // ---------------------------------------------------------------- owner (XEP-0045 §10)
 
     /// Applies a submitted configuration form.
-    pub fn configure(&mut self, v: &super::form::Values, out: &mut Out) -> Result<(), StanzaError> {
+    pub fn configure(&mut self, v: &crate::modules::forms::Values, out: &mut Out) -> Result<(), StanzaError> {
         let was_persistent = self.config.persistent;
         let was_locked = self.locked_since.take().is_some();
         let changes = self.config.apply(v).map_err(|t| err(Condition::NotAcceptable, &t))?;
@@ -1560,7 +1560,7 @@ impl Room {
             return Ok(q.child(Element::new("registered", ns::REGISTER)).text_child("username", ns::REGISTER, n));
         }
         Ok(q.text_child("instructions", ns::REGISTER, "Choose the nickname to keep for yourself in this group chat.").child(
-            super::form::Form::new("form", "http://jabber.org/protocol/muc#register")
+            crate::modules::forms::Form::new("form", "http://jabber.org/protocol/muc#register")
                 .title("Register with the group chat")
                 .field("muc#register_roomnick", "text-single", "Nickname", None)
                 .required()
@@ -1584,13 +1584,13 @@ impl Room {
             }
             return Ok(());
         }
-        let Some(x) = super::form::find(q) else {
+        let Some(x) = crate::modules::forms::find(q) else {
             return Err(err(Condition::BadRequest, "Send the registration form."));
         };
         if x.attr("type") == Some("cancel") {
             return Ok(());
         }
-        let v = super::form::Values::parse(x);
+        let v = crate::modules::forms::Values::parse(x);
         let nick = v
             .get("muc#register_roomnick")
             .map(str::trim)

@@ -18,6 +18,7 @@ pub mod carbons;
 pub mod contact;
 pub mod disco;
 pub mod extdisco;
+pub mod forms;
 pub mod invites;
 pub mod last;
 pub mod mam;

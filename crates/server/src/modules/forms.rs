@@ -1,5 +1,6 @@
-//! Just enough of Data Forms (XEP-0004) for room configuration, registration, voice requests and
-//! room info: building forms and reading submitted values.
+//! Just enough of Data Forms (XEP-0004) for the modules that ask people things (room settings,
+//! voice requests, room and account registration, ad-hoc commands): building forms and reading
+//! submitted values, with caps on how much of a submission is read.
 
 use std::collections::HashMap;
 
@@ -81,17 +82,28 @@ pub struct Values(HashMap<String, Vec<String>>);
 
 /// Submitted forms are small; anything bigger is someone being silly.
 const MAX_FIELDS: usize = 64;
-const MAX_VALUES: usize = 64;
+pub const MAX_VALUES: usize = 64;
 
 impl Values {
     pub fn parse(x: &Element) -> Values {
+        Values::parse_up_to(x, MAX_VALUES)
+    }
+
+    /// [`Values::parse`] keeping up to `max_values` values a field (a list of accounts, the
+    /// lines of a long message) rather than [`MAX_VALUES`]. Fields stay capped.
+    pub fn parse_up_to(x: &Element, max_values: usize) -> Values {
         let mut m: HashMap<String, Vec<String>> = HashMap::new();
         for f in x.children().filter(|c| c.is("field", ns::DATA_FORMS)).take(MAX_FIELDS) {
             let Some(var) = f.attr("var") else { continue };
-            let vals = f.children().filter(|c| c.is("value", ns::DATA_FORMS)).take(MAX_VALUES).map(|v| v.text_content()).collect();
+            let vals = f.children().filter(|c| c.is("value", ns::DATA_FORMS)).take(max_values).map(|v| v.text_content()).collect();
             m.insert(var.to_string(), vals);
         }
         Values(m)
+    }
+
+    /// Every value of a field, none when it wasn't sent.
+    pub fn all(&self, var: &str) -> &[String] {
+        self.0.get(var).map_or(&[], Vec::as_slice)
     }
 
     pub fn form_type(&self) -> Option<&str> {
@@ -141,6 +153,23 @@ mod tests {
         assert_eq!(v.get("b"), Some("hi"));
         assert_eq!(v.boolean("missing"), Ok(None));
         assert!(!v.is_empty());
+    }
+
+    #[test]
+    fn submissions_are_capped() {
+        let mut x = Element::new("x", ns::DATA_FORMS).attr_set("type", "submit");
+        for i in 0..MAX_FIELDS + 10 {
+            x.append(Element::new("field", ns::DATA_FORMS).attr_set("var", format!("f{i}")));
+        }
+        let mut many = Element::new("field", ns::DATA_FORMS).attr_set("var", "many");
+        for i in 0..MAX_VALUES + 10 {
+            many.append(Element::new("value", ns::DATA_FORMS).text(i.to_string()));
+        }
+        assert!(!Values::parse(&x).has(&format!("f{MAX_FIELDS}")));
+        let x = Element::new("x", ns::DATA_FORMS).child(many);
+        assert_eq!(Values::parse(&x).all("many").len(), MAX_VALUES);
+        assert_eq!(Values::parse_up_to(&x, 500).all("many").len(), MAX_VALUES + 10);
+        assert!(Values::parse(&x).all("missing").is_empty());
     }
 
     #[test]

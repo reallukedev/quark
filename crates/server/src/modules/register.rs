@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use quark_core::stanza::{error_reply, iq_result, iq_type, IqType};
 use quark_core::{ns, Condition, Element, Jid, StanzaError};
 
+use super::forms::{Form, Values};
 use super::{invites, ok, ok_empty, Event, IqCtx, IqReply, IqResult, IqTarget, Module};
 use crate::accounts::{AccountError, Role};
 use crate::db::{params, DbError, Migration};
@@ -20,8 +21,12 @@ use crate::settings::SignUp;
 
 pub static MIGRATION: Migration = Migration {
     module: "register",
-    steps: &["CREATE TABLE ibr_log (ip TEXT NOT NULL, at INTEGER NOT NULL);
-              CREATE INDEX ibr_log_by_ip ON ibr_log (ip, at);"],
+    steps: &[
+        "CREATE TABLE ibr_log (ip TEXT NOT NULL, at INTEGER NOT NULL);
+              CREATE INDEX ibr_log_by_ip ON ibr_log (ip, at);",
+        // `ip` is now an address key (see `ip_key`); `ok` is 0 for a sign-up that failed.
+        "ALTER TABLE ibr_log ADD COLUMN ok INTEGER NOT NULL DEFAULT 1;",
+    ],
 };
 
 /// Usernames nobody gets by signing up themselves: they look official. Admins can still make
@@ -58,9 +63,16 @@ pub fn reserved(user: &str) -> bool {
     RESERVED.contains(&user)
 }
 
-/// Invite tokens one connection may try before it's refused, though guessing 144 bits is hopeless.
+/// Wrong invite tokens one connection may send before it's refused, though guessing 144 bits is
+/// hopeless.
 const MAX_TOKEN_TRIES: u8 = 5;
 const HOUR_MS: i64 = 3_600_000;
+/// Sign-ups with a member's invite get this many times `registrations_per_hour` from one
+/// address: friends sign up together, but invite links shouldn't open the floodgates.
+const INVITED_FACTOR: u32 = 4;
+/// Attempts, failed ones included, one address may make per allowed sign-up. Failures are cheap
+/// now, but someone trying name after name is still someone to slow down.
+const ATTEMPTS_FACTOR: u32 = 4;
 
 pub struct Register;
 
@@ -238,12 +250,8 @@ pub fn preauth_features(srv: &Server, _host: &Host, secure: bool) -> Vec<Element
     vec![Element::new("register", ns::REGISTER_FEATURE), Element::new("register", ns::INVITE), Element::new("register", ns::IBR_TOKEN)]
 }
 
-/// A registration IQ before sign-in. Returns the reply to send.
-pub async fn preauth(srv: &Arc<Server>, host: &Arc<Host>, iq: &Element, secure: bool, ip: Option<IpAddr>) -> Option<Element> {
-    preauth_with(srv, host, iq, secure, ip, &mut PreauthState::default()).await
-}
-
-/// [`preauth`], remembering an invite token across IQs on the same connection.
+/// A registration IQ before sign-in, remembering an invite token across IQs on the same
+/// connection. Returns the reply to send.
 pub async fn preauth_with(
     srv: &Arc<Server>,
     host: &Arc<Host>,
@@ -276,7 +284,7 @@ pub async fn preauth_with(
     match kind {
         Some(IqType::Get) => {
             let invite = match &state.token {
-                Some(t) => invites::find(srv, &host.domain, t).await.ok().flatten(),
+                Some(t) => invites::find(srv, &host.domain, t).await.ok().flatten().filter(|s| invites::allows_signup(s, host)),
                 None => None,
             };
             Some(iq_result(iq).child(form(host, invite.as_ref())))
@@ -286,7 +294,9 @@ pub async fn preauth_with(
                 return fail(StanzaError::new(Condition::NotAuthorized).with_text("Sign in first to delete an account."));
             }
             let f = Fields::read(q);
-            if let Some(t) = &f.token {
+            // A token already taken on this connection isn't checked again here (`register`
+            // checks it as it's used), so retries with it don't count as guesses.
+            if let Some(t) = f.token.as_ref().filter(|t| state.token.as_ref() != Some(*t)) {
                 match check_token(srv, host, Some(t), state).await {
                     Ok(t) => state.token = Some(t),
                     Err(e) => return fail(e),
@@ -304,19 +314,23 @@ pub async fn preauth_with(
     }
 }
 
+/// Checks an invite token. Only wrong ones count against the connection's tries.
 async fn check_token(srv: &Server, host: &Host, token: Option<&str>, state: &mut PreauthState) -> Result<String, StanzaError> {
-    state.tries = state.tries.saturating_add(1);
-    if state.tries > MAX_TOKEN_TRIES {
+    if state.tries >= MAX_TOKEN_TRIES {
         return Err(StanzaError::new(Condition::PolicyViolation).with_text("Too many invite codes tried on this connection."));
     }
-    let gone = || StanzaError::item_not_found().with_text("This invite has expired or was already used.");
-    let token = token.filter(|t| invites::plausible_token(t)).ok_or_else(gone)?;
-    match invites::find(srv, &host.domain, token).await {
-        Ok(Some(s)) if invites::allows_signup(&s, host) || s.reset => Ok(s.token),
-        Ok(_) => Err(gone()),
-        Err(e) => {
+    let found = match token.filter(|t| invites::plausible_token(t)) {
+        Some(t) => invites::find(srv, &host.domain, t).await.map_err(|e| {
             tracing::warn!(error = %e, "couldn't check an invite");
-            Err(StanzaError::internal())
+            StanzaError::internal()
+        })?,
+        None => None,
+    };
+    match found.filter(|s| invites::allows_signup(s, host)) {
+        Some(s) => Ok(s.token),
+        None => {
+            state.tries = state.tries.saturating_add(1);
+            Err(StanzaError::item_not_found().with_text("This invite has expired or was already used."))
         }
     }
 }
@@ -335,29 +349,14 @@ fn form(host: &Host, invite: Option<&invites::Stored>) -> Element {
     if let Some(u) = &fixed {
         username.set_text(u.clone());
     }
-    let field = |var: &str, kind: &str, label: &str, value: Option<&str>| {
-        let mut f = Element::new("field", ns::DATA_FORMS)
-            .attr_set("var", var)
-            .attr_set("type", kind)
-            .attr_set("label", label)
-            .child(Element::new("required", ns::DATA_FORMS));
-        if let Some(v) = value {
-            f.append(Element::new("value", ns::DATA_FORMS).text(v));
-        }
-        f
-    };
-    let x = Element::new("x", ns::DATA_FORMS)
-        .attr_set("type", "form")
-        .text_child("title", ns::DATA_FORMS, format!("Make an account on {}", host.domain))
-        .text_child("instructions", ns::DATA_FORMS, instructions.clone())
-        .child(
-            Element::new("field", ns::DATA_FORMS)
-                .attr_set("var", "FORM_TYPE")
-                .attr_set("type", "hidden")
-                .child(Element::new("value", ns::DATA_FORMS).text(ns::REGISTER)),
-        )
-        .child(field("username", "text-single", "Username", fixed.as_deref()))
-        .child(field("password", "text-private", "Password", None));
+    let x = Form::new("form", ns::REGISTER)
+        .instructions(&instructions)
+        .title(&format!("Make an account on {}", host.domain))
+        .field("username", "text-single", "Username", fixed.as_deref())
+        .required()
+        .field("password", "text-private", "Password", None)
+        .required()
+        .build();
     Element::new("query", ns::REGISTER)
         .text_child("instructions", ns::REGISTER, instructions)
         .child(username)
@@ -374,22 +373,21 @@ struct Fields {
 }
 
 impl Fields {
+    /// Empty legacy fields count as absent: clients echo the form's `<username/>` and
+    /// `<password/>` next to a filled-in data form.
     fn read(q: &Element) -> Fields {
+        let given = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
         let mut f = Fields {
-            username: q.child_text("username", ns::REGISTER),
-            password: q.child_text("password", ns::REGISTER),
+            username: given(q.child_text("username", ns::REGISTER)),
+            password: q.child_text("password", ns::REGISTER).filter(|s| !s.is_empty()),
             token: q.get_child("preauth", ns::PARS).and_then(|p| p.attr("token")).map(str::to_string),
         };
         if let Some(x) = q.get_child("x", ns::DATA_FORMS).filter(|x| x.attr("type") == Some("submit")) {
-            for field in x.children().filter(|c| c.is("field", ns::DATA_FORMS)) {
-                let v = field.child_text("value", ns::DATA_FORMS);
-                match field.attr("var") {
-                    Some("username") if f.username.is_none() => f.username = v,
-                    Some("password") if f.password.is_none() => f.password = v,
-                    Some("token" | "preauth") if f.token.is_none() => f.token = v,
-                    _ => {}
-                }
-            }
+            let v = Values::parse(x);
+            let first = |var: &str| v.get(var).filter(|s| !s.is_empty()).map(str::to_string);
+            f.username = f.username.or_else(|| first("username"));
+            f.password = f.password.or_else(|| first("password"));
+            f.token = f.token.or_else(|| first("token")).or_else(|| first("preauth"));
         }
         f
     }
@@ -417,12 +415,15 @@ async fn register(srv: &Arc<Server>, host: &Arc<Host>, f: Fields, ip: Option<IpA
     }
 
     let settings = host.settings();
+    let gone = || StanzaError::item_not_found().with_text("This invite has expired or was already used.");
     let invite = match token {
+        // Checked again as it's used: sign-up may have closed since `<preauth/>`.
         Some(t) => Some(
             invites::find(srv, &host.domain, t)
                 .await
                 .map_err(|e| internal(&e))?
-                .ok_or_else(|| StanzaError::item_not_found().with_text("This invite has expired or was already used."))?,
+                .filter(|s| invites::allows_signup(s, host))
+                .ok_or_else(gone)?,
         ),
         None => None,
     };
@@ -443,47 +444,27 @@ async fn register(srv: &Arc<Server>, host: &Arc<Host>, f: Fields, ip: Option<IpA
             }
         }
     }
+    let reset = invite.as_ref().is_some_and(|s| s.reset);
     let named_by_invite = invite.as_ref().is_some_and(|s| s.username.as_deref() == Some(user.as_str()));
     if reserved(&user) && !named_by_invite {
         return Err(StanzaError::new(Condition::NotAcceptable).with_text("That username is reserved. Choose another one."));
     }
-    let ip_key = ip.map_or_else(|| "unknown".to_string(), |i| i.to_string());
-    if invite.is_none() {
-        let limit = srv.config().limits.registrations_per_hour;
-        if recent_registrations(srv, &ip_key).await.map_err(|e| internal(&e))? >= u64::from(limit) {
-            return Err(StanzaError::new(Condition::PolicyViolation)
-                .with_type(quark_core::ErrorType::Wait)
-                .with_text("Too many accounts were made from your address. Try again in an hour."));
-        }
+    // An admin in the config file is one by name, whoever makes the account: that's done with
+    // `quark ctl` or the admin API, never by signing up, with an invite or without.
+    if !reset && host.is_admin_jid(&Jid::bare_unchecked(&user, &host.domain)) {
+        return Err(StanzaError::new(Condition::NotAcceptable).with_text("That username is reserved. Choose another one."));
     }
 
-    // Take the invite's use now, so two people can't both redeem a single-use invite.
-    let claimed = match token {
-        Some(t) => Some(
-            invites::claim(srv, &host.domain, t)
-                .await
-                .map_err(|e| internal(&e))?
-                .ok_or_else(|| StanzaError::item_not_found().with_text("This invite has expired or was already used."))?,
-        ),
-        None => None,
-    };
-    let give_back = |s: &Option<invites::Stored>| {
-        let t = s.as_ref().map(|s| s.token.clone());
-        async move {
-            if let Some(t) = t {
-                invites::unclaim(srv, &t).await;
-            }
-        }
-    };
-
-    if claimed.as_ref().is_some_and(|s| s.reset) {
+    if reset {
+        let t = token.unwrap_or_default();
+        let claimed = invites::claim(srv, &host.domain, t).await.map_err(|e| internal(&e))?.ok_or_else(gone)?;
         return match change_password(srv, host, &user, &password, Some("The password was reset.")).await {
             Ok(_) => {
                 tracing::info!(account = %format!("{user}@{}", host.domain), "password reset with an invite");
                 Ok(())
             }
             Err(e) => {
-                give_back(&claimed).await;
+                invites::unclaim(srv, &claimed.token).await;
                 Err(match e {
                     AccountError::Invalid(t) => unacceptable(&t),
                     AccountError::NotFound(_) => StanzaError::item_not_found().with_text("That account doesn't exist anymore."),
@@ -493,24 +474,62 @@ async fn register(srv: &Arc<Server>, host: &Arc<Host>, f: Fields, ip: Option<IpA
         };
     }
 
+    // Sign-ups from one address: open ones, and with a member's invite (more of those). Admin
+    // invites aren't limited. The attempt is logged before anything slow, so parallel sign-ups
+    // can't all slip under the limit.
+    let ip_key = ip_key(ip);
+    let limit = srv.config().limits.registrations_per_hour;
+    let allowance = match &invite {
+        None => Some(limit),
+        Some(s) if s.inviter.is_some() => Some(limit.saturating_mul(INVITED_FACTOR)),
+        Some(_) => None,
+    };
+    let slot = match allowance {
+        Some(n) => match reserve(srv, &ip_key, n).await.map_err(|e| internal(&e))? {
+            Some(id) => Some(id),
+            None => {
+                return Err(StanzaError::new(Condition::PolicyViolation)
+                    .with_type(quark_core::ErrorType::Wait)
+                    .with_text("Too many accounts were made from your address. Try again in an hour."))
+            }
+        },
+        None => None,
+    };
+
+    // Take the invite's use now, so two people can't both redeem a single-use invite.
+    let claimed = match token {
+        Some(t) => match invites::claim_signup(srv, host, t, &user).await {
+            Ok(invites::SignupClaim::Claimed(s)) => Some(s),
+            Ok(invites::SignupClaim::Gone) => {
+                settle(srv, slot, Attempt::Void).await;
+                return Err(gone());
+            }
+            Ok(invites::SignupClaim::InviterBusy) => {
+                settle(srv, slot, Attempt::Void).await;
+                return Err(StanzaError::new(Condition::PolicyViolation)
+                    .with_type(quark_core::ErrorType::Wait)
+                    .with_text("Many people joined with this person's invites today. Try again tomorrow."));
+            }
+            Err(e) => {
+                settle(srv, slot, Attempt::Void).await;
+                return Err(internal(&e));
+            }
+        },
+        None => None,
+    };
+
     let role = claimed.as_ref().map_or(Role::Member, |s| s.role);
-    match create_account(srv, host, &user, &password, role).await {
-        Ok(()) => {}
-        Err(e) => {
-            give_back(&claimed).await;
-            return Err(match e {
-                AccountError::Exists(_) => StanzaError::new(Condition::Conflict).with_text("That username is taken. Choose another one."),
-                AccountError::Invalid(t) => unacceptable(&t),
-                e => internal(&e),
-            });
+    if let Err(e) = create_account(srv, host, &user, &password, role).await {
+        if let Some(s) = &claimed {
+            invites::unclaim(srv, &s.token).await;
         }
-    }
-    if claimed.is_none() {
-        let now = quark_core::time::now_ms();
-        let key = ip_key.clone();
-        if let Err(e) = srv.db.write(move |t| t.execute("INSERT INTO ibr_log (ip, at) VALUES (?1, ?2)", params![key, now])).await {
-            tracing::warn!(error = %e, "couldn't log a registration");
-        }
+        let taken = matches!(e, AccountError::Exists(_));
+        settle(srv, slot, if taken { Attempt::Failed } else { Attempt::Void }).await;
+        return Err(match e {
+            AccountError::Exists(_) => StanzaError::new(Condition::Conflict).with_text("That username is taken. Choose another one."),
+            AccountError::Invalid(t) => unacceptable(&t),
+            e => internal(&e),
+        });
     }
     if let Some(inviter) = claimed.as_ref().and_then(|s| s.inviter.as_deref()) {
         if let Err(e) = invites::befriend(srv, host, inviter, &user).await {
@@ -521,15 +540,61 @@ async fn register(srv: &Arc<Server>, host: &Arc<Host>, f: Fields, ip: Option<IpA
     Ok(())
 }
 
-async fn recent_registrations(srv: &Server, ip: &str) -> Result<u64, DbError> {
-    let (ip, since) = (ip.to_string(), quark_core::time::now_ms() - HOUR_MS);
+/// The key sign-ups are counted under: the IPv4 address, or the /64 of an IPv6 one, since one
+/// connection usually has a whole /64 to pick addresses from.
+fn ip_key(ip: Option<IpAddr>) -> String {
+    match ip.map(|i| i.to_canonical()) {
+        None => "unknown".to_string(),
+        Some(IpAddr::V4(v4)) => v4.to_string(),
+        Some(IpAddr::V6(v6)) => match ipnet::Ipv6Net::new(v6, 64) {
+            Ok(net) => net.trunc().to_string(),
+            Err(_) => v6.to_string(),
+        },
+    }
+}
+
+/// Logs a sign-up attempt from `key` unless the address is out of attempts: `allowance`
+/// accounts an hour, and [`ATTEMPTS_FACTOR`] times that in attempts. One transaction on the
+/// single writer, so concurrent attempts are counted one by one. Returns the log row.
+async fn reserve(srv: &Server, key: &str, allowance: u32) -> Result<Option<i64>, DbError> {
+    let (key, now) = (key.to_string(), quark_core::time::now_ms());
+    let (made_max, tried_max) = (i64::from(allowance), i64::from(allowance) * i64::from(ATTEMPTS_FACTOR));
     srv.db
-        .read(move |c| {
-            c.prepare_cached("SELECT COUNT(*) FROM ibr_log WHERE ip = ?1 AND at > ?2")?
-                .query_row(params![ip, since], |r| r.get::<_, i64>(0))
+        .write(move |t| {
+            let (made, tried): (i64, i64) = t.query_row(
+                "SELECT COALESCE(SUM(ok), 0), COUNT(*) FROM ibr_log WHERE ip = ?1 AND at > ?2",
+                params![key, now - HOUR_MS],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if made >= made_max || tried >= tried_max {
+                return Ok(None);
+            }
+            t.execute("INSERT INTO ibr_log (ip, at, ok) VALUES (?1, ?2, 1)", params![key, now])?;
+            Ok(Some(t.last_insert_rowid()))
         })
         .await
-        .map(|n| n.max(0) as u64)
+}
+
+/// How a logged attempt that didn't make an account ends.
+enum Attempt {
+    /// Counts as an attempt (a taken username).
+    Failed,
+    /// Not the person's doing (an invite used up meanwhile, a server error): forgotten.
+    Void,
+}
+
+async fn settle(srv: &Server, slot: Option<i64>, how: Attempt) {
+    let Some(id) = slot else { return };
+    let r = srv
+        .db
+        .write(move |t| match how {
+            Attempt::Failed => t.execute("UPDATE ibr_log SET ok = 0 WHERE rowid = ?1", [id]),
+            Attempt::Void => t.execute("DELETE FROM ibr_log WHERE rowid = ?1", [id]),
+        })
+        .await;
+    if let Err(e) = r {
+        tracing::warn!(error = %e, "couldn't update the registration log");
+    }
 }
 
 #[cfg(test)]
@@ -550,6 +615,28 @@ mod tests {
         .unwrap();
         let f = Fields::read(&q);
         assert_eq!((f.username.as_deref(), f.password.as_deref(), f.token.as_deref()), (Some("kim"), Some("secret12"), Some("tok")));
+    }
+
+    #[test]
+    fn empty_legacy_fields_leave_the_form_in_charge() {
+        let q = Element::parse(
+            "<query xmlns='jabber:iq:register'><username/><password></password><x xmlns='jabber:x:data' type='submit'>\
+             <field var='username'><value>kim</value></field><field var='password'><value>secret12</value></field></x></query>",
+        )
+        .unwrap();
+        let f = Fields::read(&q);
+        assert_eq!((f.username.as_deref(), f.password.as_deref()), (Some("kim"), Some("secret12")));
+    }
+
+    #[test]
+    fn addresses_are_counted_by_ipv4_or_ipv6_64() {
+        let key = |s: &str| ip_key(Some(s.parse().unwrap()));
+        assert_eq!(key("192.0.2.7"), "192.0.2.7");
+        assert_eq!(key("::ffff:192.0.2.7"), "192.0.2.7");
+        assert_eq!(key("2001:db8:1:2:aaaa::1"), "2001:db8:1:2::/64");
+        assert_eq!(key("2001:db8:1:2:bbbb:cccc:dddd:eeee"), key("2001:db8:1:2::9"));
+        assert_ne!(key("2001:db8:1:3::1"), key("2001:db8:1:2::1"));
+        assert_eq!(ip_key(None), "unknown");
     }
 
     #[test]

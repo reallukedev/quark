@@ -21,6 +21,22 @@ async fn friend_invite(c: &mut Client, domain: &str) -> anyhow::Result<String> {
     Ok(uri)
 }
 
+/// The note of a refused "Invite someone".
+async fn friend_invite_refusal(c: &mut Client, domain: &str) -> anyhow::Result<String> {
+    let cmd = Element::new("command", ns::COMMANDS).attr_set("node", "urn:xmpp:invite#invite").attr_set("action", "execute");
+    let r = c.iq_set(Some(domain), cmd).await?;
+    let note = r.get_child("command", ns::COMMANDS).and_then(|c| c.get_child("note", ns::COMMANDS)).cloned();
+    anyhow::ensure!(note.as_ref().and_then(|n| n.attr("type")) == Some("error"), "not refused: {r}");
+    Ok(note.map(|n| n.text_content()).unwrap_or_default())
+}
+
+/// Signs up `user` with the invite behind `uri`; returns the IQ answer.
+async fn sign_up_with(s: &TestServer, uri: &str, user: &str) -> anyhow::Result<Element> {
+    let mut c = unauthenticated(s).await?;
+    let q = register_query(user, "password-9").child(Element::new("preauth", ns::PARS).attr_set("token", token_of(uri)));
+    c.iq_set(None, q).await
+}
+
 async fn roster_of(c: &mut Client) -> anyhow::Result<Vec<(String, String)>> {
     let me = c.bare().unwrap_or_default();
     let r = c.iq_get(Some(&me), Element::new("query", ns::ROSTER)).await?;
@@ -86,6 +102,89 @@ async fn an_invite_token_preapproves_a_subscription() -> anyhow::Result<()> {
         .await?;
     let asked = sam.expect(|e| e.name() == "presence" && e.attr("type") == Some("subscribe")).await?;
     assert_eq!(asked.attr("from"), Some(format!("lee@{}", s.domain()).as_str()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_token_taken_before_sign_up_closed_stops_working() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    s.add_user("sam", "password-1").await?;
+    let mut sam = s.online("sam", "password-1", "phone").await?;
+    let uri = friend_invite(&mut sam, s.domain()).await?;
+    let mut c = unauthenticated(&s).await?;
+    assert_eq!(c.iq_set(None, Element::new("preauth", ns::PARS).attr_set("token", token_of(&uri))).await?.attr("type"), Some("result"));
+    s.set_settings(|st| st.sign_up = SignUp::Closed).await?;
+    assert_eq!(condition(&c.iq_set(None, register_query("kim", "password-2")).await?), "item-not-found");
+    assert!(!s.srv.accounts.exists(s.domain(), "kim").await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn member_invites_are_limited_and_new_members_wait() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    s.add_user("sam", "password-1").await?;
+    let mut sam = s.online("sam", "password-1", "phone").await?;
+    let mut uris = Vec::new();
+    for _ in 0..10 {
+        uris.push(friend_invite(&mut sam, s.domain()).await?);
+    }
+    // Ten open at once.
+    assert!(friend_invite_refusal(&mut sam, s.domain()).await?.contains("open invites"));
+
+    // Five people a day join with one member's invites.
+    for (i, uri) in uris.iter().take(5).enumerate() {
+        let r = sign_up_with(&s, uri, &format!("f{i}")).await?;
+        assert_eq!(r.attr("type"), Some("result"), "{r}");
+    }
+    let r = sign_up_with(&s, &uris[5], "f5").await?;
+    assert_eq!(condition(&r), "policy-violation");
+    assert!(!s.srv.accounts.exists(s.domain(), "f5").await?);
+    // The refused sign-up didn't use the invite up.
+    assert_eq!(s.srv.db.read(|c| c.query_row("SELECT COUNT(*) FROM invite_signups", [], |r| r.get::<_, i64>(0))).await?, 5);
+
+    // Someone who joined with a member's invite can't invite others yet.
+    let mut f0 = s.online("f0", "password-9", "phone").await?;
+    assert!(friend_invite_refusal(&mut f0, s.domain()).await?.contains("after a week"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn admins_invite_without_member_limits() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    s.add_admin("kim", "password-1").await?;
+    let mut kim = s.online("kim", "password-1", "phone").await?;
+    let mut uris = Vec::new();
+    for _ in 0..12 {
+        uris.push(friend_invite(&mut kim, s.domain()).await?);
+    }
+    for (i, uri) in uris.iter().take(6).enumerate() {
+        assert_eq!(sign_up_with(&s, uri, &format!("a{i}")).await?.attr("type"), Some("result"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn member_invite_sign_ups_are_limited_per_address() -> anyhow::Result<()> {
+    // One open sign-up an hour from an address, so four with members' invites.
+    let s = quark_testkit::TestServer::start_with(quark_testkit::Options {
+        extra_config: "[limits]\nregistrations_per_hour = 1\n".into(),
+        ..Default::default()
+    })
+    .await?;
+    let mut uris = Vec::new();
+    for who in ["sam", "lee"] {
+        s.add_user(who, "password-1").await?;
+        let mut c = s.online(who, "password-1", "phone").await?;
+        for _ in 0..3 {
+            uris.push(friend_invite(&mut c, s.domain()).await?);
+        }
+    }
+    for (i, uri) in uris.iter().take(4).enumerate() {
+        assert_eq!(sign_up_with(&s, uri, &format!("n{i}")).await?.attr("type"), Some("result"));
+    }
+    let r = sign_up_with(&s, &uris[4], "n4").await?;
+    assert_eq!(condition(&r), "policy-violation");
+    assert!(r.to_xml().contains("your address"), "{r}");
     Ok(())
 }
 

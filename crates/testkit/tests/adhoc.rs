@@ -104,6 +104,35 @@ async fn admins_manage_accounts() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn commands_people_cant_run_have_no_info() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    s.add_user("sam", "password-1").await?;
+    s.add_admin("kim", "password-2").await?;
+    let mut sam = s.login("sam", "password-1").await?;
+    let mut kim = s.login("kim", "password-2").await?;
+    let info = || Element::new("query", ns::DISCO_INFO).attr_set("node", format!("{ADMIN}#add-user"));
+    assert_eq!(condition(&sam.iq_get(Some(s.domain()), info()).await?), "item-not-found");
+    let r = kim.iq_get(Some(s.domain()), info()).await?;
+    assert!(r.get_child("query", ns::DISCO_INFO).is_some_and(|q| q.has_child("identity", ns::DISCO_INFO)), "{r}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_set_passwords_are_kept_as_typed() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    let d = s.domain().to_string();
+    s.add_admin("kim", "password-2").await?;
+    let mut kim = s.login("kim", "password-2").await?;
+    let lee = format!("lee@{d}");
+    run(&mut kim, &d, &format!("{ADMIN}#add-user"), &[("accountjid", &[&lee]), ("password", &[" spaced out "])]).await?;
+    assert!(can_sign_in(&s, "lee", " spaced out ").await);
+    run(&mut kim, &d, &format!("{ADMIN}#change-user-password"), &[("accountjid", &[&lee]), ("password", &["  new one  "])]).await?;
+    assert!(can_sign_in(&s, "lee", "  new one  ").await);
+    assert!(!can_sign_in(&s, "lee", "new one").await);
+    Ok(())
+}
+
+#[tokio::test]
 async fn admins_make_account_invites() -> anyhow::Result<()> {
     let s = TestServer::start().await?;
     let d = s.domain().to_string();

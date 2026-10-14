@@ -5,13 +5,13 @@
 //! Every command here takes at most one form, so there's no session state to keep: executing
 //! returns the form, submitting it (with any `sessionid`) completes the command.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use quark_core::stanza::IqType;
 use quark_core::{ns, Condition, Element, Jid, StanzaError};
 
+use super::forms::{Form, Values};
 use super::{invites, ok, register, IqCtx, IqResult, IqTarget, Module};
 use crate::accounts::{AccountError, Role};
 use crate::server::{Host, Server};
@@ -98,10 +98,10 @@ impl Module for AdHoc {
                     .collect()
             });
         }
-        let c = COMMANDS.iter().find(|c| c.node == node)?;
-        if !allowed(cx, c) {
-            return Some(Vec::new());
-        }
+        // A command this sender can't run is a node they don't get to see: an empty info result
+        // isn't allowed (XEP-0030 §3.1 needs an identity), and item-not-found keeps admin
+        // commands out of sight.
+        let c = COMMANDS.iter().find(|c| c.node == node).filter(|c| allowed(cx, c))?;
         Some(if info {
             vec![
                 identity("automation", "command-node", c.name),
@@ -138,7 +138,11 @@ impl Module for AdHoc {
         if !matches!(action, "execute" | "complete" | "next") {
             return Err(StanzaError::bad_request().with_app(Element::new("malformed-action", ns::COMMANDS)));
         }
-        let submitted = cx.payload.get_child("x", ns::DATA_FORMS).filter(|x| x.attr("type") == Some("submit")).map(values);
+        let submitted = cx
+            .payload
+            .get_child("x", ns::DATA_FORMS)
+            .filter(|x| x.attr("type") == Some("submit"))
+            .map(|x| Values::parse_up_to(x, MAX_JIDS));
         let out = run(cx, c.node, submitted, action == "complete").await?;
         Ok(match out {
             Out::Form(x) => {
@@ -177,21 +181,14 @@ fn problem(text: impl Into<String>) -> Out {
     Out::Done { note: Some(("error", text.into())), result: None }
 }
 
-type Values = HashMap<String, Vec<String>>;
-
-/// A submitted form's values by field.
-fn values(x: &Element) -> Values {
-    let mut m = Values::new();
-    for f in x.children().filter(|c| c.is("field", ns::DATA_FORMS)) {
-        let Some(var) = f.attr("var") else { continue };
-        let vs = f.children().filter(|c| c.is("value", ns::DATA_FORMS)).map(Element::text_content).take(MAX_JIDS);
-        m.entry(var.to_string()).or_default().extend(vs);
-    }
-    m
+/// A field's first value, trimmed; None when empty.
+fn one<'a>(v: &'a Values, k: &str) -> Option<&'a str> {
+    v.get(k).map(str::trim).filter(|s| !s.is_empty())
 }
 
-fn one<'a>(v: &'a Values, k: &str) -> Option<&'a str> {
-    v.get(k).and_then(|l| l.first()).map(|s| s.trim()).filter(|s| !s.is_empty())
+/// A password field exactly as typed: spaces at either end are part of it.
+fn password<'a>(v: &'a Values, k: &str) -> Option<&'a str> {
+    v.get(k).filter(|s| !s.is_empty())
 }
 
 fn flag(v: &Values, k: &str) -> bool {
@@ -202,24 +199,14 @@ fn identity(category: &str, kind: &str, name: &str) -> Element {
     Element::new("identity", ns::DISCO_INFO).attr_set("category", category).attr_set("type", kind).attr_set("name", name)
 }
 
-fn form(kind: &str, title: &str, instructions: Option<&str>, form_type: &str, fields: Vec<Element>) -> Element {
-    let mut x = Element::new("x", ns::DATA_FORMS).attr_set("type", kind).text_child("title", ns::DATA_FORMS, title);
-    if let Some(i) = instructions {
-        x.append(Element::new("instructions", ns::DATA_FORMS).text(i));
+/// A form with its title first, then the instructions.
+fn form(kind: &str, title: &str, instructions: Option<&str>, form_type: &str) -> Form {
+    let f = Form::new(kind, form_type);
+    match instructions {
+        Some(i) => f.instructions(i),
+        None => f,
     }
-    x.append(field("FORM_TYPE", "hidden", None, false, &[form_type]));
-    x.children_from(fields)
-}
-
-fn field(var: &str, kind: &str, label: Option<&str>, required: bool, vals: &[&str]) -> Element {
-    let mut f = Element::new("field", ns::DATA_FORMS).attr_set("var", var).attr_set("type", kind).attr_opt("label", label);
-    if required {
-        f.append(Element::new("required", ns::DATA_FORMS));
-    }
-    for v in vals {
-        f.append(Element::new("value", ns::DATA_FORMS).text(*v));
-    }
-    f
+    .title(title)
 }
 
 /// Local usernames from a form's JID fields: `sam`, `sam@host` or `xmpp:sam@host`.
@@ -243,7 +230,7 @@ fn usernames(host: &Host, vals: &[String]) -> Result<Vec<String>, String> {
 }
 
 fn accountjids_form(title: &str, instructions: &str) -> Out {
-    Out::Form(form("form", title, Some(instructions), ADMIN, vec![field("accountjids", "jid-multi", Some("Accounts"), true, &[])]))
+    Out::Form(form("form", title, Some(instructions), ADMIN).field("accountjids", "jid-multi", "Accounts", None).required().build())
 }
 
 async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) -> Result<Out, StanzaError> {
@@ -269,18 +256,19 @@ async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) 
             };
             invite_result(srv, n, "Send this link to the person you want to chat with.").await.map_err(|e| internal(&e))?
         }
-        (true, "create-account", None) if !complete => Out::Form(form(
-            "form",
-            "Create an account invite",
-            Some("Leave the username empty to let the person choose one."),
-            "urn:xmpp:invite#create-account",
-            vec![
-                field("username", "text-single", Some("Username (optional)"), false, &[]),
-                field("admin", "boolean", Some("Make them an admin"), false, &["0"]),
-                field("reusable", "boolean", Some("Can be used by several people"), false, &["0"]),
-                field("days", "text-single", Some("Valid for (days)"), false, &["7"]),
-            ],
-        )),
+        (true, "create-account", None) if !complete => Out::Form(
+            form(
+                "form",
+                "Create an account invite",
+                Some("Leave the username empty to let the person choose one."),
+                "urn:xmpp:invite#create-account",
+            )
+            .field("username", "text-single", "Username (optional)", None)
+            .boolean("admin", "Make them an admin", false)
+            .boolean("reusable", "Can be used by several people", false)
+            .field("days", "text-single", "Valid for (days)", Some("7"))
+            .build(),
+        ),
         (true, "create-account", input) => {
             let v = input.unwrap_or_default();
             let username = one(&v, "username").map(str::to_lowercase);
@@ -301,25 +289,23 @@ async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) 
             tracing::info!(target: "quark::audit", by = %admin, host = %host.domain, "invite created over ad-hoc");
             invite_result(srv, n, "Send this link to the person you're inviting.").await.map_err(|e| internal(&e))?
         }
-        (false, "add-user", None) => Out::Form(form(
-            "form",
-            "Add a user",
-            Some("Choose the address and a password for the new account."),
-            ADMIN,
-            vec![
-                field("accountjid", "jid-single", Some("Address"), true, &[]),
-                field("password", "text-private", Some("Password"), true, &[]),
-                field("password-verify", "text-private", Some("Password again"), false, &[]),
-            ],
-        )),
+        (false, "add-user", None) => Out::Form(
+            form("form", "Add a user", Some("Choose the address and a password for the new account."), ADMIN)
+                .field("accountjid", "jid-single", "Address", None)
+                .required()
+                .field("password", "text-private", "Password", None)
+                .required()
+                .field("password-verify", "text-private", "Password again", None)
+                .build(),
+        ),
         (false, "add-user", Some(v)) => {
-            let user = match usernames(host, v.get("accountjid").map(Vec::as_slice).unwrap_or_default()) {
+            let user = match usernames(host, v.all("accountjid")) {
                 Ok(u) if u.len() == 1 => u.into_iter().next().unwrap_or_default(),
                 Ok(_) => return Ok(problem("Give exactly one address.")),
                 Err(e) => return Ok(problem(e)),
             };
-            let pw = one(&v, "password").unwrap_or_default();
-            if one(&v, "password-verify").is_some_and(|p| p != pw) {
+            let pw = password(&v, "password").unwrap_or_default();
+            if password(&v, "password-verify").is_some_and(|p| p != pw) {
                 return Ok(problem("The passwords don't match."));
             }
             match register::create_account(srv, host, &user, pw, Role::Member).await {
@@ -336,7 +322,7 @@ async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) 
         (false, "reenable-user", None) => accountjids_form("Turn users back on", "They can sign in again."),
         (false, "end-user-session", None) => accountjids_form("Sign users out", "Every device of these accounts is disconnected."),
         (false, c @ ("delete-user" | "disable-user" | "reenable-user" | "end-user-session"), Some(v)) => {
-            let users = match usernames(host, v.get("accountjids").map(Vec::as_slice).unwrap_or_default()) {
+            let users = match usernames(host, v.all("accountjids")) {
                 Ok(u) if !u.is_empty() => u,
                 Ok(_) => return Ok(problem("Give at least one address.")),
                 Err(e) => return Ok(problem(e)),
@@ -375,18 +361,16 @@ async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) 
             }
             info(text)
         }
-        (false, "change-user-password", None) => Out::Form(form(
-            "form",
-            "Change a user's password",
-            Some("Their devices are signed out and need the new password."),
-            ADMIN,
-            vec![
-                field("accountjid", "jid-single", Some("Address"), true, &[]),
-                field("password", "text-private", Some("New password"), true, &[]),
-            ],
-        )),
+        (false, "change-user-password", None) => Out::Form(
+            form("form", "Change a user's password", Some("Their devices are signed out and need the new password."), ADMIN)
+                .field("accountjid", "jid-single", "Address", None)
+                .required()
+                .field("password", "text-private", "New password", None)
+                .required()
+                .build(),
+        ),
         (false, "change-user-password", Some(v)) => {
-            let user = match usernames(host, v.get("accountjid").map(Vec::as_slice).unwrap_or_default()) {
+            let user = match usernames(host, v.all("accountjid")) {
                 Ok(u) if u.len() == 1 => u.into_iter().next().unwrap_or_default(),
                 Ok(_) => return Ok(problem("Give exactly one address.")),
                 Err(e) => return Ok(problem(e)),
@@ -395,7 +379,7 @@ async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) 
                 srv,
                 host,
                 &user,
-                one(&v, "password").unwrap_or_default(),
+                password(&v, "password").unwrap_or_default(),
                 Some("An admin changed the password."),
             )
             .await
@@ -413,16 +397,13 @@ async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) 
             users.sort_unstable();
             users.dedup();
             users.truncate(MAX_JIDS);
-            let refs: Vec<&str> = users.iter().map(String::as_str).collect();
             Out::Done {
                 note: None,
-                result: Some(form(
-                    "result",
-                    "Online users",
-                    None,
-                    ADMIN,
-                    vec![field("onlineuserjids", "jid-multi", Some("Online users"), false, &refs)],
-                )),
+                result: Some(
+                    form("result", "Online users", None, ADMIN)
+                        .field_values("onlineuserjids", "jid-multi", "Online users", users.iter().map(String::as_str))
+                        .build(),
+                ),
             }
         }
         (false, "get-online-users-num", _) => {
@@ -432,40 +413,29 @@ async fn run(cx: &IqCtx<'_>, node: &str, input: Option<Values>, complete: bool) 
             let n = users.len().to_string();
             Out::Done {
                 note: None,
-                result: Some(form(
-                    "result",
-                    "Online users",
-                    None,
-                    ADMIN,
-                    vec![field("onlineusersnum", "text-single", Some("Online users"), false, &[&n])],
-                )),
+                result: Some(
+                    form("result", "Online users", None, ADMIN).field("onlineusersnum", "text-single", "Online users", Some(&n)).build(),
+                ),
             }
         }
         (false, "get-registered-users-num", _) => {
             let n = srv.accounts.count(&host.domain).await.map_err(|e| internal(&e))?.to_string();
             Out::Done {
                 note: None,
-                result: Some(form(
-                    "result",
-                    "Accounts",
-                    None,
-                    ADMIN,
-                    vec![field("registeredusersnum", "text-single", Some("Accounts"), false, &[&n])],
-                )),
+                result: Some(
+                    form("result", "Accounts", None, ADMIN).field("registeredusersnum", "text-single", "Accounts", Some(&n)).build(),
+                ),
             }
         }
-        (false, "announce", None) => Out::Form(form(
-            "form",
-            "Message everyone online",
-            Some("Everyone signed in right now gets this message from the server."),
-            ADMIN,
-            vec![
-                field("subject", "text-single", Some("Subject"), false, &[]),
-                field("announcement", "text-multi", Some("Message"), true, &[]),
-            ],
-        )),
+        (false, "announce", None) => Out::Form(
+            form("form", "Message everyone online", Some("Everyone signed in right now gets this message from the server."), ADMIN)
+                .field("subject", "text-single", "Subject", None)
+                .field("announcement", "text-multi", "Message", None)
+                .required()
+                .build(),
+        ),
         (false, "announce", Some(v)) => {
-            let body = v.get("announcement").map(|l| l.join("\n")).unwrap_or_default();
+            let body = v.all("announcement").join("\n");
             if body.trim().is_empty() {
                 return Ok(problem("Write a message first."));
             }
@@ -499,15 +469,12 @@ async fn invite_result(srv: &Arc<Server>, n: invites::NewInvite<'_>, note: &str)
     match invites::create(srv, n).await {
         Ok(inv) => {
             let expire = quark_core::time::xep82(inv.expires);
-            let mut fields = vec![field("uri", "text-single", Some("Invite link"), false, &[&inv.uri])];
+            let mut x = form("result", "Invite", None, "urn:xmpp:invite").field("uri", "text-single", "Invite link", Some(&inv.uri));
             if let Some(p) = &inv.page {
-                fields.push(field("landing-url", "text-single", Some("Invite page"), false, &[p]));
+                x = x.field("landing-url", "text-single", "Invite page", Some(p));
             }
-            fields.push(field("expire", "text-single", Some("Valid until"), false, &[&expire]));
-            Ok(Out::Done {
-                note: Some(("info", note.to_string())),
-                result: Some(form("result", "Invite", None, "urn:xmpp:invite", fields)),
-            })
+            x = x.field("expire", "text-single", "Valid until", Some(&expire));
+            Ok(Out::Done { note: Some(("info", note.to_string())), result: Some(x.build()) })
         }
         Err(invites::InviteError::Invalid(t)) => Ok(problem(t)),
         Err(invites::InviteError::Db(e)) => Err(e),
@@ -525,9 +492,22 @@ mod tests {
              <field var='admin'><value>1</value></field></x>",
         )
         .unwrap();
-        let v = values(&x);
-        assert_eq!(v["accountjids"], ["a@b", "c@b"]);
+        let v = Values::parse_up_to(&x, MAX_JIDS);
+        assert_eq!(v.all("accountjids"), ["a@b", "c@b"]);
         assert!(flag(&v, "admin"));
         assert!(!flag(&v, "reusable"));
+    }
+
+    #[test]
+    fn passwords_are_taken_as_typed() {
+        let x = Element::parse(
+            "<x xmlns='jabber:x:data' type='submit'><field var='password'><value> pass word </value></field>\
+             <field var='accountjid'><value> sam@a.test </value></field><field var='empty'><value></value></field></x>",
+        )
+        .unwrap();
+        let v = Values::parse(&x);
+        assert_eq!(password(&v, "password"), Some(" pass word "));
+        assert_eq!(one(&v, "accountjid"), Some("sam@a.test"));
+        assert_eq!((password(&v, "empty"), one(&v, "empty")), (None, None));
     }
 }

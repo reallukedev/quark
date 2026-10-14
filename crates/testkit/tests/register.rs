@@ -155,3 +155,101 @@ async fn people_change_their_password_and_delete_their_account() -> anyhow::Resu
     assert_eq!(condition(&r), "not-authorized");
     Ok(())
 }
+
+#[tokio::test]
+async fn config_admin_names_are_never_signed_up_for() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    let d = s.domain().to_string();
+    s.change_config(|c| c.hosts[0].admins.push(format!("boss@{d}")))?;
+    s.set_settings(|st| st.sign_up = SignUp::Open).await?;
+    let mut c = unauthenticated(&s).await?;
+    assert_eq!(condition(&c.iq_set(None, register_query("boss", "password-1")).await?), "not-acceptable");
+    // Not with an invite either, and no invite is made for that name.
+    let t = invite(&s, None, "member", false).await;
+    let r = c.iq_set(None, register_query("boss", "password-1").child(preauth(&t))).await?;
+    assert_eq!(condition(&r), "not-acceptable");
+    let code = admin_code(
+        &s,
+        json!({ "cmd": "invite.create", "args": { "host": d, "username": "boss", "role": "member", "days": 1, "reusable": false } }),
+    )
+    .await;
+    assert!(!code.is_empty());
+    assert!(!s.srv.accounts.exists(&d, "boss").await?);
+    // The invite is still good for someone else.
+    assert_eq!(c.iq_set(None, register_query("kim", "password-1").child(preauth(&t))).await?.attr("type"), Some("result"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_sign_ups_count_against_the_address() -> anyhow::Result<()> {
+    // One account an hour, so four attempts.
+    let s = TestServer::start_with(Options { extra_config: "[limits]\nregistrations_per_hour = 1\n".into(), ..Default::default() }).await?;
+    s.set_settings(|st| st.sign_up = SignUp::Open).await?;
+    s.add_user("taken", "password-1").await?;
+    let mut c = unauthenticated(&s).await?;
+    for _ in 0..4 {
+        assert_eq!(condition(&c.iq_set(None, register_query("taken", "password-1")).await?), "conflict");
+    }
+    assert_eq!(condition(&c.iq_set(None, register_query("free", "password-1")).await?), "policy-violation");
+    Ok(())
+}
+
+#[tokio::test]
+async fn parallel_sign_ups_cant_beat_the_limit() -> anyhow::Result<()> {
+    let s = TestServer::start_with(Options { extra_config: "[limits]\nregistrations_per_hour = 1\n".into(), ..Default::default() }).await?;
+    s.set_settings(|st| st.sign_up = SignUp::Open).await?;
+    let mut clients = Vec::new();
+    for _ in 0..6 {
+        clients.push(unauthenticated(&s).await?);
+    }
+    let tries = clients.into_iter().enumerate().map(|(i, mut c)| async move {
+        c.iq_set(None, register_query(&format!("p{i}"), "password-1")).await.map(|r| r.attr("type") == Some("result"))
+    });
+    let made = futures_util::future::join_all(tries).await.into_iter().filter(|r| matches!(r, Ok(true))).count();
+    assert_eq!(made, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn good_tokens_dont_use_up_tries() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    let t = invite(&s, None, "member", false).await;
+    let mut c = unauthenticated(&s).await?;
+    for _ in 0..8 {
+        assert_eq!(c.iq_set(None, preauth(&t)).await?.attr("type"), Some("result"));
+    }
+    // Failed registrations carrying the token in the query don't count either.
+    for _ in 0..8 {
+        assert_eq!(condition(&c.iq_set(None, register_query("kim", "short").child(preauth(&t))).await?), "not-acceptable");
+    }
+    assert_eq!(c.iq_set(None, register_query("kim", "password-1").child(preauth(&t))).await?.attr("type"), Some("result"));
+
+    // Wrong ones do.
+    let mut c = unauthenticated(&s).await?;
+    for _ in 0..5 {
+        assert_eq!(condition(&c.iq_set(None, preauth("AAAAAAAAAAAAAAAAAAAAAAAA")).await?), "item-not-found");
+    }
+    let t = invite(&s, None, "member", false).await;
+    assert_eq!(condition(&c.iq_set(None, preauth(&t)).await?), "policy-violation");
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_legacy_fields_dont_hide_the_form() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    s.set_settings(|st| st.sign_up = SignUp::Open).await?;
+    let mut c = unauthenticated(&s).await?;
+    let field = |var: &str, v: &str| Element::new("field", ns::DATA_FORMS).attr_set("var", var).text_child("value", ns::DATA_FORMS, v);
+    let x = Element::new("x", ns::DATA_FORMS)
+        .attr_set("type", "submit")
+        .child(field("FORM_TYPE", ns::REGISTER))
+        .child(field("username", "kim"))
+        .child(field("password", "password-1"));
+    let q = Element::new("query", ns::REGISTER)
+        .child(Element::new("username", ns::REGISTER))
+        .child(Element::new("password", ns::REGISTER))
+        .child(x);
+    assert_eq!(c.iq_set(None, q).await?.attr("type"), Some("result"));
+    assert!(can_sign_in(&s, "kim", "password-1").await);
+    Ok(())
+}

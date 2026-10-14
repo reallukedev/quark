@@ -19,9 +19,9 @@ use quark_core::{ns, Condition, Element, Jid, StanzaError};
 use tokio::sync::OwnedMutexGuard;
 
 use super::config::{AllowPm, Config, ROOMINFO};
-use super::form::{self, Form, Values};
 use super::room::{Affiliation, Join, Out, Prepared, Role, Room, FASTEN, MSG_MODERATE_0, MSG_MODERATE_1};
 use super::store;
+use crate::modules::forms::{self as form, Form, Values};
 use crate::modules::{mam, Component, Event, IqReply};
 use crate::server::{Dest, Server};
 

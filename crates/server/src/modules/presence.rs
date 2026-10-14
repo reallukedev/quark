@@ -33,6 +33,9 @@ fn log_db(e: crate::db::DbError) {
 
 /// `<presence/>` without `to` from a client: its availability, broadcast to contacts.
 pub async fn from_client_broadcast(srv: &Arc<Server>, host: &Arc<Host>, session: &Arc<SessionHandle>, mut el: Element) {
+    for m in &srv.modules {
+        m.presence_out(srv, session, &mut el).await;
+    }
     let kind = el.attr("type").map(str::to_string);
     match kind.as_deref() {
         None => {}

@@ -112,6 +112,27 @@ impl TestServer {
         Ok(())
     }
 
+    /// Puts `contact` in `user`'s roster with this subscription (`none`, `to`, `from`, `both`),
+    /// straight in storage. Do it before the clients sign in; nobody gets pushes.
+    pub async fn roster_set(&self, user: &str, contact: &str, subscription: &str) -> anyhow::Result<()> {
+        use quark::modules::roster::{self, Item, Subscription};
+        let mut it = Item::new(quark_core::Jid::parse(contact)?);
+        it.subscription = match subscription {
+            "to" => Subscription::To,
+            "from" => Subscription::From,
+            "both" => Subscription::Both,
+            _ => Subscription::None,
+        };
+        roster::save(&self.srv, DOMAIN, user, &it).await?;
+        Ok(())
+    }
+
+    /// Two local accounts that see each other's presence.
+    pub async fn make_contacts(&self, a: &str, b: &str) -> anyhow::Result<()> {
+        self.roster_set(a, &format!("{b}@{DOMAIN}"), "both").await?;
+        self.roster_set(b, &format!("{a}@{DOMAIN}"), "both").await
+    }
+
     /// Changes the domain's settings live.
     pub async fn set_settings(&self, f: impl FnOnce(&mut quark::settings::Settings)) -> anyhow::Result<()> {
         let mut s = (*self.srv.host(DOMAIN).context("no host")?.settings()).clone();
@@ -200,6 +221,11 @@ pub struct Client {
     backlog: std::collections::VecDeque<Element>,
     /// tls-exporter channel binding, after STARTTLS on TLS 1.3.
     pub exporter: Option<Vec<u8>>,
+    /// When set (see [`Client::caps`]), disco#info queries are answered with this and never
+    /// handed to the test.
+    disco: Option<Element>,
+    /// How many disco#info queries were answered that way.
+    pub disco_queries: usize,
 }
 
 impl Client {
@@ -215,6 +241,8 @@ impl Client {
             jid: None,
             backlog: Default::default(),
             exporter: None,
+            disco: None,
+            disco_queries: 0,
         };
         c.open().await?;
         Ok(c)
@@ -234,6 +262,8 @@ impl Client {
             jid: None,
             backlog: Default::default(),
             exporter,
+            disco: None,
+            disco_queries: 0,
         };
         c.open().await?;
         Ok(c)
@@ -362,11 +392,44 @@ impl Client {
         if let Some(e) = self.backlog.pop_front() {
             return Ok(e);
         }
-        match self.next_event().await? {
-            StreamEvent::Stanza(e) => Ok(e),
-            StreamEvent::Close => bail!("the server closed the stream"),
-            StreamEvent::Open { .. } => bail!("unexpected stream header"),
+        loop {
+            match self.next_event().await? {
+                StreamEvent::Stanza(e) if self.answered(&e).await? => {}
+                StreamEvent::Stanza(e) => return Ok(e),
+                StreamEvent::Close => bail!("the server closed the stream"),
+                StreamEvent::Open { .. } => bail!("unexpected stream header"),
+            }
         }
+    }
+
+    /// Answers a disco#info query itself when [`Client::caps`] was set up. True if it did.
+    async fn answered(&mut self, e: &Element) -> anyhow::Result<bool> {
+        let Some(info) = &self.disco else { return Ok(false) };
+        let Some(q) = e.get_child("query", ns::DISCO_INFO) else { return Ok(false) };
+        if e.name() != "iq" || e.attr("type") != Some("get") {
+            return Ok(false);
+        }
+        let mut answer = info.clone();
+        answer.set_attr_opt("node", q.attr("node"));
+        let r = quark_core::stanza::iq_result(e).child(answer);
+        self.disco_queries += 1;
+        self.send(&r).await?;
+        Ok(true)
+    }
+
+    /// Makes this client advertise these features: disco#info queries from now on are answered
+    /// automatically (as real clients do for XEP-0115 lookups), and the returned `<c/>` goes in
+    /// presence. List `node+notify` to ask for PEP notifications.
+    pub fn caps(&mut self, features: &[&str]) -> Element {
+        let mut q = Element::new("query", ns::DISCO_INFO).child(
+            Element::new("identity", ns::DISCO_INFO).attr_set("category", "client").attr_set("type", "pc").attr_set("name", "testkit"),
+        );
+        for f in features {
+            q.append(Element::new("feature", ns::DISCO_INFO).attr_set("var", *f));
+        }
+        let ver = caps_ver(&q);
+        self.disco = Some(q);
+        Element::new("c", ns::CAPS).attr_set("hash", "sha-1").attr_set("node", "https://quark.test/testkit").attr_set("ver", ver)
     }
 
     /// Like `recv` but returns None when nothing arrives within `wait`.
@@ -374,13 +437,39 @@ impl Client {
         if let Some(e) = self.backlog.pop_front() {
             return Ok(Some(e));
         }
-        let r = self.reader.as_mut().context("closed")?;
-        match tokio::time::timeout(wait, r.next()).await {
-            Err(_) => Ok(None),
-            Ok(Ok(Some(StreamEvent::Stanza(e)))) => Ok(Some(e)),
-            Ok(Ok(Some(ev))) => bail!("unexpected {ev:?}"),
-            Ok(Ok(None)) => bail!("the server closed the connection"),
-            Ok(Err(e)) => bail!("read error: {e}"),
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let r = self.reader.as_mut().context("closed")?;
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(left, r.next()).await {
+                Err(_) => return Ok(None),
+                Ok(Ok(Some(StreamEvent::Stanza(e)))) if self.answered(&e).await? => {}
+                Ok(Ok(Some(StreamEvent::Stanza(e)))) => return Ok(Some(e)),
+                Ok(Ok(Some(ev))) => bail!("unexpected {ev:?}"),
+                Ok(Ok(None)) => bail!("the server closed the connection"),
+                Ok(Err(e)) => bail!("read error: {e}"),
+            }
+        }
+    }
+
+    /// Reads for `wait`, answering disco#info queries (see [`Client::caps`]) and keeping
+    /// everything else for later `recv`s. Lets the server finish a caps lookup.
+    pub async fn pump(&mut self, wait: Duration) -> anyhow::Result<()> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let r = self.reader.as_mut().context("closed")?;
+            match tokio::time::timeout(left, r.next()).await {
+                Err(_) => return Ok(()),
+                Ok(Ok(Some(StreamEvent::Stanza(e)))) => {
+                    if !self.answered(&e).await? {
+                        self.backlog.push_back(e);
+                    }
+                }
+                Ok(Ok(Some(ev))) => bail!("unexpected {ev:?}"),
+                Ok(Ok(None)) => bail!("the server closed the connection"),
+                Ok(Err(e)) => bail!("read error: {e}"),
+            }
         }
     }
 
@@ -409,6 +498,7 @@ impl Client {
                 Ok(Ok(Some(ev))) => ev,
             };
             match ev {
+                StreamEvent::Stanza(e) if self.answered(&e).await? => {}
                 StreamEvent::Stanza(e) if f(&e) => {
                     self.backlog.extend(skipped);
                     return Ok(e);
@@ -617,6 +707,28 @@ impl ScramClient {
         }
         Ok(())
     }
+}
+
+/// The XEP-0115 `ver` (sha-1) of a disco#info answer with identities and features only.
+pub fn caps_ver(query: &Element) -> String {
+    use sha1::Digest;
+    let mut ids: Vec<String> = query
+        .children()
+        .filter(|c| c.is("identity", ns::DISCO_INFO))
+        .map(|i| {
+            let a = |k| i.attr(k).unwrap_or("");
+            format!("{}/{}/{}/{}<", a("category"), a("type"), a("xml:lang"), a("name"))
+        })
+        .collect();
+    ids.sort();
+    let mut feats: Vec<&str> = query.children().filter(|c| c.is("feature", ns::DISCO_INFO)).filter_map(|f| f.attr("var")).collect();
+    feats.sort();
+    let mut s = ids.concat();
+    for f in feats {
+        s.push_str(f);
+        s.push('<');
+    }
+    B64.encode(sha1::Sha1::digest(s.as_bytes()))
 }
 
 /// Builds a `<message/>` with a body.

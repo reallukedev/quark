@@ -316,8 +316,12 @@ impl State {
             let ev = super::deliver::item_event(&p.node, &p.cfg, &p.item);
             self.notify(srv, o, &p.node, &p.cfg, ev).await;
         }
-        // Items the limit pushed out are deleted like retracted ones (XEP-0060 §7.1.2).
-        if !p.trimmed.is_empty() {
+        // Items the limit pushed out are deleted like retracted ones (XEP-0060 §7.1.2), except
+        // on nodes that keep one item: there the new item replaces the old (avatar metadata,
+        // nick, mood), and a retract for the old id makes clients that take it as "removed"
+        // (as Conversations and Monal do for avatars) clear what was just set. Prosody and
+        // ejabberd send none for those either.
+        if !p.trimmed.is_empty() && p.cfg.keep() > 1 {
             self.after_retract(srv, o, &p.node, &p.cfg, &p.trimmed, None).await;
         }
         if origin == Origin::Client {

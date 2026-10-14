@@ -503,6 +503,36 @@ async fn a_pep_avatar_shows_up_in_the_vcard_and_presence() -> anyhow::Result<()>
 }
 
 #[tokio::test]
+async fn a_new_avatar_doesnt_retract_the_old_one() -> anyhow::Result<()> {
+    // Avatar metadata keeps one item; a retract for the previous id would make clients clear
+    // the avatar that was just set.
+    let s = server(&["alice", "bob"]).await?;
+    s.make_contacts("alice", "bob").await?;
+    let mut alice = online(&s, "alice", "phone", &[]).await?;
+    let mut bob = online(&s, "bob", "pc", &["urn:xmpp:avatar:metadata+notify"]).await?;
+    bob.pump(SETTLE).await?;
+    let meta = |id: &str| {
+        Element::new("metadata", AVATAR_META)
+            .child(Element::new("info", AVATAR_META).attr_set("id", id).attr_set("bytes", "8").attr_set("type", "image/png"))
+    };
+    let open = [("pubsub#access_model", "open")];
+    let (first, second) = ("1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222");
+    for id in [first, second] {
+        let r = alice.iq_set(None, with_options(publish(AVATAR_META, Some(id), meta(id)), &open)).await?;
+        assert_eq!(r.attr("type"), Some("result"), "{r}");
+        let m = bob.expect(is_event(AVATAR_META)).await?;
+        let items = event_items(&m, AVATAR_META).expect("an event");
+        assert_eq!(items.get_child("item", ns::PUBSUB_EVENT).and_then(|i| i.attr("id")), Some(id), "{m}");
+        assert!(!items.has_child("retract", ns::PUBSUB_EVENT), "{m}");
+    }
+    no_events(&mut bob).await?;
+    // Only the newest is kept.
+    let r = alice.iq_get(Some(&jid("alice")), items(AVATAR_META)).await?;
+    assert_eq!(ids(&result_items(&r)?), [second]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_vcard_photo_becomes_the_pep_avatar() -> anyhow::Result<()> {
     let s = server(&["alice", "bob"]).await?;
     s.make_contacts("alice", "bob").await?;

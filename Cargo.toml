@@ -6,7 +6,7 @@ members = ["crates/core", "crates/server", "crates/testkit"]
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 quark-core = { path = "crates/core" }
@@ -26,3 +26,10 @@ unwrap_used = "warn"
 dbg_macro = "warn"
 todo = "warn"
 large_futures = "warn"
+
+[profile.dev]
+# Line tables are enough for backtraces and keep build folders a fraction of the size.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

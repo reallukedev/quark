@@ -334,6 +334,10 @@ impl Module for Roster {
                     .ok_or_else(|| StanzaError::new(quark_core::Condition::JidMalformed))?
                     .to_bare();
                 if el.attr("subscription") == Some("remove") {
+                    // RFC 6121 §2.5.3: removing something that isn't there is an error.
+                    if item(cx.srv, &cx.host.domain, user, &contact).await.map_err(db)?.is_none_or(|i| !i.visible) {
+                        return Err(StanzaError::item_not_found());
+                    }
                     remove(cx.srv, cx.host, user, &contact).await.map_err(db)?;
                     return ok_empty();
                 }

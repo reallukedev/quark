@@ -177,9 +177,16 @@ struct Negotiation {
     plus_offered: bool,
     /// Software name from SASL2's user-agent, kept for the session.
     client: Option<String>,
+    /// Whether we've sent a stream header on this connection.
+    header_sent: bool,
+    /// Failed sign-in attempts on this stream.
+    failures: u32,
 }
 
 type NegResult<T> = Result<T, Option<StreamError>>;
+
+/// Failed SASL attempts allowed on one stream.
+const MAX_AUTH_TRIES: u32 = 5;
 
 fn sasl_el(name: &str, b: Option<&[u8]>) -> Element {
     let e = Element::new(name, ns::SASL);
@@ -208,34 +215,58 @@ fn decode_b64(text: &str) -> Option<Vec<u8>> {
 
 impl Negotiation {
     fn new(srv: Arc<Server>) -> Self {
-        Negotiation { srv, host: None, user: None, sasl: None, sasl2: None, mechanism: None, plus_offered: false, client: None }
+        Negotiation {
+            srv,
+            host: None,
+            user: None,
+            sasl: None,
+            sasl2: None,
+            mechanism: None,
+            plus_offered: false,
+            client: None,
+            header_sent: false,
+            failures: 0,
+        }
     }
 
     async fn run(&mut self, t: &mut dyn Transport) -> NegResult<Outcome> {
+        use quark_core::xml::XmlError;
         loop {
-            let ev = match t.read().await {
-                Ok(Some(ev)) => ev,
-                Ok(None) => return Err(None),
-                Err(quark_core::xml::XmlError::Io(_)) => return Err(None),
-                Err(quark_core::xml::XmlError::TooBig) => return Err(Some(StreamError::new("policy-violation"))),
-                Err(quark_core::xml::XmlError::Restricted) => return Err(Some(StreamError::new("restricted-xml"))),
-                Err(_) => return Err(Some(StreamError::new("not-well-formed"))),
+            let err = match t.read().await {
+                Ok(Some(ev)) => match self.event(t, ev).await {
+                    Ok(Some(o)) => return Ok(o),
+                    Ok(None) => continue,
+                    Err(e) => e,
+                },
+                Ok(None) | Err(XmlError::Io(_)) => None,
+                Err(XmlError::TooBig) => Some(StreamError::new("policy-violation")),
+                Err(XmlError::Restricted) => Some(StreamError::new("restricted-xml")),
+                Err(XmlError::InvalidNamespace) => Some(StreamError::new("invalid-namespace")),
+                Err(XmlError::Malformed(_)) => Some(StreamError::new("not-well-formed")),
             };
-            let el = match ev {
-                StreamEvent::Open { attrs, default_ns } => {
-                    self.open(t, &attrs, &default_ns).await?;
-                    continue;
-                }
-                StreamEvent::Close => return Err(None),
-                StreamEvent::Stanza(el) => el,
-            };
-            if self.host.is_none() {
-                return Err(Some(StreamError::new("invalid-xml")));
+            // A stream error goes inside a stream: send our header first if we haven't yet
+            // (RFC 6120 §4.9.1.2).
+            if err.is_some() && !self.header_sent {
+                let from = self.srv.hosts().first().map(|h| h.domain.clone()).unwrap_or_default();
+                let _ = t.open(&from, &quark_core::new_id(), None).await;
             }
-            if let Some(o) = self.element(t, el).await? {
-                return Ok(o);
-            }
+            return Err(err);
         }
+    }
+
+    async fn event(&mut self, t: &mut dyn Transport, ev: StreamEvent) -> NegResult<Option<Outcome>> {
+        let el = match ev {
+            StreamEvent::Open { attrs, default_ns } => {
+                self.open(t, &attrs, &default_ns).await?;
+                return Ok(None);
+            }
+            StreamEvent::Close => return Err(None),
+            StreamEvent::Stanza(el) => el,
+        };
+        if self.host.is_none() {
+            return Err(Some(StreamError::new("invalid-xml")));
+        }
+        self.element(t, el).await
     }
 
     fn host(&self) -> NegResult<Arc<Host>> {
@@ -249,6 +280,7 @@ impl Negotiation {
         let from = to.clone().unwrap_or_else(|| fallback.clone());
         // Answer with our header before any error, as RFC 6120 §4.9.1.2 requires.
         let _ = t.open(&from, &id, None).await;
+        self.header_sent = true;
         if default_ns != ns::CLIENT && t.kind() == "tcp" {
             return Err(Some(StreamError::new("invalid-namespace")));
         }
@@ -347,23 +379,30 @@ impl Negotiation {
             (ns::SASL, "auth") if self.user.is_none() => {
                 self.sasl2 = None;
                 let mech = el.attr("mechanism").unwrap_or_default().to_string();
-                let Some(initial) = decode_b64(&el.text_content()) else {
-                    t.send(&failure_el(ns::SASL, Failure::IncorrectEncoding, None)).await.map_err(|_| None)?;
-                    return Ok(None);
+                // No text at all means no initial response; "=" means an empty one.
+                let text = el.text_content();
+                let initial = if text.trim().is_empty() {
+                    None
+                } else {
+                    let Some(d) = decode_b64(&text) else {
+                        t.send(&failure_el(ns::SASL, Failure::IncorrectEncoding, None)).await.map_err(|_| None)?;
+                        return Ok(None);
+                    };
+                    Some(d)
                 };
-                self.start_sasl(t, &host, &mech, &initial).await
+                self.start_sasl(t, &host, &mech, initial.as_deref()).await
             }
             (ns::SASL2, "authenticate") if self.user.is_none() => {
                 let mech = el.attr("mechanism").unwrap_or_default().to_string();
                 let initial = match el.get_child("initial-response", ns::SASL2) {
                     Some(r) => match decode_b64(&r.text_content()) {
-                        Some(d) => d,
+                        Some(d) => Some(d),
                         None => {
                             t.send(&failure_el(ns::SASL2, Failure::IncorrectEncoding, None)).await.map_err(|_| None)?;
                             return Ok(None);
                         }
                     },
-                    None => Vec::new(),
+                    None => None,
                 };
                 let ua = el.get_child("user-agent", ns::SASL2);
                 self.sasl2 = Some(Inline {
@@ -375,7 +414,7 @@ impl Negotiation {
                     fast_invalidate: el.get_child("fast", ns::FAST).is_some_and(|f| matches!(f.attr("invalidate"), Some("true" | "1"))),
                 });
                 self.client = self.sasl2.as_ref().and_then(|i| i.software.clone());
-                self.start_sasl(t, &host, &mech, &initial).await
+                self.start_sasl(t, &host, &mech, initial.as_deref()).await
             }
             (ns::SASL, "response") | (ns::SASL2, "response") if self.sasl.is_some() => {
                 let ns_ = el.ns().to_string();
@@ -394,7 +433,7 @@ impl Negotiation {
                     plus_offered: self.plus_offered,
                     tokens: Some(&tokens),
                 };
-                let step = s.step(&ctx, &data);
+                let step = s.step(&ctx, &data).await;
                 self.sasl = Some(s);
                 self.after_step(t, &host, step).await
             }
@@ -410,7 +449,8 @@ impl Negotiation {
                     Some(q) if q.is("query", ns::REGISTER) => {
                         crate::modules::register::preauth(&self.srv, &host, &el, t.secure(), t.peer()).await
                     }
-                    _ => quark_core::stanza::error_reply(&el, &quark_core::StanzaError::new(quark_core::Condition::NotAuthorized)),
+                    // Anything else before signing in ends the stream (RFC 6120 §4.3.5).
+                    _ => return Err(Some(StreamError::new("not-authorized"))),
                 };
                 if let Some(r) = reply {
                     t.send(&r).await.map_err(|_| None)?;
@@ -438,7 +478,13 @@ impl Negotiation {
         }
     }
 
-    async fn start_sasl(&mut self, t: &mut dyn Transport, host: &Arc<Host>, mech: &str, initial: &[u8]) -> NegResult<Option<Outcome>> {
+    async fn start_sasl(
+        &mut self,
+        t: &mut dyn Transport,
+        host: &Arc<Host>,
+        mech: &str,
+        initial: Option<&[u8]>,
+    ) -> NegResult<Option<Outcome>> {
         let cfg = self.srv.config();
         if self.srv.auth_limiter.blocked(t.peer(), cfg.limits.auth_failures_per_minute) {
             let ns_ = if self.sasl2.is_some() { ns::SASL2 } else { ns::SASL };
@@ -482,6 +528,11 @@ impl Negotiation {
                 self.srv.auth_limiter.failed(t.peer());
                 self.srv.stats.auth_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 t.send(&failure_el(ns_, f, text)).await.map_err(|_| None)?;
+                // RFC 6120 §6.4.5: a few retries, then the stream ends.
+                self.failures += 1;
+                if self.failures >= MAX_AUTH_TRIES && f != Failure::Aborted {
+                    return Err(Some(StreamError::with_text("policy-violation", "Too many failed sign-in attempts.")));
+                }
                 Ok(None)
             }
             Step::Success { user, data } => {

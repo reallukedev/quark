@@ -20,19 +20,16 @@ pub async fn from_client(srv: &Arc<Server>, host: &Arc<Host>, session: &Arc<Sess
         Err(e) => return bounce(srv, &el, e).await,
     };
     let me = &session.jid;
-    match el.name() {
-        "presence" if to.is_none() => return crate::modules::presence::from_client_broadcast(srv, host, session, el).await,
-        "iq" if to.is_none() => {
-            el.set_attr("to", host.domain.clone());
-        }
-        _ if to.is_none() => {
+    let to = match to {
+        Some(t) => t,
+        None if el.name() == "presence" => return crate::modules::presence::from_client_broadcast(srv, host, session, el).await,
+        // No `to`: the account itself (RFC 6120 §10.3.3). IQs stay without one, so the reply
+        // comes back without a `from`, as clients expect for roster and the like.
+        None if el.name() == "iq" => me.to_bare(),
+        None => {
             el.set_attr("to", me.to_bare().to_string());
+            me.to_bare()
         }
-        _ => {}
-    }
-    let to = match quark_core::stanza::jid_attr(&el, "to") {
-        Ok(Some(t)) => t,
-        _ => return,
     };
     // Stanzas to the server itself or the account's own bare JID aren't "to someone else".
     let to_other = to.domain() != host.domain || to.node().is_some() && to.to_bare() != me.to_bare();
@@ -164,7 +161,7 @@ async fn local(srv: &Arc<Server>, host: &Arc<Host>, from: Jid, to: Jid, mut el: 
 
 async fn local_iq(srv: &Arc<Server>, host: &Arc<Host>, from: Jid, to: Jid, el: Element, session: Option<&Arc<SessionHandle>>) {
     let Some(kind) = iq_type(&el) else {
-        return bounce(srv, &el, StanzaError::bad_request()).await;
+        return bounce_iq(srv, session, &el, StanzaError::bad_request()).await;
     };
     let target = if to.node().is_none() {
         Some(IqTarget::Server)
@@ -179,7 +176,7 @@ async fn local_iq(srv: &Arc<Server>, host: &Arc<Host>, from: Jid, to: Jid, el: E
             Some(s) => {
                 s.send(el);
             }
-            None if matches!(kind, IqType::Get | IqType::Set) => bounce(srv, &el, StanzaError::service_unavailable()).await,
+            None if matches!(kind, IqType::Get | IqType::Set) => bounce_iq(srv, session, &el, StanzaError::service_unavailable()).await,
             None => {}
         }
         return;
@@ -189,17 +186,24 @@ async fn local_iq(srv: &Arc<Server>, host: &Arc<Host>, from: Jid, to: Jid, el: E
         srv.answer_pending(&el);
         return;
     }
-    let Some(payload) = el.first_child() else {
-        return bounce(srv, &el, StanzaError::bad_request()).await;
+    // A get or set carries exactly one payload (RFC 6120 §8.2.3).
+    let mut children = el.children();
+    let (Some(payload), None) = (children.next(), children.next()) else {
+        return bounce_iq(srv, session, &el, StanzaError::bad_request()).await;
     };
     if target == IqTarget::Account && !srv.accounts.exists(&host.domain, to.node().unwrap_or_default()).await.unwrap_or(false) {
-        return bounce(srv, &el, StanzaError::service_unavailable()).await;
+        return bounce_iq(srv, session, &el, StanzaError::service_unavailable()).await;
     }
-    if target == IqTarget::Server && payload.is("session", ns::SESSION) && kind == IqType::Set {
+    if payload.is("session", ns::SESSION) && kind == IqType::Set && (target == IqTarget::Server || from.to_bare() == to) {
         return reply(srv, session, iq_result(&el)).await;
     }
-    let Some(m) = srv.iq_module(payload.ns(), target).cloned() else {
-        return bounce(srv, &el, StanzaError::service_unavailable()).await;
+    // An account asking its own bare JID about something only the server answers (a ping
+    // without `to`, say) gets the server's answer.
+    let module = srv
+        .iq_module(payload.ns(), target)
+        .or_else(|| (target == IqTarget::Account && from.to_bare() == to).then(|| srv.iq_module(payload.ns(), IqTarget::Server)).flatten());
+    let Some(m) = module.cloned() else {
+        return bounce_iq(srv, session, &el, StanzaError::service_unavailable()).await;
     };
     let cx = IqCtx { srv, host, from: &from, to: &to, iq: &el, payload, kind, session };
     let result = m.handle_iq(&cx).await;
@@ -228,6 +232,13 @@ pub async fn reply(srv: &Arc<Server>, session: Option<&Arc<SessionHandle>>, el: 
             s.send(el);
         }
         _ => srv.route(el).await,
+    }
+}
+
+/// An error reply to an IQ, sent the same way as a result would be.
+async fn bounce_iq(srv: &Arc<Server>, session: Option<&Arc<SessionHandle>>, el: &Element, err: StanzaError) {
+    if let Some(r) = error_reply(el, &err) {
+        reply(srv, session, r).await;
     }
 }
 
@@ -309,12 +320,12 @@ pub async fn deliver_message(srv: &Arc<Server>, host: &Arc<Host>, from: &Jid, to
             s.send(msg);
             return;
         }
-        // RFC 6121 §8.5.3.2.1: chat and normal go to the account; the rest are dropped.
-        if !(kind == "chat" || kind == "normal") {
-            if kind == "groupchat" || kind == "headline" {
-                return;
-            }
-            return bounce(srv, &msg, StanzaError::service_unavailable()).await;
+        // RFC 6121 §8.5.3.2.1: chat goes to the account; groupchat and headline are dropped;
+        // normal (and anything else) is refused.
+        match kind.as_str() {
+            "chat" => {}
+            "groupchat" | "headline" | "error" => return,
+            _ => return bounce(srv, &msg, StanzaError::service_unavailable()).await,
         }
     }
 

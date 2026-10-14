@@ -178,7 +178,7 @@ pub(super) async fn read_loop(mut r: Box<dyn StanzaReader>, tx: mpsc::Sender<Rea
             Err(XmlError::Io(_)) => ReaderEvent::Gone(Gone::Dropped),
             Err(XmlError::TooBig) => ReaderEvent::Gone(Gone::Error(StreamError::with_text("policy-violation", "Stanza too big."))),
             Err(XmlError::Restricted) => ReaderEvent::Gone(Gone::Error(StreamError::new("restricted-xml"))),
-            Err(XmlError::Malformed(_)) => ReaderEvent::Gone(Gone::Error(StreamError::new("not-well-formed"))),
+            Err(XmlError::Malformed(_) | XmlError::InvalidNamespace) => ReaderEvent::Gone(Gone::Error(StreamError::new("not-well-formed"))),
         };
         let done = matches!(ev, ReaderEvent::Gone(_));
         if tx.send(ev).await.is_err() || done {
@@ -317,7 +317,7 @@ impl Actor {
             SessionMsg::Close { condition, text } => {
                 if let Some(w) = self.writer.as_mut() {
                     let _ = w.flush().await;
-                    w.close(Some(&StreamError { condition, text })).await;
+                    w.close(Some(&StreamError { condition, text, app: None })).await;
                 }
                 self.writer = None;
                 Some(End::Final)
@@ -363,7 +363,12 @@ impl Actor {
                 if h.is_some_and(|h| sm.ack(h)) {
                     return None;
                 }
-                self.fail("undefined-condition", "That acknowledgement counts stanzas that were never sent.").await
+                // XEP-0198 §5: say what was claimed and what was really sent.
+                let sent = sm.out_h;
+                let too_high = Element::new("handled-count-too-high", ns::SM)
+                    .attr_set("h", h.unwrap_or(0).to_string())
+                    .attr_set("send-count", sent.to_string());
+                self.close_with(StreamError { condition: "undefined-condition", text: None, app: Some(too_high) }).await
             }
             (ns::SM, "enable") => {
                 if self.sm.is_some() {
@@ -400,9 +405,12 @@ impl Actor {
     }
 
     async fn fail(&mut self, condition: &'static str, text: &str) -> Option<End> {
+        self.close_with(StreamError { condition, text: (!text.is_empty()).then(|| text.to_string()), app: None }).await
+    }
+
+    async fn close_with(&mut self, e: StreamError) -> Option<End> {
         if let Some(w) = self.writer.as_mut() {
             let _ = w.flush().await;
-            let e = StreamError { condition, text: (!text.is_empty()).then(|| text.to_string()) };
             w.close(Some(&e)).await;
         }
         self.writer = None;

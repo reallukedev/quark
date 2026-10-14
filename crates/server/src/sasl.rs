@@ -133,6 +133,8 @@ enum State {
         known: bool,
         enabled: bool,
     },
+    /// The client named a mechanism without an initial response; we sent an empty challenge.
+    AwaitInitial(String),
     Done,
 }
 
@@ -141,8 +143,16 @@ pub struct Sasl {
 }
 
 impl Sasl {
-    /// Starts `mechanism` with the client's initial response (empty when none was sent).
-    pub async fn start(ctx: &Context<'_>, mechanism: &str, initial: &[u8]) -> (Option<Sasl>, Step) {
+    /// Starts `mechanism` with the client's initial response. Without one (RFC 6120 §6.4.2),
+    /// answers with an empty challenge and takes the next response as the initial one.
+    pub async fn start(ctx: &Context<'_>, mechanism: &str, initial: Option<&[u8]>) -> (Option<Sasl>, Step) {
+        let Some(initial) = initial else {
+            let known = mechanism == "PLAIN" || mechanism.starts_with("HT-SHA-256-") || mechanism.starts_with("SCRAM-SHA-");
+            if !known {
+                return (None, Step::Failure(Failure::InvalidMechanism, None));
+            }
+            return (Some(Sasl { state: State::AwaitInitial(mechanism.to_string()) }), Step::Challenge(Vec::new()));
+        };
         match mechanism {
             "PLAIN" if ctx.secure => (None, plain(ctx, initial).await),
             "PLAIN" => (None, Step::Failure(Failure::EncryptionRequired, None)),
@@ -169,8 +179,15 @@ impl Sasl {
         }
     }
 
-    pub fn step(&mut self, ctx: &Context<'_>, response: &[u8]) -> Step {
+    pub async fn step(&mut self, ctx: &Context<'_>, response: &[u8]) -> Step {
         match std::mem::replace(&mut self.state, State::Done) {
+            State::AwaitInitial(m) => {
+                let (next, step) = Box::pin(Self::start(ctx, &m, Some(response))).await;
+                if let Some(next) = next {
+                    *self = next;
+                }
+                step
+            }
             State::Scram { hash, client_first_bare, gs2, cb_kind, server_first, nonce, user, cred, known, enabled } => {
                 let Ok(msg) = std::str::from_utf8(response) else {
                     return Step::Failure(Failure::MalformedRequest, None);
@@ -432,7 +449,7 @@ mod tests {
         let Step::Challenge(sf) = step else { panic!("{step:?}") };
         let sf = String::from_utf8(sf).unwrap();
         let (fin, server_sig) = client_final(ScramHash::Sha256, "pencil-pencil", bare, &sf, b"n,,");
-        match s.unwrap().step(&c, fin.as_bytes()) {
+        match s.unwrap().step(&c, fin.as_bytes()).await {
             Step::Success { user, data } => {
                 assert_eq!(user, "user");
                 assert_eq!(data.unwrap(), format!("v={}", B64.encode(server_sig)).into_bytes());
@@ -449,7 +466,7 @@ mod tests {
         let bare = "n=user,r=abcdef";
         let (s, Step::Challenge(sf)) = Sasl::start(&c, "SCRAM-SHA-1", format!("n,,{bare}").as_bytes()).await else { panic!() };
         let (fin, _) = client_final(ScramHash::Sha1, "wrong", bare, &String::from_utf8(sf).unwrap(), b"n,,");
-        assert!(matches!(s.unwrap().step(&c, fin.as_bytes()), Step::Failure(Failure::NotAuthorized, _)));
+        assert!(matches!(s.unwrap().step(&c, fin.as_bytes()).await, Step::Failure(Failure::NotAuthorized, _)));
     }
 
     #[tokio::test]
@@ -465,7 +482,7 @@ mod tests {
         let mut good = b"p=tls-exporter,,".to_vec();
         good.extend_from_slice(&[7; 32]);
         let (fin, _) = client_final(ScramHash::Sha256, "pencil-pencil", bare, &sf, &good);
-        assert!(matches!(s.unwrap().step(&c, fin.as_bytes()), Step::Success { .. }));
+        assert!(matches!(s.unwrap().step(&c, fin.as_bytes()).await, Step::Success { .. }));
     }
 
     #[tokio::test]
@@ -473,7 +490,7 @@ mod tests {
         let a = accounts().await;
         let cb = ChannelBindings { exporter: Some(vec![1; 32]), server_end_point: None };
         let c = ctx(&a, &cb);
-        let (_, step) = Sasl::start(&c, "SCRAM-SHA-256", b"y,,n=user,r=abc").await;
+        let (_, step) = Sasl::start(&c, "SCRAM-SHA-256", Some(b"y,,n=user,r=abc")).await;
         assert!(matches!(step, Step::Failure(Failure::NotAuthorized, _)));
     }
 
@@ -485,7 +502,17 @@ mod tests {
         let bare = "n=nobody,r=abc";
         let (s, Step::Challenge(sf)) = Sasl::start(&c, "SCRAM-SHA-256", format!("n,,{bare}").as_bytes()).await else { panic!() };
         let (fin, _) = client_final(ScramHash::Sha256, "x", bare, &String::from_utf8(sf).unwrap(), b"n,,");
-        assert!(matches!(s.unwrap().step(&c, fin.as_bytes()), Step::Failure(Failure::NotAuthorized, _)));
+        assert!(matches!(s.unwrap().step(&c, fin.as_bytes()).await, Step::Failure(Failure::NotAuthorized, _)));
+    }
+
+    #[tokio::test]
+    async fn missing_initial_response_gets_an_empty_challenge() {
+        let a = accounts().await;
+        let cb = ChannelBindings::default();
+        let c = ctx(&a, &cb);
+        let (s, step) = Sasl::start(&c, "PLAIN", None).await;
+        assert!(matches!(step, Step::Challenge(ref d) if d.is_empty()));
+        assert!(matches!(s.unwrap().step(&c, b"\0user\0pencil-pencil").await, Step::Success { .. }));
     }
 
     #[tokio::test]
@@ -493,9 +520,9 @@ mod tests {
         let a = accounts().await;
         let cb = ChannelBindings::default();
         let mut c = ctx(&a, &cb);
-        assert!(matches!(Sasl::start(&c, "PLAIN", b"\0user\0pencil-pencil").await.1, Step::Success { .. }));
-        assert!(matches!(Sasl::start(&c, "PLAIN", b"\0user\0nope").await.1, Step::Failure(Failure::NotAuthorized, _)));
+        assert!(matches!(Sasl::start(&c, "PLAIN", Some(b"\0user\0pencil-pencil")).await.1, Step::Success { .. }));
+        assert!(matches!(Sasl::start(&c, "PLAIN", Some(b"\0user\0nope")).await.1, Step::Failure(Failure::NotAuthorized, _)));
         c.secure = false;
-        assert!(matches!(Sasl::start(&c, "PLAIN", b"\0user\0pencil-pencil").await.1, Step::Failure(Failure::EncryptionRequired, _)));
+        assert!(matches!(Sasl::start(&c, "PLAIN", Some(b"\0user\0pencil-pencil")).await.1, Step::Failure(Failure::EncryptionRequired, _)));
     }
 }

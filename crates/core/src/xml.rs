@@ -400,6 +400,9 @@ pub enum XmlError {
     Restricted,
     #[error("stanza too big")]
     TooBig,
+    /// The stream header is `<stream>` in the wrong namespace.
+    #[error("wrong stream namespace")]
+    InvalidNamespace,
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -563,6 +566,29 @@ impl<R: AsyncRead + Unpin> StreamReader<R> {
         self.reader.get_ref().get_ref().get_ref()
     }
 
+    /// Something that isn't XML (an HTTP request, a TLS handshake on the plain port) is refused
+    /// right away instead of waiting for a `<` that never comes.
+    async fn check_first_byte(&mut self) -> Result<(), XmlError> {
+        use tokio::io::AsyncBufReadExt;
+        let br = self.reader.get_mut();
+        loop {
+            let buf = br.fill_buf().await?;
+            let Some(&b) = buf.first() else { return Ok(()) };
+            if b == b'<' {
+                return Ok(());
+            }
+            // A UTF-8 byte order mark or whitespace may come first.
+            let skip = if buf.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                3
+            } else if b.is_ascii_whitespace() {
+                1
+            } else {
+                return Err(XmlError::Malformed("not XML".into()));
+            };
+            br.consume(skip);
+        }
+    }
+
     /// Total bytes read from the transport so far (for rate limits and stats).
     pub fn bytes_read(&self) -> u64 {
         self.count.load(Ordering::Relaxed)
@@ -574,6 +600,9 @@ impl<R: AsyncRead + Unpin> StreamReader<R> {
     }
 
     pub async fn next(&mut self) -> Result<Option<StreamEvent>, XmlError> {
+        if !self.opened {
+            self.check_first_byte().await?;
+        }
         loop {
             if self.stack.is_empty() {
                 // Each top-level element gets its own allowance, counted from what's been read so far.
@@ -591,8 +620,11 @@ impl<R: AsyncRead + Unpin> StreamReader<R> {
                 Event::Decl(_) => {}
                 Event::Start(e) if !self.opened => {
                     let name = e.local_name();
-                    if name.as_ref() != b"stream" || !matches!(&res, Ok(n) if n == ns::STREAM) {
+                    if name.as_ref() != b"stream" {
                         return Err(XmlError::Malformed("expected <stream:stream>".into()));
+                    }
+                    if !matches!(&res, Ok(n) if n == ns::STREAM) {
+                        return Err(XmlError::InvalidNamespace);
                     }
                     let mut attrs = Vec::new();
                     for a in e.attributes() {

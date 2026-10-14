@@ -73,12 +73,11 @@ pub async fn from_client_broadcast(srv: &Arc<Server>, host: &Arc<Host>, session:
         p.set_attr("to", it.contact.to_string());
         srv.route(p).await;
     }
+    // Every available resource of the account, the sender included (RFC 6121 §4.2.2).
     for o in srv.sessions.available_of(&bare) {
-        if o.id != session.id {
-            let mut p = el.clone();
-            p.set_attr("to", o.jid.to_string());
-            o.send(p);
-        }
+        let mut p = el.clone();
+        p.set_attr("to", o.jid.to_string());
+        o.send(p);
     }
 
     if initial {
@@ -241,7 +240,15 @@ async fn outbound_subscription(
     let mut it = existing.clone().unwrap_or_else(|| Item::new(contact.clone()));
     match kind {
         "subscribe" => {
-            if !it.subscription.receives_from_contact() && !it.ask {
+            if it.subscription.receives_from_contact() {
+                // Already subscribed: confirm on the contact's behalf instead of asking again.
+                let ok = Element::new("presence", ns::CLIENT).attr_set("from", contact.to_string()).attr_set("type", "subscribed");
+                for s in srv.sessions.available_of(&me) {
+                    s.send(ok.clone().attr_set("to", s.jid.to_string()));
+                }
+                return Ok(());
+            }
+            if !it.ask {
                 it.ask = true;
                 it.visible = true;
                 roster::save_and_push(srv, host, user, &it).await?;

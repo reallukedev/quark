@@ -21,19 +21,24 @@ use crate::tls::CertStore;
 pub struct StreamError {
     pub condition: &'static str,
     pub text: Option<String>,
+    /// An application-specific condition element.
+    pub app: Option<Element>,
 }
 
 impl StreamError {
     pub fn new(condition: &'static str) -> Self {
-        StreamError { condition, text: None }
+        StreamError { condition, text: None, app: None }
     }
     pub fn with_text(condition: &'static str, text: impl Into<String>) -> Self {
-        StreamError { condition, text: Some(text.into()) }
+        StreamError { condition, text: Some(text.into()), app: None }
     }
     pub fn to_element(&self) -> Element {
         let mut e = Element::new("error", ns::STREAM).child(Element::new(self.condition, ns::STREAMS));
         if let Some(t) = &self.text {
             e.append(Element::new("text", ns::STREAMS).attr_set("xml:lang", "en").text(t.clone()));
+        }
+        if let Some(a) = &self.app {
+            e.append(a.clone());
         }
         e
     }

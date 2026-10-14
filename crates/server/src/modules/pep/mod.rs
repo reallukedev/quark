@@ -32,7 +32,7 @@ mod iq;
 mod pie;
 mod store;
 
-use caps::{Bounded, Caps, CapsCache};
+use caps::{bounded, Bounded, Caps, CapsCache};
 
 /// Largest item payload, in bytes of XML.
 const MAX_ITEM_BYTES: usize = 256 * 1024;
@@ -191,8 +191,8 @@ impl Default for State {
             caps: CapsCache::default(),
             local: Mutex::new(HashMap::new()),
             remote: Mutex::new(Remote::default()),
-            contacts: Mutex::new(Bounded::new(CONTACT_CACHE)),
-            avatars: Mutex::new(Bounded::new(AVATAR_CACHE)),
+            contacts: Mutex::new(bounded(CONTACT_CACHE)),
+            avatars: Mutex::new(bounded(AVATAR_CACHE)),
         }
     }
 }
@@ -253,7 +253,7 @@ impl Module for Pep {
         let (o, data) = (store::Owner { host: host.domain.clone(), user: user.to_string() }, data.clone());
         let notes = srv.db.write(move |t| pie::import(t, &o, &data)).await?;
         // The avatar hash for presence comes from the database again.
-        self.st.avatars.lock().remove(&Jid::bare_unchecked(user, &host.domain));
+        self.st.avatars.lock().pop(&Jid::bare_unchecked(user, &host.domain));
         Ok(notes)
     }
 
@@ -312,14 +312,14 @@ impl Module for Pep {
                 self.st.local.lock().remove(jid);
             }
             Event::SubscriptionApproved { user, contact } => {
-                self.st.contacts.lock().remove(&(user.clone(), contact.to_bare()));
+                self.st.contacts.lock().pop(&(user.clone(), contact.to_bare()));
                 let (st, srv, user, contact) = (self.st.clone(), srv.clone(), user.clone(), contact.clone());
                 tokio::spawn(async move { st.subscription_approved(&srv, &user, &contact).await });
             }
             // Its resources stay tracked while their presence still reaches the account: every
             // notification checks the roster, and a later approval needs to know them.
             Event::SubscriptionRevoked { user, contact } => {
-                self.st.contacts.lock().remove(&(user.clone(), contact.to_bare()));
+                self.st.contacts.lock().pop(&(user.clone(), contact.to_bare()));
             }
             Event::AccountDeleted { jid } => self.st.forget(jid),
             Event::VCardChanged { jid, vcard } => self.st.vcard_changed(srv, jid, vcard).await,
@@ -334,7 +334,7 @@ impl State {
     fn forget(&self, bare: &Jid) {
         self.local.lock().retain(|j, _| j.to_bare() != *bare);
         self.remote.lock().remove_owner(bare);
-        self.avatars.lock().remove(bare);
+        self.avatars.lock().pop(bare);
     }
 }
 

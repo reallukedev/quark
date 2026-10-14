@@ -175,17 +175,12 @@ fn clean_ctype(t: &str) -> Option<String> {
     (t.len() <= 100 && token(a) && token(b) && t.bytes().all(|c| (0x20..0x7f).contains(&c))).then(|| t.to_ascii_lowercase())
 }
 
-/// Percent-encodes a URL path segment.
+/// Everything but RFC 3986's unreserved characters.
+const SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~');
+
+/// Percent-encodes a URL path segment (or an RFC 8187 header value).
 pub fn pct(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
+    percent_encoding::utf8_percent_encode(s, SEGMENT).to_string()
 }
 
 /// A slot or stored file.
@@ -717,8 +712,11 @@ mod tests {
 
     async fn server(dir: &std::path::Path) -> Arc<Server> {
         let path = dir.join("quark.toml");
-        let text =
-            format!("[server]\ndata_dir = {:?}\n[tls]\ncert_dir = {:?}\n[[host]]\ndomain = \"a.test\"\n", dir.join("data"), dir.join("certs"));
+        let text = format!(
+            "[server]\ndata_dir = {:?}\n[tls]\ncert_dir = {:?}\n[[host]]\ndomain = \"a.test\"\n",
+            dir.join("data"),
+            dir.join("certs")
+        );
         std::fs::write(&path, text).unwrap();
         let srv = crate::run::build(crate::run::load_config(&path).unwrap()).unwrap();
         srv.accounts.create("a.test", "sam", "password", crate::accounts::Role::Member).await.unwrap();

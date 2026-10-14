@@ -34,8 +34,8 @@ use tower::ServiceExt as _;
 
 use crate::modules::Module;
 use crate::sasl::ChannelBindings;
-use crate::turn::Cidr;
 use crate::server::{Host, Server};
+use crate::turn::Cidr;
 
 /// Time a client has to send a request's headers.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -70,7 +70,7 @@ pub(crate) struct Conn {
 
 impl Conn {
     /// Whether the TCP peer is one of `http.trusted_proxies`, whose forwarding headers count.
-    fn from_proxy(&self) -> bool {
+    fn peer_is_proxy(&self) -> bool {
         trusted(&self.proxies, self.peer.ip())
     }
 }
@@ -115,7 +115,7 @@ pub(crate) fn is_private(ip: IpAddr) -> bool {
 pub(crate) fn peer(conn: &Conn, headers: &HeaderMap) -> Peer {
     let direct = conn.peer.ip().to_canonical();
     let own_tls = conn.tls.is_some();
-    if !conn.from_proxy() {
+    if !conn.peer_is_proxy() {
         return Peer { ip: direct, secure: own_tls, proxied: false };
     }
     let forwarded: Vec<IpAddr> = headers
@@ -157,7 +157,7 @@ fn metrics_allowed(token: Option<&str>, conn: &Conn, headers: &HeaderMap) -> boo
     if !forwarded(headers) {
         return conn.peer.ip().to_canonical().is_loopback();
     }
-    conn.from_proxy() && headers.contains_key("x-forwarded-for") && is_private(peer(conn, headers).ip)
+    conn.peer_is_proxy() && headers.contains_key("x-forwarded-for") && is_private(peer(conn, headers).ip)
 }
 
 /// What one address has open of something, capped: IPv4 addresses one by one, IPv6 by /64,
@@ -633,7 +633,8 @@ mod tests {
         assert!(n.begin(a).is_some());
         assert!(n.counts.lock().is_empty(), "addresses with nothing open are forgotten");
         // Rotating within one /64 doesn't buy more.
-        let held: Vec<_> = (1..=4u16).map(|i| n.begin(IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, i, 0, 0, i))).unwrap()).collect();
+        let held: Vec<_> =
+            (1..=4u16).map(|i| n.begin(IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, i, 0, 0, i))).unwrap()).collect();
         assert!(n.begin("2001:db8:0:1:ffff::1".parse().unwrap()).is_none());
         assert!(n.begin("2001:db8:0:2::1".parse().unwrap()).is_some());
         drop(held);

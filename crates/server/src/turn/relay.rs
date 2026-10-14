@@ -1357,9 +1357,7 @@ mod tests {
         let r = relay().await;
         let ext: IpAddr = "198.51.100.77".parse().unwrap();
         assert!(!r.own.load().contains(ext));
-        let mut t = TurnSection::default();
-        t.external_ip = Some(ext);
-        r.set_limits(Limits::new(&t));
+        r.set_limits(Limits::new(&TurnSection { external_ip: Some(ext), ..TurnSection::default() }));
         assert!(r.own.load().contains(ext), "peers at the external IP are only our own allocations");
     }
 

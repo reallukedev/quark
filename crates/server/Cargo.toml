@@ -67,6 +67,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 x509-parser = "0.16"
 webpki-roots = "1"
 qrcode = { version = "0.14", default-features = false }
+lru = "0.18"
+httpdate = "1"
+percent-encoding = "2"
 
 [target.'cfg(unix)'.dependencies]
 # The effective user id, to check who owns the admin socket (no unsafe libc calls).

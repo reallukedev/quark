@@ -1605,7 +1605,8 @@ impl Room {
             if *aff == Affiliation::Owner {
                 owners.push(jid);
             }
-            let before = planned.get(jid).copied().unwrap_or_else(|| self.affiliations.get(jid).map_or(Affiliation::None, |a| a.affiliation));
+            let before =
+                planned.get(jid).copied().unwrap_or_else(|| self.affiliations.get(jid).map_or(Affiliation::None, |a| a.affiliation));
             for (a, delta) in [(before, -1isize), (*aff, 1)] {
                 let slot = match a {
                     Affiliation::None => continue,

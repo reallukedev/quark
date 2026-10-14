@@ -110,7 +110,7 @@ async fn dispatch(srv: &Arc<Server>, from: Jid, to: Jid, el: Element, session: O
                 s.federation || (s.push && crate::modules::push::is_notification(&el))
             });
             match srv.remote() {
-                Some(r) if allowed && !srv.config().s2s.blocked.iter().any(|b| b == to.domain()) => r.send(from.domain(), to.domain(), el),
+                Some(r) if allowed && !crate::s2s::is_blocked(&srv.config(), to.domain()) => r.send(from.domain(), to.domain(), el),
                 _ => {
                     let e = StanzaError::new(Condition::RemoteServerNotFound).with_text(if allowed {
                         "That server can't be reached from here."

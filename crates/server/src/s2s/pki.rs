@@ -13,12 +13,22 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, RootCertStore, SignatureScheme};
 
+use sha2::{Digest, Sha256};
+
 use crate::tls::CertStore;
+
+/// Adds one file to a trust store digest, length first so file boundaries count.
+fn hash_file(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+}
 
 /// The CAs we trust and a verifier built from them.
 pub struct Pki {
     /// The files the extra roots came from, to notice config changes.
     pub sources: Vec<PathBuf>,
+    /// A hash of what those files held, to notice them being replaced.
+    pub digest: [u8; 32],
     verifier: Arc<WebPkiServerVerifier>,
     provider: Arc<CryptoProvider>,
 }
@@ -34,8 +44,10 @@ impl Pki {
     /// off the async threads.
     pub fn load(extra: &[PathBuf]) -> Result<Pki, String> {
         let mut roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        let mut digest = Sha256::new();
         for path in extra {
             let pem = std::fs::read(path).map_err(|e| format!("couldn't read {}: {e}", path.display()))?;
+            hash_file(&mut digest, &pem);
             let mut n = 0;
             for c in rustls_pemfile::certs(&mut pem.as_slice()) {
                 let c = c.map_err(|e| format!("{}: {e}", path.display()))?;
@@ -50,14 +62,28 @@ impl Pki {
         let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
             .build()
             .map_err(|e| format!("couldn't build the certificate verifier: {e}"))?;
-        Ok(Pki { sources: extra.to_vec(), verifier, provider })
+        Ok(Pki { sources: extra.to_vec(), digest: digest.finalize().into(), verifier, provider })
+    }
+
+    /// The [`Pki::digest`] the files in `paths` would give now: compared with the loaded one, it
+    /// says whether a file was rewritten in place (a renewed CA, a peer's new self-signed
+    /// certificate) without the config changing. Reads files: call it off the async threads.
+    pub fn fingerprint(paths: &[PathBuf]) -> Result<[u8; 32], String> {
+        let mut digest = Sha256::new();
+        for path in paths {
+            let pem = std::fs::read(path).map_err(|e| format!("couldn't read {}: {e}", path.display()))?;
+            hash_file(&mut digest, &pem);
+        }
+        Ok(digest.finalize().into())
     }
 
     /// Whether `chain` (leaf first) is a currently valid certificate for `domain` from a CA we
-    /// trust (RFC 6125 DNS-ID, wildcards included).
+    /// trust (RFC 6125 DNS-ID, wildcards included). Internationalized domains are matched in
+    /// their A-label form, the way certificates carry them (RFC 6125 §6.4.2).
     pub fn valid_for(&self, chain: &[CertificateDer<'_>], domain: &str) -> bool {
         let Some((leaf, intermediates)) = chain.split_first() else { return false };
-        let Ok(name) = ServerName::try_from(domain.to_string()) else { return false };
+        let Some(ascii) = super::dns::to_ascii(domain) else { return false };
+        let Ok(name) = ServerName::try_from(ascii) else { return false };
         self.verifier.verify_server_cert(leaf, intermediates, &name, &[], UnixTime::now()).is_ok()
     }
 
@@ -226,6 +252,36 @@ mod tests {
         std::fs::write(&path, ck.cert.pem()).unwrap();
         let pki = Pki::load(&[path]).unwrap();
         assert!(pki.valid_for(&[ck.cert.der().clone()], "b.test"));
+    }
+
+    #[test]
+    fn internationalized_domains_match_their_a_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let ck = rcgen::generate_simple_self_signed(vec!["xn--bcher-kva.test".to_string()]).unwrap();
+        let path = dir.path().join("b.pem");
+        std::fs::write(&path, ck.cert.pem()).unwrap();
+        let pki = Pki::load(&[path]).unwrap();
+        let chain = [ck.cert.der().clone()];
+        assert!(pki.valid_for(&chain, "bücher.test"));
+        assert!(pki.valid_for(&chain, "xn--bcher-kva.test"));
+        assert!(!pki.valid_for(&chain, "bucher.test"));
+    }
+
+    #[test]
+    fn rewritten_trust_files_change_the_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer.pem");
+        let first = rcgen::generate_simple_self_signed(vec!["b.test".to_string()]).unwrap();
+        std::fs::write(&path, first.cert.pem()).unwrap();
+        let pki = Pki::load(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(Pki::fingerprint(std::slice::from_ref(&path)).unwrap(), pki.digest);
+        // Same path, new contents (even within the same second, at the same length).
+        let second = rcgen::generate_simple_self_signed(vec!["b.test".to_string()]).unwrap();
+        std::fs::write(&path, second.cert.pem()).unwrap();
+        assert_ne!(Pki::fingerprint(std::slice::from_ref(&path)).unwrap(), pki.digest);
+        let reloaded = Pki::load(std::slice::from_ref(&path)).unwrap();
+        assert!(reloaded.valid_for(&[second.cert.der().clone()], "b.test"));
+        assert!(!reloaded.valid_for(&[first.cert.der().clone()], "b.test"));
     }
 
     #[test]

@@ -8,15 +8,15 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use quark_core::stanza::jid_attr;
+use quark_core::stanza::{error_reply, jid_attr};
 use quark_core::{ns, Condition, Element, Jid, StanzaError};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, OwnedSemaphorePermit};
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit};
 
 use super::dialback::{self, Outcome};
 use super::stream::{self, In, Io, Stream, StreamFailure, Writer};
-use super::{is_blocked, LinkInfo, S2s};
+use super::{inbound, is_blocked, Inbound, IpSlot, LinkInfo, S2s};
 use crate::server::Server;
 use crate::transport::StreamError;
 
@@ -34,9 +34,9 @@ pub(super) async fn accept_loop(s2s: Arc<S2s>, srv: Arc<Server>, listener: TcpLi
     }
     let mut shutdown = srv.shutdown_signal();
     loop {
-        let tcp = tokio::select! {
+        let (tcp, addr) = tokio::select! {
             r = listener.accept() => match r {
-                Ok((tcp, _)) => tcp,
+                Ok(x) => x,
                 Err(e) => {
                     tracing::warn!(error = %e, "accept failed");
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -48,26 +48,31 @@ pub(super) async fn accept_loop(s2s: Arc<S2s>, srv: Arc<Server>, listener: TcpLi
                 _ => return,
             },
         };
+        let Some(ip_slot) = s2s.ip_slot(addr.ip(), super::per_ip_cap(srv.config().s2s.max_incoming)) else {
+            tracing::warn!(peer = %addr, "too many server connections from one address; refusing one");
+            continue;
+        };
         let Ok(permit) = s2s.in_slots.clone().try_acquire_owned() else {
             tracing::warn!("too many server connections; refusing one");
             continue;
         };
-        tokio::spawn(serve(s2s.clone(), srv.clone(), tcp, direct_tls, permit));
+        tokio::spawn(serve(s2s.clone(), srv.clone(), tcp, direct_tls, (permit, ip_slot)));
     }
 }
 
-async fn serve(s2s: Arc<S2s>, srv: Arc<Server>, tcp: TcpStream, direct_tls: bool, _permit: OwnedSemaphorePermit) {
+async fn serve(s2s: Arc<S2s>, srv: Arc<Server>, tcp: TcpStream, direct_tls: bool, _slots: (OwnedSemaphorePermit, IpSlot)) {
     let cfg = srv.config();
     let tls = s2s.tls(&srv).await;
     let max = cfg.limits.s2s_stanza_bytes;
+    let write_limit = Duration::from_secs(cfg.s2s.timeout_secs.max(1));
     let mut st = if direct_tls {
         let accept = tokio_rustls::TlsAcceptor::from(tls.direct.clone()).accept(tcp);
         match tokio::time::timeout(Duration::from_secs(15), accept).await {
-            Ok(Ok(s)) => Stream::new(Io::Server(Box::new(s)), max),
+            Ok(Ok(s)) => Stream::new(Io::Server(Box::new(s)), max, write_limit),
             _ => return,
         }
     } else {
-        Stream::new(Io::Plain(tcp), max)
+        Stream::new(Io::Plain(tcp), max, write_limit)
     };
     let limit = Duration::from_secs(cfg.limits.auth_timeout_secs);
     let neg = match tokio::time::timeout(limit, negotiate(&srv, &tls, &mut st)).await {
@@ -97,11 +102,14 @@ async fn serve(s2s: Arc<S2s>, srv: Arc<Server>, tcp: TcpStream, direct_tls: bool
     let (in_tx, in_rx) = mpsc::channel(8);
     let reader_task = tokio::spawn(stream::read_loop(reader, in_tx));
     let (ev_tx, ev_rx) = mpsc::channel(MAX_VERIFYING);
+    let id = s2s.next_id();
+    let evicted = s2s.evictable(id);
     let mut link = Link {
         s2s: s2s.clone(),
         srv,
         tls,
-        id: s2s.next_id(),
+        id,
+        evicted,
         local: neg.local,
         stream_id: neg.stream_id,
         secure,
@@ -165,6 +173,10 @@ async fn negotiate(srv: &Arc<Server>, tls: &super::Tls, st: &mut Stream) -> Resu
         st.open(Some(&local), from.as_deref(), Some(&id)).await?;
         if let Some(f) = from.as_deref().filter(|f| is_blocked(&cfg, f) || srv.is_local(f)) {
             let text = if srv.is_local(f) { "That's this server's own name." } else { "This server doesn't talk to yours." };
+            return Err(StreamFailure::Local(StreamError::with_text("policy-violation", text)));
+        }
+        if inbound(srv, &local) == Inbound::Nothing {
+            let text = format!("Chatting with other servers is turned off on {local}.");
             return Err(StreamFailure::Local(StreamError::with_text("policy-violation", text)));
         }
         if attr("version").is_none_or(|v| !v.starts_with("1.")) {
@@ -264,6 +276,8 @@ struct Link {
     srv: Arc<Server>,
     tls: Arc<super::Tls>,
     id: u64,
+    /// Woken when a newer link from the same domain takes this one's place.
+    evicted: Arc<Notify>,
     local: String,
     stream_id: String,
     secure: bool,
@@ -287,6 +301,7 @@ enum Next {
     In(Option<In>),
     Verified(Verified),
     Tick,
+    Evicted,
     Shutdown,
 }
 
@@ -298,6 +313,9 @@ impl Link {
         let mut shutdown = self.srv.shutdown_signal();
         let idle = Duration::from_secs(self.srv.config().s2s.idle_secs);
         let auth_limit = Duration::from_secs(self.srv.config().limits.auth_timeout_secs);
+        // Dialback checks still running get this long on top of the sign-in time, and no more.
+        let verify_limit = Duration::from_secs(self.srv.config().s2s.timeout_secs.max(1));
+        let evicted = self.evicted.clone();
         let mut tick = tokio::time::interval(super::tick_period(idle.as_secs()));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut pending = first;
@@ -315,6 +333,7 @@ impl Link {
                         None => continue,
                     },
                     i = inbound.recv() => Next::In(i),
+                    _ = evicted.notified() => Next::Evicted,
                     _ = tick.tick() => Next::Tick,
                 },
             };
@@ -330,7 +349,11 @@ impl Link {
                     self.on_element(el).await
                 }
                 Next::Verified(v) => self.on_verified(v).await,
-                Next::Tick => self.on_tick(idle, auth_limit).await,
+                Next::Evicted => {
+                    tracing::debug!(peer = %super::peer_str(self.peer), domains = ?self.authed, "a newer link replaced this one");
+                    Some(Some(StreamError::with_text("conflict", "A newer connection from your server replaced this one.")))
+                }
+                Next::Tick => self.on_tick(idle, auth_limit + verify_limit).await,
             };
             if let Some(err) = end {
                 stream::close(&mut self.writer, err.as_ref()).await;
@@ -368,8 +391,10 @@ impl Link {
         self.authed.insert(d);
     }
 
+    /// `auth_limit`: how long a stream may stay unauthenticated (the sign-in time plus one
+    /// dialback check), however many checks it keeps starting.
     async fn on_tick(&mut self, idle: Duration, auth_limit: Duration) -> Option<End> {
-        if self.authed.is_empty() && self.verifying == 0 && self.since.elapsed() > auth_limit {
+        if self.authed.is_empty() && self.since.elapsed() > auth_limit {
             return Some(Some(StreamError::new("connection-timeout")));
         }
         if self.last_heard.elapsed() > idle {
@@ -414,10 +439,16 @@ impl Link {
     }
 
     /// A stanza from the other server: it must come from a domain this stream proved and be
-    /// for one of ours (RFC 6120 §4.9.3.10, §4.9.3.6).
+    /// for one of ours (RFC 6120 §4.9.3.10, §4.9.3.6), whose settings take stanzas from other
+    /// servers.
     async fn on_stanza(&mut self, el: Element) -> Option<End> {
         if self.authed.is_empty() {
             return Some(Some(StreamError::new("not-authorized")));
+        }
+        // Every stanza counts as handled, refused ones too (XEP-0198 §4), or the peer would send
+        // them again; ones that end the stream don't matter.
+        if let Some(h) = self.sm.as_mut() {
+            *h = h.wrapping_add(1);
         }
         match jid_attr(&el, "from") {
             Ok(Some(f)) if self.authed.contains(f.domain()) => {}
@@ -431,22 +462,42 @@ impl Link {
             Ok(Some(t)) => t,
             Ok(None) => return Some(Some(StreamError::new("improper-addressing"))),
             Err(_) => {
-                // A malformed recipient: an error back, not a dead stream.
-                let err = StanzaError::new(Condition::JidMalformed);
-                let srv = self.srv.clone();
-                tokio::spawn(async move { crate::router::bounce(&srv, &el, err).await });
+                // A malformed recipient: an error back, not a dead stream. It comes from this
+                // server, since the address it named can't be the sender of anything.
+                let mut r = error_reply(&el, &StanzaError::new(Condition::JidMalformed));
+                if let Some(r) = r.as_mut() {
+                    r.set_attr("from", self.local.as_str());
+                }
+                self.refuse(r, &self.local);
                 return None;
             }
         };
         if !self.srv.is_local(to.domain()) {
             return Some(Some(StreamError::with_text("host-unknown", format!("{} isn't served here.", to.domain()))));
         }
+        match inbound(&self.srv, to.domain()) {
+            Inbound::All => {}
+            // Push notifications still go out, so app servers' answers to them come in.
+            Inbound::Answers if el.name() == "iq" && matches!(el.attr("type"), Some("result" | "error")) => {}
+            Inbound::Answers | Inbound::Nothing => {
+                let text = format!("Chatting with other servers is turned off on {}.", to.domain());
+                self.refuse(error_reply(&el, &StanzaError::new(Condition::ServiceUnavailable).with_text(text)), to.domain());
+                return None;
+            }
+        }
         self.srv.count_in();
         crate::router::route(&self.srv, el).await;
-        if let Some(h) = self.sm.as_mut() {
-            *h = h.wrapping_add(1);
-        }
         None
+    }
+
+    /// Sends error `reply` (None for stanzas that get none) back to the server the stanza came
+    /// from, on our link from `local`. Straight onto that link rather than through the router,
+    /// which sends nothing to other servers for a domain with federation off.
+    fn refuse(&self, reply: Option<Element>, local: &str) {
+        let Some(r) = reply else { return };
+        if let Ok(Some(to)) = jid_attr(&r, "to") {
+            self.s2s.enqueue(&self.srv, local, to.domain(), r);
+        }
     }
 
     /// `<db:result/>`: the other server asks to send as `from` to our `to` (XEP-0220 §2.1).
@@ -466,6 +517,8 @@ impl Link {
             deny(StanzaError::new(Condition::PolicyViolation).with_text("This server requires encryption."))
         } else if !self.srv.is_local(&to) {
             deny(StanzaError::new(Condition::ItemNotFound).with_text(format!("{to} isn't served here.")))
+        } else if inbound(&self.srv, &to) == Inbound::Nothing {
+            deny(StanzaError::new(Condition::PolicyViolation).with_text(format!("Chatting with other servers is turned off on {to}.")))
         } else if is_blocked(&cfg, &from) || self.srv.is_local(&from) {
             deny(StanzaError::new(Condition::Forbidden).with_text("This server doesn't talk to yours."))
         } else if self.authed.contains(&from) {
@@ -523,11 +576,24 @@ impl Link {
 
 /// Asks `originating`'s authoritative server whether `key` is its key for a stream to
 /// `receiving` (ours) with id `stream_id`, over a fresh connection to it (XEP-0220 §2.3).
+///
+/// The answer is only as trustworthy as that connection. When the server called back has a
+/// certificate valid for `originating`, it is that domain's real server and the answer stands
+/// (XEP-0344). When it doesn't (a self-signed certificate), the answer comes from whoever
+/// DNS and the network led us to, so an attacker able to redirect this connection can vouch
+/// for any domain: that is all plain dialback promises (XEP-0220, Security Considerations), and the only way servers
+/// with self-signed certificates can federate. `s2s.require_valid_certs` refuses those; with
+/// `s2s.require_tls` the connection is at least encrypted, which keeps passive listeners out.
 async fn verify(s2s: &S2s, srv: &Arc<Server>, receiving: &str, originating: &str, stream_id: &str, key: &str) -> Outcome {
     let mut o = match super::outgoing::open(s2s, srv, receiving, originating).await {
         Ok(o) => o,
         Err(f) => return Outcome::Error(f.err),
     };
+    if !o.verified && srv.config().s2s.require_valid_certs {
+        o.st.close(None).await;
+        let text = format!("The certificate of {originating}'s server can't be verified, and this server requires one.");
+        return Outcome::Error(StanzaError::new(Condition::PolicyViolation).with_text(text));
+    }
     let q = dialback::element("verify", receiving, originating).attr_set("id", stream_id).text(key);
     if o.st.send(&q).await.is_err() {
         return Outcome::Error(StanzaError::new(Condition::RemoteServerNotFound));

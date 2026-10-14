@@ -2,11 +2,13 @@
 //! in either direction. Elements read in jabber:server come out in jabber:client like everything
 //! else in the server, and go back out in jabber:server.
 
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use quark_core::xml::{stream_header, StreamEvent, StreamReader, XmlError};
 use quark_core::{ns, Element};
@@ -64,13 +66,69 @@ impl Io {
 }
 
 pub type Reader = StreamReader<ReadHalf<Io>>;
-pub type Writer = BufWriter<WriteHalf<Io>>;
+pub type Writer = BufWriter<Stalls<WriteHalf<Io>>>;
+
+/// A writer whose writes fail once they've made no progress for `limit`. A peer that stops
+/// reading fills its socket buffers and then every write waits forever; with this the link's
+/// task gets an error instead, closes the link, and its timers and queues aren't held up.
+pub struct Stalls<W> {
+    inner: W,
+    limit: Duration,
+    /// Armed while a write is pending, cleared whenever one goes through.
+    stalled: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<W> Stalls<W> {
+    pub fn new(inner: W, limit: Duration) -> Stalls<W> {
+        Stalls { inner, limit, stalled: None }
+    }
+
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
+    fn check<T>(&mut self, cx: &mut Context<'_>, r: Poll<io::Result<T>>) -> Poll<io::Result<T>> {
+        if r.is_ready() {
+            self.stalled = None;
+            return r;
+        }
+        let limit = self.limit;
+        let sleep = self.stalled.get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+        match sleep.as_mut().poll(cx) {
+            Poll::Ready(()) => {
+                self.stalled = None;
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, "the other server stopped reading")))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for Stalls<W> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let me = self.get_mut();
+        let r = Pin::new(&mut me.inner).poll_write(cx, buf);
+        me.check(cx, r)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        let r = Pin::new(&mut me.inner).poll_flush(cx);
+        me.check(cx, r)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        let r = Pin::new(&mut me.inner).poll_shutdown(cx);
+        me.check(cx, r)
+    }
+}
 
 /// A stream during negotiation; split into a reader and a writer once it's set up.
 pub struct Stream {
     reader: Option<Reader>,
     writer: Option<Writer>,
     max_stanza: u64,
+    /// How long a write may make no progress before it fails.
+    write_limit: Duration,
     pub secure: bool,
     pub peer: Option<SocketAddr>,
     /// The peer's certificate chain after TLS, if it presented one.
@@ -85,7 +143,7 @@ fn tune(tcp: &TcpStream) {
 }
 
 impl Stream {
-    pub fn new(io: Io, max_stanza: u64) -> Stream {
+    pub fn new(io: Io, max_stanza: u64, write_limit: Duration) -> Stream {
         let (peer, secure) = match &io {
             Io::Plain(t) => (t.peer_addr().ok(), false),
             Io::Client(t) => (t.get_ref().0.peer_addr().ok(), true),
@@ -100,7 +158,8 @@ impl Stream {
         let (r, w) = tokio::io::split(io);
         let mut reader = StreamReader::new(r, max_stanza);
         reader.server_ns = true;
-        Stream { reader: Some(reader), writer: Some(BufWriter::with_capacity(8 * 1024, w)), max_stanza, secure, peer, peer_certs }
+        let writer = BufWriter::with_capacity(8 * 1024, Stalls::new(w, write_limit));
+        Stream { reader: Some(reader), writer: Some(writer), max_stanza, write_limit, secure, peer, peer_certs }
     }
 
     fn writer(&mut self) -> io::Result<&mut Writer> {
@@ -173,14 +232,14 @@ impl Stream {
             // Bytes sent before the handshake would be read as if they came encrypted.
             return Err(io::Error::new(io::ErrorKind::InvalidData, "data after <starttls/>"));
         }
-        match reader.into_inner().unsplit(writer.into_inner()) {
+        match reader.into_inner().unsplit(writer.into_inner().into_inner()) {
             Io::Plain(tcp) => Ok(tcp),
             _ => Err(io::Error::other("already encrypted")),
         }
     }
 
     fn reset(&mut self, io: Io) {
-        *self = Stream::new(io, self.max_stanza);
+        *self = Stream::new(io, self.max_stanza, self.write_limit);
     }
 
     /// STARTTLS as the connecting side, with SNI `name`.
@@ -321,5 +380,38 @@ pub async fn read_loop(mut r: Reader, tx: tokio::sync::mpsc::Sender<In>) {
         if tx.send(ev).await.is_err() || done {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn writes_to_a_peer_that_stopped_reading_fail() {
+        // Nobody reads the other end, so the 1 KiB pipe fills and the write can't finish.
+        let (near, _far) = tokio::io::duplex(1024);
+        let mut w = Stalls::new(near, Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let err = w.write_all(&[b'x'; 64 * 1024]).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn writes_that_keep_moving_never_time_out() {
+        let (near, mut far) = tokio::io::duplex(1024);
+        let reader = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut far, &mut buf).await.map(|_| buf.len())
+        });
+        // Each chunk only waits for the reader, never for the whole limit.
+        let mut w = Stalls::new(near, Duration::from_millis(200));
+        for _ in 0..8 {
+            w.write_all(&[b'x'; 16 * 1024]).await.unwrap();
+        }
+        w.shutdown().await.unwrap();
+        drop(w);
+        assert_eq!(reader.await.unwrap().unwrap(), 8 * 16 * 1024);
     }
 }

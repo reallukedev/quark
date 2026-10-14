@@ -62,6 +62,7 @@ metrics = true                            # /metrics for loopback and private ad
 
 [s2s]
 require_tls = true
+require_valid_certs = false   # true: only servers whose certificate verifies (no self-signed)
 idle_secs = 900
 blocked = ["spam.example"]
 

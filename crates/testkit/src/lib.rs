@@ -181,6 +181,10 @@ impl TestServer {
         let mut c = self.login_as(user, password, resource).await?;
         c.iq_get(None, Element::new("query", ns::ROSTER)).await?;
         c.send(&Element::new("presence", ns::CLIENT)).await?;
+        // The server echoes initial presence to the sender (RFC 6121 §4.2.2); take it here so
+        // tests start from a quiet stream.
+        let me = c.jid.clone();
+        c.expect(|e| e.name() == "presence" && e.attr("from") == me.as_deref() && e.attr("type").is_none()).await?;
         Ok(c)
     }
 }

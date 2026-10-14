@@ -31,11 +31,14 @@ async fn initial_presence_goes_to_subscribers_and_own_resources_only() -> anyhow
 #[tokio::test]
 async fn initial_presence_is_echoed_to_the_sending_resource() -> anyhow::Result<()> {
     let s = server(&["alice"]).await?;
-    let mut phone = s.online("alice", PW, "phone").await?;
+    // `online()` itself waits for this echo, so send initial presence by hand here.
+    let mut phone = s.login_as("alice", PW, "phone").await?;
+    phone.send(&Element::new("presence", ns::CLIENT)).await?;
     // §4.2.2: "to all of the user's available resources, including the resource that generated
     // the presence notification in the first place".
     expect_presence(&mut phone, &full("alice", "phone"), "available").await?;
-    let mut tablet = s.online("alice", PW, "tablet").await?;
+    let mut tablet = s.login_as("alice", PW, "tablet").await?;
+    tablet.send(&Element::new("presence", ns::CLIENT)).await?;
     expect_presence(&mut tablet, &full("alice", "tablet"), "available").await?;
     expect_presence(&mut phone, &full("alice", "tablet"), "available").await?;
     Ok(())

@@ -374,7 +374,7 @@ impl Negotiation {
                 Ok(None)
             }
             _ if !t.secure() && cfg.tls.require_c2s && el.ns() != ns::TLS => {
-                Err(Some(StreamError::with_text("policy-violation", "Use TLS first (STARTTLS).")))
+                Err(Some(StreamError::with_text("policy-violation", if t.can_starttls() { "Use TLS first (STARTTLS)." } else { "This server only accepts encrypted connections." })))
             }
             (ns::SASL, "auth") if self.user.is_none() => {
                 self.sasl2 = None;

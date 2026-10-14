@@ -332,7 +332,7 @@ impl State {
                 return false;
             }
         };
-        self.contacts.lock().insert(key, (yes, Instant::now()));
+        self.contacts.lock().put(key, (yes, Instant::now()));
         yes
     }
 

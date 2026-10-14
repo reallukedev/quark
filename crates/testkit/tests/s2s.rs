@@ -829,3 +829,64 @@ async fn blocked_subdomains_bounce_like_blocked_domains() -> anyhow::Result<()> 
     assert_eq!(a.srv.remote().unwrap().counts(), (0, 0));
     Ok(())
 }
+
+/// The text of the error in a dialback answer.
+fn dialback_error_text(r: &Element) -> Option<String> {
+    r.children().find(|c| c.name() == "error")?.child_text("text", ns::STANZAS)
+}
+
+#[tokio::test]
+async fn dialback_never_calls_back_to_private_addresses_and_fails_the_same_way() -> anyhow::Result<()> {
+    let (_a, b) = plain_pair("").await?;
+    // down.test is routed to a closed port: an explicit route is followed and simply fails.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    b.route("down.test", &closed.to_string())?;
+    let mut texts = Vec::new();
+    // 127.0.0.1 and [::1] name loopback as their own domain, with no route: b.test must not
+    // connect there, and the asker can't tell that apart from a server that's down.
+    for d in ["127.0.0.1", "[::1]", "down.test"] {
+        let mut raw = Raw::connect(b.s2s()).await?;
+        raw.open(d, B).await?;
+        raw.send(&quark::s2s::dialback::element("result", d, B).text("0123456789abcdef")).await?;
+        let r = raw.recv().await?;
+        assert!(r.is("result", ns::DIALBACK) && r.attr("type") == Some("error"), "{r}");
+        texts.push(dialback_error_text(&r).map(|t| t.replace(d, "X")));
+    }
+    assert_eq!(texts[0].as_deref(), Some("Couldn't check the key with X's server."));
+    assert!(texts.iter().all(|t| t == &texts[0]), "{texts:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn with_only_push_on_other_servers_cant_send_iq_answers_to_sessions() -> anyhow::Result<()> {
+    let (_a, b) = plain_pair("").await?;
+    b.add_user("bob", "password-b").await?;
+    let mut bob = b.online("bob", "password-b", "laptop").await?;
+    b.set_settings(|s| s.federation = false).await?;
+    let mut raw = Raw::connect(b.s2s()).await?;
+    raw.dialback_as_a(&b).await?;
+    // Not an answer to anything b.test asked: dropped, not handed to bob's session.
+    for to in ["bob@b.test/laptop", "bob@b.test"] {
+        let fake = Element::new("iq", ns::SERVER)
+            .attr_set("type", "result")
+            .attr_set("id", "guess")
+            .attr_set("from", "x@a.test/r")
+            .attr_set("to", to)
+            .child(Element::new("query", "jabber:iq:version"));
+        raw.send(&fake).await?;
+    }
+    bob.expect_silence(Duration::from_millis(300)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn messages_to_ip_literal_domains_never_reach_loopback() -> anyhow::Result<()> {
+    let a = TestServer::start_with(opts(A, "")).await?;
+    a.add_user("alice", "password-a").await?;
+    let mut alice = a.online("alice", "password-a", "phone").await?;
+    alice.send(&message("x@127.0.0.1", "chat", "hi")).await?;
+    let err = alice.expect(|e| is_message(e) && e.attr("type") == Some("error")).await?;
+    assert_eq!(error_condition(&err).as_deref(), Some("remote-server-not-found"));
+    assert_eq!(error_text(&err).as_deref(), Some("127.0.0.1 points at an address this server doesn't connect to."));
+    Ok(())
+}

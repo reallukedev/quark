@@ -125,10 +125,15 @@ pub struct Session {
     pub presence: Element,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct Bucket {
     tokens: f32,
     at: Instant,
+}
+
+/// What an occupant gets for presence beyond its [`Bucket`].
+fn too_fast() -> StanzaError {
+    err(Condition::ResourceConstraint, "You're changing presence too fast. Wait a moment.")
 }
 
 impl Bucket {
@@ -198,8 +203,9 @@ struct Proxied {
 /// What handling a stanza produced.
 #[derive(Debug, Default)]
 pub struct Out {
-    /// For people in the room (or asking it something), delivered in order.
-    pub send: Vec<Element>,
+    /// For people in the room (or asking it something), delivered in order, each with its
+    /// recipient (so a broadcast never parses the same addresses back out of every copy).
+    pub send: Vec<(Jid, Element)>,
     /// Invitations, declines and private messages: routed like any message to a person, so
     /// they're stored for people who are offline, archived, pushed to sleeping phones and kept
     /// from people who blocked the sender.
@@ -208,6 +214,27 @@ pub struct Out {
     /// The room is gone: destroyed, or temporary and empty.
     pub closed: bool,
     pub delete_archive: bool,
+}
+
+impl Out {
+    /// Queues `el` for `to`, addressing it.
+    pub fn send_to(&mut self, to: &Jid, mut el: Element) {
+        el.set_attr("to", to.to_string());
+        self.send.push((to.clone(), el));
+    }
+
+    /// Queues `el`, already addressed (an IQ answer); dropped when its `to` isn't a JID.
+    pub fn push(&mut self, el: Element) {
+        if let Some(to) = el.attr("to").and_then(|t| Jid::parse(t).ok()) {
+            self.send.push((to, el));
+        }
+    }
+
+    /// The stanzas queued, in order.
+    #[cfg(test)]
+    pub fn sent(&self) -> impl Iterator<Item = &Element> {
+        self.send.iter().map(|(_, e)| e)
+    }
 }
 
 /// A groupchat message checked and ready to go out once it has its stanza id.
@@ -612,18 +639,14 @@ impl Room {
             for other in self.occupants.values().filter(|x| x.nick != o.nick) {
                 let p = if anyone || other.role == Role::Moderator { &full } else { &open };
                 for s in &other.sessions {
-                    let mut p = p.clone();
-                    p.set_attr("to", s.jid.to_string());
-                    out.send.push(p);
+                    out.send_to(&s.jid, p.clone());
                 }
             }
         }
         if !own.is_empty() {
             let mine = self.presence_el(&o.nick, base, spec.unavailable, x(real, true), &o.id);
             for to in own {
-                let mut p = mine.clone();
-                p.set_attr("to", to.to_string());
-                out.send.push(p);
+                out.send_to(to, mine.clone());
             }
         }
     }
@@ -635,13 +658,12 @@ impl Room {
         for o in self.occupants.values().filter(|o| o.nick != except) {
             let Some(primary) = o.primary() else { continue };
             let item = Self::item(self.occ_aff(o), o.role, show_jid.then_some(&primary.jid));
-            let mut p = self.presence_el(&o.nick, Some(&primary.presence), false, Element::new("x", ns::MUC_USER).child(item), &o.id);
-            p.set_attr("to", to.to_string());
-            out.send.push(p);
+            let p = self.presence_el(&o.nick, Some(&primary.presence), false, Element::new("x", ns::MUC_USER).child(item), &o.id);
+            out.send_to(to, p);
         }
     }
 
-    fn subject_message(&self, to: &Jid) -> Element {
+    fn subject_message(&self) -> Element {
         let from = match self.subject.as_ref().and_then(|s| s.nick.as_deref()) {
             Some(n) => self.occ_jid(n).to_string(),
             None => self.jid.to_string(),
@@ -650,17 +672,15 @@ impl Room {
         Element::new("message", ns::CLIENT)
             .attr_set("type", "groupchat")
             .attr_set("from", from)
-            .attr_set("to", to.to_string())
             .attr_set("id", quark_core::new_id())
             .child(Element::new("subject", ns::CLIENT).text(text))
     }
 
-    fn avatar_presence(&self, to: &Jid) -> Option<Element> {
+    fn avatar_presence(&self) -> Option<Element> {
         let hash = self.avatar_hash.as_ref()?;
         Some(
             Element::new("presence", ns::CLIENT)
                 .attr_set("from", self.jid.to_string())
-                .attr_set("to", to.to_string())
                 .child(Element::new("x", ns::VCARD_UPDATE).text_child("photo", ns::VCARD_UPDATE, hash.as_str())),
         )
     }
@@ -687,17 +707,16 @@ impl Room {
     }
 
     fn send_join_state(&self, to: &Jid, lim: HistoryLimits, out: &mut Out) {
-        if let Some(p) = self.avatar_presence(to) {
-            out.send.push(p);
+        if let Some(p) = self.avatar_presence() {
+            out.send_to(to, p);
         }
         let room = self.jid.to_string();
         for h in self.select_history(lim) {
             let mut m = h.msg.clone();
-            m.set_attr("to", to.to_string());
             m.append(quark_core::stanza::delay(&room, h.stamp));
-            out.send.push(m);
+            out.send_to(to, m);
         }
-        out.send.push(self.subject_message(to));
+        out.send_to(to, self.subject_message());
     }
 
     /// Someone enters (XEP-0045 §7.2), or another of their devices joins under the same nick.
@@ -829,6 +848,11 @@ impl Room {
         let rejoin = presence.has_child("x", ns::MUC);
         let Some(o) = self.occupants.get_mut(&cur) else { return Ok(()) };
         let allowed = o.bucket.take();
+        // A re-join sends the whole roster and the history back: the most expensive presence
+        // there is, so it's refused (the client stays in) rather than answered in full.
+        if rejoin && !allowed {
+            return Err(too_fast());
+        }
         if let Some(i) = o.sessions.iter().position(|s| s.jid == *from) {
             let mut s = o.sessions.remove(i);
             s.presence = base;
@@ -866,6 +890,16 @@ impl Room {
         if self.reserved_by_other(nick, &bare) {
             return Err(err(Condition::Conflict, "That nickname is reserved by someone else."));
         }
+        // Every rename is broadcast twice to the whole room, so it costs from the same budget
+        // as messages; a refused one leaves the old nickname in place (§7.6.3).
+        let Some(o) = self.occupants.get_mut(cur) else { return Ok(()) };
+        if !o.bucket.take() {
+            return Err(too_fast());
+        }
+        // A device moving to a new nickname takes the budget along, or hopping between
+        // nicknames would get a fresh one each time.
+        let bucket = o.bucket;
+        let Some(o) = self.occupants.get(cur) else { return Ok(()) };
         let mut base = presence.clone();
         base.remove_children(room_owned);
         let sole = o.sessions.len() == 1 && !self.occupants.contains_key(nick);
@@ -910,7 +944,7 @@ impl Room {
                 id,
                 sessions: Vec::new(),
                 admin,
-                bucket: Bucket::new(),
+                bucket,
                 voice_asked: None,
             });
             o.sessions.push(s);
@@ -1126,9 +1160,7 @@ impl Room {
         }
         for o in self.occupants.values() {
             for s in &o.sessions {
-                let mut m = p.msg.clone();
-                m.set_attr("to", s.jid.to_string());
-                out.send.push(m);
+                out.send_to(&s.jid, p.msg.clone());
             }
         }
         if let Some(text) = p.subject.take() {
@@ -1351,9 +1383,7 @@ impl Room {
             Element::new("message", ns::CLIENT).attr_set("from", self.jid.to_string()).attr_set("id", quark_core::new_id()).child(form);
         for m in self.occupants.values().filter(|o| o.role == Role::Moderator) {
             for s in &m.sessions {
-                let mut x = msg.clone();
-                x.set_attr("to", s.jid.to_string());
-                out.send.push(x);
+                out.send_to(&s.jid, msg.clone());
             }
         }
         Ok(())
@@ -1514,8 +1544,7 @@ impl Room {
             return Err(err(Condition::BadRequest, "Send between one and a hundred items."));
         }
         let mut plan = Vec::with_capacity(items.len());
-        let mut owners: Vec<Jid> =
-            self.affiliations.iter().filter(|(_, a)| a.affiliation == Affiliation::Owner).map(|(j, _)| j.clone()).collect();
+        let mut affs: Vec<(Jid, Affiliation)> = Vec::new();
         for it in items {
             let reason = it.child_text("reason", ns::MUC_ADMIN);
             if let Some(a) = it.attr("affiliation") {
@@ -1529,12 +1558,7 @@ impl Room {
                         .ok_or_else(|| err(Condition::ItemNotFound, "There's nobody with that nickname here."))?,
                     (None, None) => return Err(err(Condition::BadRequest, "Say whose affiliation to change.")),
                 };
-                let old = self.aff(&jid, false);
-                check_affiliation_change(actor_aff, old, aff)?;
-                owners.retain(|o| *o != jid);
-                if aff == Affiliation::Owner {
-                    owners.push(jid.clone());
-                }
+                affs.push((jid.clone(), aff));
                 plan.push(Change::Aff { jid, aff, reason });
             } else if let Some(r) = it.attr("role") {
                 let role = Role::parse(r).ok_or_else(|| err(Condition::BadRequest, "That isn't a role."))?;
@@ -1546,36 +1570,7 @@ impl Room {
                 return Err(err(Condition::BadRequest, "Each item needs a role or an affiliation."));
             }
         }
-        let had_owner = self.affiliations.values().any(|a| a.affiliation == Affiliation::Owner);
-        if had_owner && owners.is_empty() {
-            return Err(err(Condition::Conflict, "A group chat needs at least one owner."));
-        }
-        // Bans and everything else have limits of their own, so a full member list (people can
-        // register themselves) never stops a ban. A change that shrinks a list is always fine.
-        let (standing, bans) = self.affiliation_counts();
-        let (mut standing_after, mut bans_after) = (standing, bans);
-        let mut planned: HashMap<&Jid, Affiliation> = HashMap::new();
-        for c in &plan {
-            if let Change::Aff { jid, aff, .. } = c {
-                let before =
-                    planned.get(jid).copied().unwrap_or_else(|| self.affiliations.get(jid).map_or(Affiliation::None, |a| a.affiliation));
-                for (a, delta) in [(before, -1isize), (*aff, 1)] {
-                    let slot = match a {
-                        Affiliation::None => continue,
-                        Affiliation::Outcast => &mut bans_after,
-                        _ => &mut standing_after,
-                    };
-                    *slot = slot.saturating_add_signed(delta);
-                }
-                planned.insert(jid, *aff);
-            }
-        }
-        if standing_after > standing && standing_after > MAX_AFFILIATIONS {
-            return Err(err(Condition::ResourceConstraint, "This group chat has too many members."));
-        }
-        if bans_after > bans && bans_after > MAX_BANS {
-            return Err(err(Condition::ResourceConstraint, "This group chat has banned as many people as it can; lift some bans first."));
-        }
+        self.check_affiliations(actor_aff, &affs)?;
         let actor = actor_nick.as_deref();
         for c in plan {
             match c {
@@ -1595,10 +1590,101 @@ impl Room {
         Ok(())
     }
 
+    /// Checks a batch of affiliation changes by someone with `actor_aff` before any is made:
+    /// each is one they may make, the room keeps an owner, and the lists stay within their
+    /// limits. Bans and everything else have limits of their own, so a full member list (people
+    /// can register themselves) never stops a ban; a change that shrinks a list is always fine.
+    fn check_affiliations(&self, actor_aff: Affiliation, changes: &[(Jid, Affiliation)]) -> Result<(), StanzaError> {
+        let mut owners: Vec<&Jid> = self.affiliations.iter().filter(|(_, a)| a.affiliation == Affiliation::Owner).map(|(j, _)| j).collect();
+        let (standing, bans) = self.affiliation_counts();
+        let (mut standing_after, mut bans_after) = (standing, bans);
+        let mut planned: HashMap<&Jid, Affiliation> = HashMap::new();
+        for (jid, aff) in changes {
+            check_affiliation_change(actor_aff, self.aff(jid, false), *aff)?;
+            owners.retain(|o| *o != jid);
+            if *aff == Affiliation::Owner {
+                owners.push(jid);
+            }
+            let before =
+                planned.get(jid).copied().unwrap_or_else(|| self.affiliations.get(jid).map_or(Affiliation::None, |a| a.affiliation));
+            for (a, delta) in [(before, -1isize), (*aff, 1)] {
+                let slot = match a {
+                    Affiliation::None => continue,
+                    Affiliation::Outcast => &mut bans_after,
+                    _ => &mut standing_after,
+                };
+                *slot = slot.saturating_add_signed(delta);
+            }
+            planned.insert(jid, *aff);
+        }
+        let had_owner = self.affiliations.values().any(|a| a.affiliation == Affiliation::Owner);
+        if had_owner && owners.is_empty() {
+            return Err(err(Condition::Conflict, "A group chat needs at least one owner."));
+        }
+        if standing_after > standing && standing_after > MAX_AFFILIATIONS {
+            return Err(err(Condition::ResourceConstraint, "This group chat has too many members."));
+        }
+        if bans_after > bans && bans_after > MAX_BANS {
+            return Err(err(Condition::ResourceConstraint, "This group chat has banned as many people as it can; lift some bans first."));
+        }
+        Ok(())
+    }
+
+    /// The affiliation changes the owner and admin lists of a submitted configuration form ask
+    /// for (XEP-0045 §10.2: each is the full list). A list left out changes nothing, nor does an
+    /// empty owner list (a room always has an owner; some clients send the field back blank).
+    /// Someone dropped from a list loses that affiliation; on both lists, owner wins.
+    fn form_affiliations(&self, v: &crate::modules::forms::Values) -> Result<Vec<(Jid, Affiliation)>, StanzaError> {
+        let list = |var: &str| -> Result<Option<Vec<Jid>>, StanzaError> {
+            if !v.has(var) {
+                return Ok(None);
+            }
+            let vals = v.all(var);
+            if vals.len() > MAX_ITEMS_PER_REQUEST {
+                return Err(err(Condition::NotAcceptable, "That's too many owners or admins for the settings form; use the member list."));
+            }
+            let mut out: Vec<Jid> = Vec::with_capacity(vals.len());
+            for s in vals.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                let j = Jid::parse(s).map_err(|_| err(Condition::JidMalformed, &format!("\"{s}\" isn't a valid address.")))?.to_bare();
+                if !out.contains(&j) {
+                    out.push(j);
+                }
+            }
+            Ok(Some(out))
+        };
+        let owners = list("muc#roomconfig_roomowners")?.filter(|o| !o.is_empty());
+        let admins = list("muc#roomconfig_roomadmins")?;
+        let listed = |l: &Option<Vec<Jid>>, j: &Jid| l.as_ref().map(|l| l.contains(j));
+        // Everyone either list could change: those on them now and those named.
+        let mut everyone: std::collections::BTreeSet<Jid> = self
+            .affiliations
+            .iter()
+            .filter(|(_, e)| matches!(e.affiliation, Affiliation::Owner | Affiliation::Admin))
+            .map(|(j, _)| j.clone())
+            .collect();
+        everyone.extend(owners.iter().chain(admins.iter()).flatten().cloned());
+        let mut changes = Vec::new();
+        for j in everyone {
+            let now = self.aff(&j, false);
+            let next = match (listed(&owners, &j), listed(&admins, &j)) {
+                (Some(true), _) => Affiliation::Owner,
+                (_, Some(true)) if now != Affiliation::Owner || owners.is_some() => Affiliation::Admin,
+                (Some(false), _) if now == Affiliation::Owner => Affiliation::None,
+                (_, Some(false)) if now == Affiliation::Admin => Affiliation::None,
+                _ => now,
+            };
+            if next != now {
+                changes.push((j, next));
+            }
+        }
+        Ok(changes)
+    }
+
     /// Sets an affiliation and applies it to anyone in the room under that address.
     pub fn set_affiliation(&mut self, jid: &Jid, aff: Affiliation, reason: Option<String>, actor: Option<&str>, out: &mut Out) {
         let prev = self.affiliations.remove(jid);
-        if aff != Affiliation::None || prev.as_ref().is_some_and(|p| p.nick.is_some() && aff >= Affiliation::Member) {
+        // None means no entry at all; a reserved nickname only stays with members and up.
+        if aff != Affiliation::None {
             let (nick, last_nick) = prev.map_or((None, None), |p| (p.nick, p.last_nick));
             let nick = if aff >= Affiliation::Member { nick } else { None };
             self.affiliations.insert(jid.clone(), AffEntry { affiliation: aff, reason: reason.clone(), nick, last_nick });
@@ -1620,10 +1706,13 @@ impl Room {
 
     // ---------------------------------------------------------------- owner (XEP-0045 §10)
 
-    /// Applies a submitted configuration form.
+    /// Applies a submitted configuration form, owner and admin lists included. Only owners
+    /// submit it (the service checks), so they may make any change but removing the last owner.
     pub fn configure(&mut self, v: &crate::modules::forms::Values, out: &mut Out) -> Result<(), StanzaError> {
         let was_persistent = self.config.persistent;
         // A form that's refused leaves everything as it was, a new room still locked included.
+        let affs = self.form_affiliations(v)?;
+        self.check_affiliations(Affiliation::Owner, &affs)?;
         let changes = self.config.apply(v).map_err(|t| err(Condition::NotAcceptable, &t))?;
         let was_locked = self.locked_since.take().is_some();
         if self.config.persistent && !was_persistent {
@@ -1643,10 +1732,12 @@ impl Room {
                 for s in &o.sessions {
                     let mut m = note.clone();
                     m.set_attr("id", quark_core::new_id());
-                    m.set_attr("to", s.jid.to_string());
-                    out.send.push(m);
+                    out.send_to(&s.jid, m);
                 }
             }
+        }
+        for (jid, aff) in affs {
+            self.set_affiliation(&jid, aff, None, None, out);
         }
         if changes.became_members_only {
             let out_now: Vec<String> = self
@@ -1802,13 +1893,10 @@ impl Room {
             .child(Element::new("x", ns::MUC_USER).child(Element::new("status", ns::MUC_USER).attr_set("code", "104")));
         for o in self.occupants.values() {
             for s in &o.sessions {
-                let mut x = p.clone();
-                x.set_attr("to", s.jid.to_string());
-                out.send.push(x);
+                out.send_to(&s.jid, p.clone());
                 let mut m = note.clone();
-                m.set_attr("to", s.jid.to_string());
                 m.set_attr("id", quark_core::new_id());
-                out.send.push(m);
+                out.send_to(&s.jid, m);
             }
         }
     }
@@ -1951,13 +2039,13 @@ mod tests {
         let mut r = room();
         join(&mut r, "a@x/1", "alice").unwrap();
         let out = join(&mut r, "b@x/1", "bob").unwrap();
-        let to_bob: Vec<&Element> = out.send.iter().filter(|e| e.attr("to") == Some("b@x/1")).collect();
+        let to_bob: Vec<&Element> = out.sent().filter(|e| e.attr("to") == Some("b@x/1")).collect();
         assert_eq!(to_bob[0].attr("from"), Some("tea@rooms.x/alice"));
         assert_eq!(to_bob[1].attr("from"), Some("tea@rooms.x/bob"));
         assert!(codes(to_bob[1]).contains(&"110".to_string()));
         assert!(to_bob.last().unwrap().has_child("subject", ns::CLIENT));
         // Alice hears about bob, without his address (semi-anonymous) or 110.
-        let to_alice: Vec<&Element> = out.send.iter().filter(|e| e.attr("to") == Some("a@x/1")).collect();
+        let to_alice: Vec<&Element> = out.sent().filter(|e| e.attr("to") == Some("a@x/1")).collect();
         assert_eq!(to_alice.len(), 1);
         let item = to_alice[0].get_child("x", ns::MUC_USER).unwrap().get_child("item", ns::MUC_USER).unwrap();
         assert_eq!(item.attr("jid"), None);
@@ -1973,13 +2061,125 @@ mod tests {
         assert_eq!(r.occupant_count(), 1);
         assert_eq!(r.occupant("alice").unwrap().sessions.len(), 2);
         // The phone hears the updated self-presence.
-        assert!(out.send.iter().any(|e| e.attr("to") == Some("a@x/phone") && codes(e).contains(&"110".to_string())));
+        assert!(out.sent().any(|e| e.attr("to") == Some("a@x/phone") && codes(e).contains(&"110".to_string())));
         // One device leaving keeps the occupant.
         let mut out = Out::default();
         r.leave(&j("a@x/laptop"), None, &[], &mut out);
         assert_eq!(r.occupant_count(), 1);
-        let gone = out.send.iter().find(|e| e.attr("to") == Some("a@x/laptop")).unwrap();
+        let gone = out.sent().find(|e| e.attr("to") == Some("a@x/laptop")).unwrap();
         assert_eq!(gone.attr("type"), Some("unavailable"));
+    }
+
+    fn presence_again(r: &mut Room, from: &str, nick: &str, rejoin: bool) -> Result<Out, StanzaError> {
+        let mut p = Element::new("presence", ns::CLIENT);
+        if rejoin {
+            p.append(Element::new("x", ns::MUC));
+        }
+        let mut out = Out::default();
+        r.presence_from_occupant(&j(from), nick, &p, 1000, &mut out)?;
+        Ok(out)
+    }
+
+    #[test]
+    fn nick_changes_and_rejoins_cost_from_the_rate_limit() {
+        let mut r = room();
+        join(&mut r, "a@x/1", "alice").unwrap();
+        join(&mut r, "b@x/1", "bob").unwrap();
+        // Hopping between nicknames runs out like any other burst, and the last rename sticks.
+        let mut refused = None;
+        for i in 0..100 {
+            let cur = r.occupant_of(&j("b@x/1")).map(|o| o.nick.clone()).unwrap();
+            let next = format!("bob{i}");
+            if let Err(e) = presence_again(&mut r, "b@x/1", &next, false) {
+                refused = Some((i, e.condition, cur));
+                break;
+            }
+        }
+        let (i, cond, cur) = refused.expect("renames are limited");
+        assert!(i <= BURST as usize + 1, "{i}");
+        assert_eq!(cond, Condition::ResourceConstraint);
+        assert_eq!(r.occupant_of(&j("b@x/1")).map(|o| o.nick.clone()), Some(cur), "a refused rename keeps the old nick");
+        // Re-joins (roster and history again) are limited too, and send nothing when refused.
+        let mut refused = false;
+        for _ in 0..100 {
+            match presence_again(&mut r, "a@x/1", "alice", true) {
+                Ok(out) => assert!(!out.send.is_empty()),
+                Err(e) => {
+                    assert_eq!(e.condition, Condition::ResourceConstraint);
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused, "re-joins are limited");
+        assert!(r.occupant_of(&j("a@x/1")).is_some(), "a refused re-join stays in the room");
+    }
+
+    #[test]
+    fn a_device_moving_to_a_new_nick_takes_its_budget_along() {
+        let mut r = room();
+        join(&mut r, "a@x/phone", "alice").unwrap();
+        join(&mut r, "a@x/laptop", "alice").unwrap();
+        // The laptop alternates between two nicknames; the phone stays, so each move makes a
+        // new occupant, which must not come with a full budget.
+        let mut moved = 0;
+        for i in 0..100 {
+            let nick = if i % 2 == 0 { "away" } else { "alice" };
+            if presence_again(&mut r, "a@x/laptop", nick, false).is_err() {
+                break;
+            }
+            moved += 1;
+        }
+        assert!(moved < 100, "moves between nicknames are limited");
+    }
+
+    fn config_form(fields: &[(&str, &[&str])]) -> crate::modules::forms::Values {
+        let mut x = Element::new("x", ns::DATA_FORMS).attr_set("type", "submit");
+        for (var, vals) in fields {
+            let mut f = Element::new("field", ns::DATA_FORMS).attr_set("var", *var);
+            for v in *vals {
+                f.append(Element::new("value", ns::DATA_FORMS).text(*v));
+            }
+            x.append(f);
+        }
+        crate::modules::forms::Values::parse(&x)
+    }
+
+    fn aff_of(r: &Room, jid: &str) -> Affiliation {
+        r.aff(&j(jid), false)
+    }
+
+    #[test]
+    fn the_config_form_sets_owners_and_admins() {
+        let mut r = room();
+        r.set_affiliation(&j("a@x"), Affiliation::Owner, None, None, &mut Out::default());
+        let (owners, admins) = ("muc#roomconfig_roomowners", "muc#roomconfig_roomadmins");
+        r.configure(&config_form(&[(owners, &["a@x", "c@x/phone"]), (admins, &["d@x"])]), &mut Out::default()).unwrap();
+        assert_eq!((aff_of(&r, "a@x"), aff_of(&r, "c@x"), aff_of(&r, "d@x")), (Affiliation::Owner, Affiliation::Owner, Affiliation::Admin));
+        // Each list is the full list: a dropped owner listed as admin moves down, a dropped admin
+        // loses the affiliation.
+        r.configure(&config_form(&[(owners, &["c@x"]), (admins, &["a@x"])]), &mut Out::default()).unwrap();
+        assert_eq!((aff_of(&r, "a@x"), aff_of(&r, "c@x"), aff_of(&r, "d@x")), (Affiliation::Admin, Affiliation::Owner, Affiliation::None));
+        // Lists left out, or an owner list sent back blank, change nothing; an owner named only
+        // as admin (no owner list) stays owner.
+        r.configure(&config_form(&[("muc#roomconfig_roomname", &["Tea"])]), &mut Out::default()).unwrap();
+        r.configure(&config_form(&[(owners, &[]), (admins, &["a@x", "c@x"])]), &mut Out::default()).unwrap();
+        assert_eq!((aff_of(&r, "a@x"), aff_of(&r, "c@x")), (Affiliation::Admin, Affiliation::Owner));
+        // A bad address refuses the whole form, the other settings included.
+        let e = r.configure(&config_form(&[("muc#roomconfig_roomname", &["Coffee"]), (owners, &["not an address@"])]), &mut Out::default());
+        assert_eq!(e.unwrap_err().condition, Condition::JidMalformed);
+        assert_eq!(r.config.name.as_deref(), Some("Tea"));
+    }
+
+    #[test]
+    fn the_config_form_cant_leave_a_room_without_an_owner() {
+        let mut r = room();
+        r.set_affiliation(&j("a@x"), Affiliation::Owner, None, None, &mut Out::default());
+        // Moving the only owner to the admin list with nobody else as owner isn't possible
+        // through the form (a blank owner list changes nothing), but the shared check stands.
+        assert_eq!(r.check_affiliations(Affiliation::Owner, &[(j("a@x"), Affiliation::Admin)]).unwrap_err().condition, Condition::Conflict);
+        r.configure(&config_form(&[("muc#roomconfig_roomowners", &[]), ("muc#roomconfig_roomadmins", &[])]), &mut Out::default()).unwrap();
+        assert_eq!(aff_of(&r, "a@x"), Affiliation::Owner);
     }
 
     #[test]
@@ -2004,7 +2204,7 @@ mod tests {
         let mut out = Out::default();
         r.set_affiliation(&j("a@x"), Affiliation::Outcast, Some("spam".into()), None, &mut out);
         assert_eq!(r.occupant_count(), 0);
-        assert!(out.send.iter().any(|e| codes(e).contains(&"301".to_string())));
+        assert!(out.sent().any(|e| codes(e).contains(&"301".to_string())));
         r.config.members_only = false;
         assert_eq!(join(&mut r, "a@x/2", "alice").unwrap_err().condition, Condition::Forbidden);
     }
@@ -2057,7 +2257,7 @@ mod tests {
         let mut out = Out::default();
         r.commit_message(p, Some("sid1".into()), 5, &mut out);
         assert_eq!(out.send.len(), 2, "both occupants, the sender included");
-        assert!(out.send.iter().all(|m| m.get_child("stanza-id", ns::SID).and_then(|s| s.attr("id")) == Some("sid1")));
+        assert!(out.sent().all(|m| m.get_child("stanza-id", ns::SID).and_then(|s| s.attr("id")) == Some("sid1")));
         assert_eq!(r.prepare_message(&j("c@x/1"), &msg).unwrap_err().condition, Condition::NotAcceptable);
     }
 
@@ -2257,10 +2457,10 @@ mod tests {
         let from = j("a@x/1");
         r.join(Join { from: &from, nick: "alice", presence: &p, admin: false, created: false, now: 0 }, &mut out).unwrap();
         join(&mut r, "b@x/1", "bob").unwrap();
-        assert!(out.send.iter().all(|e| !e.has_child("hats", HATS)));
+        assert!(out.sent().all(|e| !e.has_child("hats", HATS)));
         let mut out = Out::default();
         r.send_roster(&j("b@x/1"), "bob", &mut out);
-        assert!(!out.send.is_empty() && out.send.iter().all(|e| !e.has_child("hats", HATS)));
+        assert!(!out.send.is_empty() && out.sent().all(|e| !e.has_child("hats", HATS)));
     }
 
     #[test]
@@ -2276,7 +2476,7 @@ mod tests {
         assert_eq!(r.admin_set(&j("b@x/1"), false, &kick("owner"), &mut out).unwrap_err().condition, Condition::Forbidden);
         r.admin_set(&j("o@x/1"), false, &kick("bob"), &mut out).unwrap();
         assert!(r.occupant("bob").is_none());
-        let to_bob = out.send.iter().find(|e| e.attr("to") == Some("b@x/1")).unwrap();
+        let to_bob = out.sent().find(|e| e.attr("to") == Some("b@x/1")).unwrap();
         assert!(codes(to_bob).contains(&"307".to_string()));
         // The last owner can't step down.
         let q = Element::new("query", ns::MUC_ADMIN)

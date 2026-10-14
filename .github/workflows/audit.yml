@@ -5,6 +5,12 @@ on:
   push:
     paths: ["Cargo.lock"]
 
+# audit-check reports through a check run, and opens issues for advisories on scheduled runs.
+permissions:
+  contents: read
+  checks: write
+  issues: write
+
 jobs:
   audit:
     runs-on: ubuntu-latest

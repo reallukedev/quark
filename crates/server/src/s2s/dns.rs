@@ -10,6 +10,8 @@ use hickory_resolver::TokioAsyncResolver;
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 
+use crate::turn::PeerPolicy;
+
 /// The usual server-to-server port.
 pub const DEFAULT_PORT: u16 = 5269;
 /// How long one TCP connect may take.
@@ -139,6 +141,10 @@ pub async fn targets(resolver: &TokioAsyncResolver, route: Option<&str>, domain:
     if domain.ends_with(".invalid") || domain == "invalid" || domain == "localhost" || domain.ends_with(".localhost") {
         return Err(LookupError::NotFound);
     }
+    // An IP literal domain (`192.0.2.1`, `[2001:db8::1]`) has no SRV records to ask for.
+    if let Ok(ip) = domain.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+        return Ok(vec![Target { host: ip.to_string(), port: DEFAULT_PORT, direct_tls: false }]);
+    }
     let (tls, plain) = tokio::join!(srv(resolver, "_xmpps-server._tcp.", domain, true), srv(resolver, "_xmpp-server._tcp.", domain, false));
     merge(domain, tls, plain, |n| rand::random::<u32>() % n)
 }
@@ -210,6 +216,15 @@ pub async fn addrs(resolver: &TokioAsyncResolver, t: &Target) -> Result<Vec<Sock
         Err(e) => return Err(LookupError::Failed(e.to_string())),
     };
     Ok(interleave(ips).into_iter().take(MAX_ADDRS).map(|ip| SocketAddr::new(ip, t.port)).collect())
+}
+
+/// The addresses federation may connect to without a configured route: public ones, plus the
+/// networks in `s2s.allow_networks`. Whoever controls a domain's DNS (or names an IP literal
+/// domain) chooses where we connect, so without this a server asking for dialback, or a user
+/// messaging `x@127.0.0.1`, could make this server probe its own loopback services, the LAN or
+/// a cloud metadata endpoint, on any port.
+pub fn reachable(policy: &PeerPolicy, addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    addrs.into_iter().filter(|a| policy.allows(a.ip())).collect()
 }
 
 /// IPv6 first, then alternating families (RFC 8305 §4).
@@ -360,6 +375,23 @@ mod tests {
         assert_eq!(to_ascii("bücher.test").as_deref(), Some("xn--bcher-kva.test"));
         assert_eq!(to_ascii("B.Test").as_deref(), Some("b.test"));
         assert_eq!(to_ascii("xn--bcher-kva.test").as_deref(), Some("xn--bcher-kva.test"));
+    }
+
+    #[test]
+    fn federation_only_reaches_public_addresses_unless_allowed() {
+        let a = |s: &str| SocketAddr::new(s.parse().unwrap(), 5269);
+        let all = ["127.0.0.1", "::1", "10.0.0.5", "192.168.1.1", "169.254.169.254", "fe80::1", "::ffff:127.0.0.1", "8.8.8.8", "2a00::1"];
+        let strict = PeerPolicy::public_only(Vec::new());
+        assert_eq!(reachable(&strict, all.iter().map(|s| a(s)).collect()), [a("8.8.8.8"), a("2a00::1")]);
+        let lan = PeerPolicy::public_only(vec!["10.0.0.0/8".parse().unwrap()]);
+        assert_eq!(reachable(&lan, vec![a("10.0.0.5"), a("192.168.1.1")]), [a("10.0.0.5")]);
+    }
+
+    #[tokio::test]
+    async fn ip_literal_domains_skip_dns() {
+        let r = TokioAsyncResolver::tokio(Default::default(), Default::default());
+        assert_eq!(targets(&r, None, "127.0.0.1").await.unwrap()[0].host, "127.0.0.1");
+        assert_eq!(targets(&r, None, "[::1]").await.unwrap()[0].host, "::1");
     }
 
     #[tokio::test]

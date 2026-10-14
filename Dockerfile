@@ -1,9 +1,13 @@
 # Quark, the XMPP server, in one small image.
 #   docker build -t quark .
 #   docker run -e QUARK_DOMAIN=chat.example.com -e QUARK_ADMINS=you@chat.example.com \
+#     -e QUARK_TURN_EXTERNAL_IP=203.0.113.7 \
 #     -v quark-config:/etc/quark -v quark-data:/var/lib/quark \
 #     -p 5222:5222 -p 5223:5223 -p 5269:5269 -p 5280:5280 -p 3478:3478/udp -p 3478:3478 \
 #     -p 49160-49200:49160-49200/udp quark
+# QUARK_TURN_EXTERNAL_IP is the host's public IP: inside the container the call relay only sees
+# its bridge address, which phones can't reach, so calls through the relay fail without it.
+# A reverse proxy in another container must be listed in [http] trusted_proxies (docs/config.md).
 
 FROM rust:1-slim-bookworm AS build
 WORKDIR /src

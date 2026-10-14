@@ -17,6 +17,7 @@ seeds them for a domain Quark hasn't seen before.
 | `QUARK_ADMINS` | Comma-separated admin JIDs (each added to its domain). |
 | `QUARK_DATA_DIR` | Overrides `server.data_dir`. |
 | `QUARK_LOG` | Overrides `server.log` (a `tracing` filter, e.g. `quark=debug`). |
+| `QUARK_TURN_EXTERNAL_IP` | Overrides `turn.external_ip`: the public IP the call relay advertises. Needed in Docker and behind NAT. |
 
 ## Reference
 
@@ -58,7 +59,8 @@ self_signed_fallback = true
 [http]
 public_url = "https://chat.example.com"   # default https://<domain>
 admin_api = false                         # POST /admin/api with the token in <data_dir>/admin.token
-metrics = true                            # /metrics for loopback and private addresses (see below)
+trusted_proxies = ["127.0.0.0/8", "::1"]  # reverse proxies whose X-Forwarded-For/-Proto count (see below)
+metrics = true                            # /metrics for loopback, or private clients through a trusted proxy (see below)
 metrics_token = "long-random-string"      # optional: /metrics then needs "Authorization: Bearer <token>", from anywhere
 strip_photo_metadata = false              # strip EXIF/GPS from JPEG uploads (breaks shared file hashes; see below)
 
@@ -67,12 +69,16 @@ require_tls = true
 require_valid_certs = false   # true: only servers whose certificate verifies (no self-signed)
 idle_secs = 900
 blocked = ["spam.example"]
+allow_networks = []           # private networks other servers may be found at through DNS, e.g. ["10.0.0.0/8"]
+
+[s2s.routes]                  # fixed addresses instead of DNS (always followed, private ones too)
+"chat.internal" = "10.0.0.5:5269"   # or "tls://10.0.0.5:5270" for direct TLS
 
 [turn]
 enabled = true
 listen = "0.0.0.0:3478"
 public_host = "turn.example.com"   # optional, defaults to the calls host
-external_ip = "203.0.113.7"        # optional, when behind NAT
+external_ip = "203.0.113.7"        # when behind NAT or in Docker (or QUARK_TURN_EXTERNAL_IP)
 relay_min = 49160
 relay_max = 49200
 
@@ -100,24 +106,53 @@ phones on the same home Wi-Fi either connect directly or, when that fails, meet 
 relayed addresses on this server. Turn it on, or better list the networks in `allow`, only if
 peers really live on a private network the server can route to, such as a VPN.
 
+Without `external_ip`, relayed addresses are advertised at the address the machine uses to reach
+the client. Inside a container or behind NAT that is a private address phones on the internet
+can't reach, so calls that need the relay fail; the server logs a warning the first time it
+hands one out. Set `external_ip` (or `QUARK_TURN_EXTERNAL_IP`) to the public address. The relay
+treats it as one of its own: peers there only reach its relayed ports.
+
 Relayed addresses that never get a permission end after 3 minutes, so the ones phones open while
 setting up a call and don't use give their ports back quickly. The listener on `[::]` also takes
 IPv4 (UDP and TCP). TCP connections must authenticate within 30 seconds and one address (or IPv6
 /64) may have at most 16 open.
 
+### Federation and private addresses
+
+Whoever runs a domain's DNS decides where this server connects when it delivers to that domain
+or checks a dialback key for it. So without a route, federation only connects to public
+addresses: loopback, private, link-local, cloud metadata and reserved ones are skipped, and a
+domain that points only there fails as if it had no server. Otherwise a stranger could make the
+server probe its own machine and network on any port. Servers on a private network federate
+through `[s2s.routes]` or by listing their networks in `allow_networks`.
+
+### Reverse proxies
+
+`X-Forwarded-For` and `X-Forwarded-Proto` are only believed from addresses in
+`trusted_proxies`, by default loopback alone; from anyone else they are ignored, since any client
+could send them. A proxy on another machine or container must be listed, e.g.
+`trusted_proxies = ["172.17.0.0/16"]` for nginx or Caddy in Docker. Being on a private network
+doesn't make an address a proxy: under Docker every client reaches the server from the bridge
+address. The client address decides sign-in and sign-up limits, so list only your proxies.
+
+Each address (or IPv6 /64) may have at most 512 web connections open; trusted proxies, which
+carry everyone's connections, aren't counted.
+
 ### Metrics behind a proxy
 
-Without `metrics_token`, `/metrics` answers direct requests from loopback and private addresses,
-and requests from a proxy on such an address whose `X-Forwarded-For` names a private client. A
-request with other proxy headers (`X-Forwarded-Proto`, `X-Real-IP`, `Forwarded`, `Via`) but no
-`X-Forwarded-For` is refused, since the proxy's own address says nothing about the client. A proxy
-that adds no headers at all (nginx's default `proxy_pass`) looks exactly like a local scraper, so
-if yours forwards `/metrics` that way, set `metrics_token` (or don't route `/metrics` through it).
-With a token set, only the token counts: local requests need it as well.
+Without `metrics_token`, `/metrics` answers direct requests from loopback, and requests from a
+trusted proxy whose `X-Forwarded-For` names a private client. Other private addresses (a
+Prometheus container, the Docker bridge) need the token. A request with other proxy headers
+(`X-Forwarded-Proto`, `X-Real-IP`, `Forwarded`, `Via`) but no `X-Forwarded-For` is refused, since
+the proxy's own address says nothing about the client. A proxy that adds no headers at all
+(nginx's default `proxy_pass`) on loopback looks exactly like a local scraper, so if yours
+forwards `/metrics` that way, set `metrics_token` (or don't route `/metrics` through it). With a
+token set, only the token counts: local requests need it as well.
 
 ### Photo metadata
 
-With `strip_photo_metadata = true`, JPEG uploads lose EXIF (camera, time, GPS), XMP, IPTC and
+With `strip_photo_metadata = true`, JPEG uploads (recognised by their content, whatever name or
+type they're sent with) lose EXIF (camera, time, GPS), XMP, IPTC and
 comments as they stream in (the orientation is kept). It's off by default because the stored file
 then differs from what was sent: clients that share a file's hash and size with its link
 (XEP-0446/0447 stateless file sharing, used by Dino and Gajim) check the download against them and

@@ -88,7 +88,7 @@ impl State {
                 return None;
             }
         };
-        self.avatars.lock().insert(bare.clone(), h.clone());
+        self.avatars.lock().put(bare.clone(), h.clone());
         h
     }
 
@@ -144,7 +144,7 @@ impl State {
         let changed = {
             let mut a = self.avatars.lock();
             let changed = a.get(&bare) != Some(&hash);
-            a.insert(bare.clone(), hash);
+            a.put(bare.clone(), hash);
             changed
         };
         let Some(host) = srv.host(&o.host) else { return };

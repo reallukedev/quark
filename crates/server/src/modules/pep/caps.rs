@@ -1,8 +1,7 @@
 //! Entity capabilities (XEP-0115) for PEP's `+notify` filtering (XEP-0163 §4.3): verification
 //! strings, and bounded caches of what each `ver` says a client wants notifications for.
 
-use std::borrow::Borrow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
@@ -138,51 +137,13 @@ pub fn verify(query: &Element, algo: &str, ver: &str) -> bool {
     B64.encode(digest) == ver
 }
 
-/// A map that forgets its oldest entries past `cap`, for caches remote parties can grow.
-pub struct Bounded<K, V> {
-    map: HashMap<K, V>,
-    order: VecDeque<K>,
-    cap: usize,
-}
+/// A map that forgets the least recently used entries past its size, for caches remote parties
+/// can grow.
+pub type Bounded<K, V> = lru::LruCache<K, V>;
 
-impl<K: Hash + Eq + Clone, V> Bounded<K, V> {
-    pub fn new(cap: usize) -> Self {
-        Bounded { map: HashMap::new(), order: VecDeque::new(), cap: cap.max(1) }
-    }
-
-    pub fn get<Q: Hash + Eq + ?Sized>(&self, k: &Q) -> Option<&V>
-    where
-        K: Borrow<Q>,
-    {
-        self.map.get(k)
-    }
-
-    pub fn insert(&mut self, k: K, v: V) {
-        if let Some(slot) = self.map.get_mut(&k) {
-            *slot = v;
-            return;
-        }
-        while self.map.len() >= self.cap {
-            let Some(old) = self.order.pop_front() else { break };
-            self.map.remove(&old);
-        }
-        self.order.push_back(k.clone());
-        self.map.insert(k, v);
-        // Keys removed by `remove` linger in `order`; drop them once they pile up.
-        if self.order.len() > self.cap * 2 {
-            let map = &self.map;
-            self.order.retain(|k| map.contains_key(k));
-        }
-    }
-
-    pub fn remove(&mut self, k: &K) -> Option<V> {
-        self.map.remove(k)
-    }
-
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
+/// A [`Bounded`] map of at most `cap` entries (at least one).
+pub fn bounded<K: Hash + Eq, V>(cap: usize) -> Bounded<K, V> {
+    lru::LruCache::new(std::num::NonZeroUsize::new(cap).unwrap_or(std::num::NonZeroUsize::MIN))
 }
 
 /// Who is waiting for a `ver` to be resolved.
@@ -269,10 +230,10 @@ const RETRIES_CAP: usize = 8192;
 impl Default for CapsCache {
     fn default() -> Self {
         CapsCache {
-            verified: Mutex::new(Bounded::new(VERIFIED_CAP)),
-            per_entity: Mutex::new(Bounded::new(PER_ENTITY_CAP)),
+            verified: Mutex::new(bounded(VERIFIED_CAP)),
+            per_entity: Mutex::new(bounded(PER_ENTITY_CAP)),
             pending: Mutex::new(Pending::default()),
-            retries: Mutex::new(Bounded::new(RETRIES_CAP)),
+            retries: Mutex::new(bounded(RETRIES_CAP)),
         }
     }
 }
@@ -356,11 +317,11 @@ impl CapsCache {
         let mut out = Resolved { caps: caps.clone(), ..Resolved::default() };
         if let (Some(q), Some(c)) = (answer, &caps) {
             if hash.is_some_and(|h| verifiable(h) && verify(q, h, ver)) {
-                self.verified.lock().insert(ver.to_string(), c.clone());
+                self.verified.lock().put(ver.to_string(), c.clone());
                 out.done = waiters.into_iter().map(|(w, _)| w).collect();
                 return out;
             }
-            self.per_entity.lock().insert(entity.clone(), (ver.to_string(), c.clone()));
+            self.per_entity.lock().put(entity.clone(), (ver.to_string(), c.clone()));
         }
         let (mine, mut rest): (Vec<_>, Vec<_>) = waiters.into_iter().partition(|(w, _)| w.entity() == entity);
         let mine = mine.into_iter().map(|(w, _)| w);
@@ -391,7 +352,7 @@ impl CapsCache {
         if cur.scheduled || cur.tries >= MAX_RETRIES {
             return None;
         }
-        r.insert(w.clone(), Retry { tries: cur.tries + 1, scheduled: true });
+        r.put(w.clone(), Retry { tries: cur.tries + 1, scheduled: true });
         Some(RETRY_BASE * 2u32.pow(cur.tries))
     }
 
@@ -399,13 +360,13 @@ impl CapsCache {
     pub fn retry_due(&self, w: &Waiter) {
         let mut r = self.retries.lock();
         if let Some(cur) = r.get(w).copied() {
-            r.insert(w.clone(), Retry { scheduled: false, ..cur });
+            r.put(w.clone(), Retry { scheduled: false, ..cur });
         }
     }
 
     /// `w` got its caps: a later failure starts with a full set of tries.
     pub fn succeeded(&self, w: &Waiter) {
-        self.retries.lock().remove(w);
+        self.retries.lock().pop(w);
     }
 }
 
@@ -476,19 +437,15 @@ mod tests {
     }
 
     #[test]
-    fn bounded_map_forgets_the_oldest() {
-        let mut m = Bounded::new(2);
-        m.insert(1, "a");
-        m.insert(2, "b");
-        m.insert(3, "c");
-        assert!(m.get(&1).is_none());
+    fn bounded_map_forgets_the_least_recently_used() {
+        let mut m = bounded(2);
+        m.put(1, "a");
+        m.put(2, "b");
+        assert_eq!(m.get(&1), Some(&"a"));
+        m.put(3, "c");
+        assert!(m.get(&2).is_none(), "1 was used since, so 2 goes");
         assert_eq!(m.get(&3), Some(&"c"));
-        m.remove(&2);
-        for i in 10..20 {
-            m.insert(i, "x");
-        }
-        assert_eq!(m.len(), 2);
-        assert!(m.order.len() <= 4);
+        assert_eq!(bounded::<u8, u8>(0).cap().get(), 1);
     }
 
     fn local(j: &str) -> Waiter {

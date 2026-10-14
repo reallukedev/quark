@@ -439,7 +439,18 @@ pub struct Relay {
     registry: Mutex<Registry>,
     own: ArcSwap<OwnAddrs>,
     amp: AmpGuard,
+    /// Said once that the address relayed addresses are advertised at can't work (see
+    /// [`unreachable_for`]).
+    warned_private: AtomicBool,
     pub(super) shutdown: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Whether relayed addresses at `advertised` can't work for `client`: a private address (a
+/// container's bridge network, a LAN behind NAT) handed to a client on the internet, which has
+/// no route to it. Under Docker that is what the system picks unless `turn.external_ip` is set.
+fn unreachable_for(advertised: IpAddr, client: IpAddr) -> bool {
+    let public = PeerPolicy::public_only(Vec::new());
+    !public.allows(advertised) && public.allows(client)
 }
 
 impl std::fmt::Debug for Relay {
@@ -494,6 +505,7 @@ impl Relay {
             registry: Mutex::new(Registry::default()),
             own: ArcSwap::from_pointee(OwnAddrs::default()),
             amp: AmpGuard::new(Instant::now()),
+            warned_private: AtomicBool::new(false),
             shutdown,
         };
         r.refresh_own_addrs();
@@ -509,7 +521,12 @@ impl Relay {
     }
 
     pub fn set_limits(&self, l: Limits) {
+        let moved = l.external_ip != self.limits.load().external_ip;
         self.limits.store(Arc::new(l));
+        // A new external IP is one of our own addresses at once, not at the next listing.
+        if moved {
+            self.refresh_own_addrs();
+        }
     }
 
     /// The longest lifetime a client can be granted, in seconds.
@@ -912,7 +929,17 @@ impl Relay {
         })
         .and_then(|s| s.connect(target).and_then(|_| s.local_addr()));
         match probe {
-            Ok(a) if !a.ip().is_unspecified() => Ok(a.ip()),
+            Ok(a) if !a.ip().is_unspecified() => {
+                if unreachable_for(a.ip(), client.ip()) && !self.warned_private.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        advertised = %a.ip(),
+                        client = %client.ip(),
+                        "the call relay hands out a private address to clients on the internet, so calls through it will fail; \
+                         set turn.external_ip (or QUARK_TURN_EXTERNAL_IP) to the server's public address"
+                    );
+                }
+                Ok(a.ip())
+            }
             _ => Err(Refuse(440, "Address Family not Supported")),
         }
     }
@@ -1323,6 +1350,24 @@ mod tests {
         for ip in interface_addrs().unwrap_or_default() {
             assert!(own.contains(ip), "{ip}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_new_external_ip_is_guarded_at_once() {
+        let r = relay().await;
+        let ext: IpAddr = "198.51.100.77".parse().unwrap();
+        assert!(!r.own.load().contains(ext));
+        r.set_limits(Limits::new(&TurnSection { external_ip: Some(ext), ..TurnSection::default() }));
+        assert!(r.own.load().contains(ext), "peers at the external IP are only our own allocations");
+    }
+
+    #[test]
+    fn private_relayed_addresses_are_flagged_for_internet_clients() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // Docker's bridge address handed to a phone on mobile data.
+        assert!(unreachable_for(ip("172.17.0.2"), ip("93.184.216.34")));
+        assert!(!unreachable_for(ip("172.17.0.2"), ip("192.168.1.20")), "a client on the LAN can reach it");
+        assert!(!unreachable_for(ip("1.1.1.1"), ip("93.184.216.34")));
     }
 
     #[test]

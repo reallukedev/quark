@@ -387,6 +387,25 @@ async fn jpeg_location_metadata_is_stripped() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn jpegs_under_another_name_or_type_are_stripped_too() -> anyhow::Result<()> {
+    let s = TestServer::start_with(Options { extra_config: "[http]\nstrip_photo_metadata = true\n".into(), ..Default::default() }).await?;
+    s.add_user("alice", "password-a").await?;
+    let mut alice = s.login("alice", "password-a").await?;
+    let jpeg = jpeg_with_gps();
+    let (put, get) = slot(&mut alice, "photo.bin", jpeg.len() as u64, Some("application/octet-stream")).await?;
+    assert_eq!(http_request(s.web(), "PUT", &put, &[("Content-Type", "application/octet-stream")], &jpeg).await?.status, 201);
+    let r = http_request(s.web(), "GET", &get, &[], b"").await?;
+    assert_eq!(r.body, [0xFF, 0xD8, 0xFF, 0xDA, 0, 8, 1, 1, 0, 0, 63, 0, 0x11, 0x22, 0xFF, 0xD9]);
+    // Anything else passes untouched, bytes that look a bit like a JPEG included.
+    for body in [b"GPS 52.52N plain text".to_vec(), vec![0xFF, 0xD9, 1, 2, 3], vec![0xFF]] {
+        let (put, get) = slot(&mut alice, "notes.txt", body.len() as u64, None).await?;
+        assert_eq!(http_request(s.web(), "PUT", &put, &[], &body).await?.status, 201);
+        assert_eq!(http_request(s.web(), "GET", &get, &[], b"").await?.body, body);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn uploads_off_removes_the_service() -> anyhow::Result<()> {
     let s = TestServer::start().await?;
     s.add_user("alice", "password-a").await?;

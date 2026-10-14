@@ -445,7 +445,7 @@ mod tests {
         let cb = ChannelBindings::default();
         let c = ctx(&a, &cb);
         let bare = "n=user,r=abcdef";
-        let (s, step) = Sasl::start(&c, "SCRAM-SHA-256", format!("n,,{bare}").as_bytes()).await;
+        let (s, step) = Sasl::start(&c, "SCRAM-SHA-256", Some(format!("n,,{bare}").as_bytes())).await;
         let Step::Challenge(sf) = step else { panic!("{step:?}") };
         let sf = String::from_utf8(sf).unwrap();
         let (fin, server_sig) = client_final(ScramHash::Sha256, "pencil-pencil", bare, &sf, b"n,,");
@@ -464,7 +464,7 @@ mod tests {
         let cb = ChannelBindings::default();
         let c = ctx(&a, &cb);
         let bare = "n=user,r=abcdef";
-        let (s, Step::Challenge(sf)) = Sasl::start(&c, "SCRAM-SHA-1", format!("n,,{bare}").as_bytes()).await else { panic!() };
+        let (s, Step::Challenge(sf)) = Sasl::start(&c, "SCRAM-SHA-1", Some(format!("n,,{bare}").as_bytes())).await else { panic!() };
         let (fin, _) = client_final(ScramHash::Sha1, "wrong", bare, &String::from_utf8(sf).unwrap(), b"n,,");
         assert!(matches!(s.unwrap().step(&c, fin.as_bytes()).await, Step::Failure(Failure::NotAuthorized, _)));
     }
@@ -475,7 +475,7 @@ mod tests {
         let cb = ChannelBindings { exporter: Some(vec![7; 32]), server_end_point: None };
         let c = ctx(&a, &cb);
         let bare = "n=user,r=xyz";
-        let (s, Step::Challenge(sf)) = Sasl::start(&c, "SCRAM-SHA-256-PLUS", format!("p=tls-exporter,,{bare}").as_bytes()).await else {
+        let (s, Step::Challenge(sf)) = Sasl::start(&c, "SCRAM-SHA-256-PLUS", Some(format!("p=tls-exporter,,{bare}").as_bytes())).await else {
             panic!()
         };
         let sf = String::from_utf8(sf).unwrap();
@@ -500,7 +500,7 @@ mod tests {
         let cb = ChannelBindings::default();
         let c = ctx(&a, &cb);
         let bare = "n=nobody,r=abc";
-        let (s, Step::Challenge(sf)) = Sasl::start(&c, "SCRAM-SHA-256", format!("n,,{bare}").as_bytes()).await else { panic!() };
+        let (s, Step::Challenge(sf)) = Sasl::start(&c, "SCRAM-SHA-256", Some(format!("n,,{bare}").as_bytes())).await else { panic!() };
         let (fin, _) = client_final(ScramHash::Sha256, "x", bare, &String::from_utf8(sf).unwrap(), b"n,,");
         assert!(matches!(s.unwrap().step(&c, fin.as_bytes()).await, Step::Failure(Failure::NotAuthorized, _)));
     }

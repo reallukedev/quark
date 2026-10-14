@@ -172,6 +172,66 @@ async fn bosh_preflight_allows_cross_origin_clients() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn a_resent_request_takes_over_from_the_one_still_held() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    s.add_user("alice", "password-a").await?;
+    s.add_user("bob", "password-b").await?;
+    let mut bob = s.online("bob", "password-b", "laptop").await?;
+    let mut alice = s.bosh_login("alice", "password-a", "web").await?;
+    let addr = alice.addr();
+    let body = alice.body(&[], &[]);
+    let original = {
+        let body = body.clone();
+        tokio::spawn(async move { BoshClient::post(addr, &body).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The client thinks the original's connection died and sends the same rid again.
+    let started = Instant::now();
+    let resent = tokio::spawn(async move { BoshClient::post(addr, &body).await });
+    let o = original.await??;
+    assert!(started.elapsed() < Duration::from_secs(3), "the original is answered (empty) right away");
+    assert_eq!(o.children().count(), 0, "{o}");
+    bob.send(&message("alice@quark.test/web", "chat", "after the resend")).await?;
+    let r = resent.await??;
+    let m = r.get_child("message", ns::CLIENT).expect("the resend waits for the output");
+    assert_eq!(m.child_text("body", ns::CLIENT).as_deref(), Some("after the resend"));
+    Ok(())
+}
+
+/// The `quark_bosh_sessions` gauge.
+async fn open_sessions(s: &TestServer) -> anyhow::Result<u64> {
+    let t = http_request(s.web(), "GET", "/metrics", &[], b"").await?.text();
+    let line = t.lines().find(|l| l.starts_with("quark_bosh_sessions ")).expect("the gauge");
+    Ok(line.rsplit(' ').next().unwrap_or_default().parse()?)
+}
+
+#[tokio::test]
+async fn a_session_whose_held_request_was_dropped_is_still_reaped() -> anyhow::Result<()> {
+    // Sign-ins time out after a second, which ends the session.
+    let s =
+        TestServer::start_with(quark_testkit::Options { extra_config: "[limits]\nauth_timeout_secs = 1\n".into(), ..Default::default() })
+            .await?;
+    let mut c = BoshClient::connect(s.web(), s.domain()).await?;
+    // A held request whose client goes away before the answer.
+    let body = c.body(&[], &[]);
+    let mut tcp = tokio::net::TcpStream::connect(s.web()).await?;
+    let req = format!(
+        "POST /http-bind HTTP/1.1\r\nHost: quark.test\r\nX-Forwarded-Proto: https\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut tcp, req.as_bytes()).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(tcp);
+    assert_eq!(open_sessions(&s).await?, 1);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while open_sessions(&s).await? > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(open_sessions(&s).await?, 0, "the ended session was forgotten");
+    Ok(())
+}
+
+#[tokio::test]
 async fn web_clients_off_refuses_bosh_sessions() -> anyhow::Result<()> {
     let s = TestServer::start().await?;
     s.set_settings(|st| st.web = false).await?;

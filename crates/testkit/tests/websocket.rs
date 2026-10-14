@@ -158,3 +158,51 @@ async fn a_dropped_websocket_session_can_be_resumed() -> anyhow::Result<()> {
     assert_eq!(got.child_text("body", ns::CLIENT).as_deref(), Some("while you were gone"));
     Ok(())
 }
+
+/// The `quark_http_connections` gauge, read on a connection of its own (which counts too).
+async fn open_connections(s: &TestServer) -> anyhow::Result<u64> {
+    let t = http_request(s.web(), "GET", "/metrics", &[], b"").await?.text();
+    let line = t.lines().find(|l| l.starts_with("quark_http_connections ")).expect("the gauge");
+    Ok(line.rsplit(' ').next().unwrap_or_default().parse()?)
+}
+
+/// Polls the gauge until it reads `want`.
+async fn connections_reach(s: &TestServer, want: u64) -> anyhow::Result<u64> {
+    let mut n = 0;
+    for _ in 0..30 {
+        n = open_connections(s).await?;
+        if n == want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(n)
+}
+
+#[tokio::test]
+async fn websockets_count_as_open_connections_until_they_close() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    assert_eq!(connections_reach(&s, 1).await?, 1, "only the metrics request itself");
+    let ws = WsClient::connect(s.web(), s.domain(), &[VIA_TLS_PROXY]).await?;
+    assert_eq!(connections_reach(&s, 2).await?, 2, "the WebSocket holds its place after the upgrade");
+    drop(ws);
+    assert_eq!(connections_reach(&s, 1).await?, 1, "and gives it back when it closes");
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_address_can_have_only_so_many_websockets_signing_in() -> anyhow::Result<()> {
+    let s = TestServer::start().await?;
+    s.add_user("alice", "password-a").await?;
+    let mut open = Vec::new();
+    for _ in 0..64 {
+        open.push(WsClient::connect(s.web(), s.domain(), &[VIA_TLS_PROXY]).await?);
+    }
+    assert!(WsClient::handshake(s.web(), &[VIA_TLS_PROXY]).await.is_err(), "the 65th is refused");
+    // A stream that has signed in and bound no longer counts.
+    let first = &mut open[0];
+    first.auth_scram("SCRAM-SHA-256", "alice", "password-a").await?;
+    first.bind(Some("web")).await?;
+    WsClient::connect(s.web(), s.domain(), &[VIA_TLS_PROXY]).await?;
+    Ok(())
+}

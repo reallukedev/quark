@@ -167,9 +167,20 @@ pub struct HttpSection {
     /// Serve the admin API over HTTP (bearer token in `<data_dir>/admin.token`).
     #[serde(default)]
     pub admin_api: bool,
-    /// Prometheus metrics at `/metrics` (only from loopback and private addresses).
+    /// Prometheus metrics at `/metrics`: for direct requests from loopback and private
+    /// addresses, or with `metrics_token` for whoever presents it.
     #[serde(default = "yes")]
     pub metrics: bool,
+    /// A bearer token `/metrics` then requires from everyone, so scrapers can come through a
+    /// reverse proxy (or from anywhere) without the proxy making every request look local.
+    #[serde(default)]
+    pub metrics_token: Option<String>,
+    /// Strip EXIF, XMP, IPTC and comments from JPEG uploads as they stream in. Off by default:
+    /// the stored file then differs from what the uploader sent, so the hash and size clients
+    /// share with the link (XEP-0446/0447: Dino, Gajim) no longer match and the download is
+    /// refused as corrupt. Most phone apps strip location data before uploading anyway.
+    #[serde(default)]
+    pub strip_photo_metadata: bool,
     /// Serve the web listener over TLS itself (certificates from `tls.cert_dir`) instead of
     /// behind a TLS proxy.
     #[serde(default)]
@@ -178,7 +189,7 @@ pub struct HttpSection {
 
 impl Default for HttpSection {
     fn default() -> Self {
-        HttpSection { public_url: None, admin_api: false, metrics: true, tls: false }
+        HttpSection { public_url: None, admin_api: false, metrics: true, metrics_token: None, strip_photo_metadata: false, tls: false }
     }
 }
 

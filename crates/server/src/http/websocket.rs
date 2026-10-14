@@ -20,7 +20,7 @@ use futures_util::{SinkExt, StreamExt};
 use quark_core::xml::{StreamEvent, XmlError};
 use quark_core::{ns, Element};
 
-use super::{AppState, Conn};
+use super::{AppState, Conn, Negotiating};
 use crate::sasl::ChannelBindings;
 use crate::server::Server;
 use crate::transport::{StanzaReader, StanzaWriter, StreamError, Transport};
@@ -44,6 +44,10 @@ pub(super) async fn handler(
         Err(e) => return (e.status(), "This is the XMPP WebSocket endpoint (RFC 7395). Chat apps connect here.\n").into_response(),
     };
     let peer = super::peer(&conn, &headers);
+    let Some(negotiating) = st.negotiations.begin(peer.ip) else {
+        return (StatusCode::TOO_MANY_REQUESTS, "Too many connections are signing in from your address. Try again in a minute.\n")
+            .into_response();
+    };
     let max_stanza = st.srv.config().limits.c2s_stanza_bytes;
     let frame = usize::try_from(max_stanza + FRAME_SLACK).unwrap_or(usize::MAX);
     // Channel binding only holds when our own TLS reaches the client.
@@ -52,7 +56,11 @@ pub(super) async fn handler(
         _ => (ChannelBindings::default(), None),
     };
     st.stats.websockets.fetch_add(1, Ordering::Relaxed);
+    // The connection's place under the listener's cap goes with the WebSocket, which outlives
+    // the HTTP connection task.
+    let permit = conn.permit.clone();
     ws.protocols(["xmpp"]).max_message_size(frame).max_frame_size(frame).on_upgrade(move |socket| async move {
+        let _permit = permit;
         let (tx, rx) = socket.split();
         let t = WsTransport {
             srv: st.srv.clone(),
@@ -62,6 +70,7 @@ pub(super) async fn handler(
             secure: peer.secure,
             cb,
             sni,
+            negotiating: Some(negotiating),
         };
         crate::c2s::serve(st.srv.clone(), Box::new(t)).await;
     })
@@ -209,6 +218,8 @@ pub struct WsTransport {
     secure: bool,
     cb: ChannelBindings,
     sni: Option<String>,
+    /// Counts against the address's sign-ins until the stream splits into a session.
+    negotiating: Option<Negotiating>,
 }
 
 #[async_trait]
@@ -273,7 +284,8 @@ impl Transport for WsTransport {
     }
 
     fn split(self: Box<Self>) -> (Box<dyn StanzaReader>, Box<dyn StanzaWriter>) {
-        let me = *self;
+        let mut me = *self;
+        me.negotiating = None;
         (Box::new(me.reader), Box::new(me.writer))
     }
 }

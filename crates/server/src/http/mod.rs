@@ -10,6 +10,7 @@ mod files;
 pub mod jpeg;
 mod websocket;
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
@@ -26,8 +27,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Extension, Router};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use parking_lot::Mutex;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tower::ServiceExt as _;
 
 use crate::modules::Module;
@@ -43,6 +45,9 @@ const MAX_CONNECTIONS: usize = 20_000;
 const BODY_LIMIT: usize = 1 << 20;
 /// How long open requests get to finish when the server stops.
 const DRAIN: Duration = Duration::from_secs(10);
+/// WebSocket streams and BOSH sessions one address may have signing in at once. Each holds a
+/// task, a parser and (for BOSH) a session until it binds or the sign-in timeout ends it.
+const NEGOTIATIONS_PER_IP: usize = 64;
 
 /// Facts about the TCP (or TLS) connection a request came in on.
 #[derive(Clone)]
@@ -50,6 +55,10 @@ pub(crate) struct Conn {
     pub peer: SocketAddr,
     /// Set when this listener did the TLS handshake itself.
     pub tls: Option<Arc<TlsFacts>>,
+    /// The connection's place under `MAX_CONNECTIONS`. hyper hands an upgraded WebSocket's IO
+    /// to a task of its own and ends the connection task, so the WebSocket keeps a clone of
+    /// this until it closes.
+    pub permit: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 pub(crate) struct TlsFacts {
@@ -103,6 +112,65 @@ pub(crate) fn peer(conn: &Conn, headers: &HeaderMap) -> Peer {
     Peer { ip: ip.unwrap_or(direct), secure: own_tls || proto_https, proxied }
 }
 
+/// Whether a request carries any header a reverse proxy adds.
+fn forwarded(headers: &HeaderMap) -> bool {
+    ["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "x-real-ip", "forwarded", "via"].iter().any(|h| headers.contains_key(*h))
+}
+
+/// Who may read `/metrics`. With `http.metrics_token` set, whoever presents it (from anywhere,
+/// proxied or not). Otherwise only private addresses, judged from `X-Forwarded-For` when a
+/// trusted proxy sent one. A request with other proxy headers but no `X-Forwarded-For` is
+/// refused: it came through a proxy that doesn't say who the client is, and the proxy's own
+/// private address says nothing about them. (A proxy that adds no headers at all can't be told
+/// from a local scraper; docs/config.md says to set the token then.)
+fn metrics_allowed(token: Option<&str>, conn: &Conn, headers: &HeaderMap) -> bool {
+    use subtle::ConstantTimeEq;
+    if let Some(token) = token {
+        let given = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
+        return bool::from(given.trim().as_bytes().ct_eq(token.as_bytes()));
+    }
+    if forwarded(headers) && !headers.contains_key("x-forwarded-for") {
+        return false;
+    }
+    is_private(peer(conn, headers).ip)
+}
+
+/// Web streams still signing in, per address.
+#[derive(Default, Clone)]
+pub(crate) struct Negotiations(Arc<Mutex<HashMap<IpAddr, usize>>>);
+
+impl Negotiations {
+    /// A place for one more stream from `ip`, or None when it has `NEGOTIATIONS_PER_IP` already.
+    pub fn begin(&self, ip: IpAddr) -> Option<Negotiating> {
+        let mut m = self.0.lock();
+        let n = m.entry(ip).or_insert(0);
+        if *n >= NEGOTIATIONS_PER_IP {
+            return None;
+        }
+        *n += 1;
+        Some(Negotiating { owner: self.clone(), ip })
+    }
+}
+
+/// One stream's place in [`Negotiations`]. The transports drop it when the stream binds or
+/// resumes (they split then) or ends.
+pub(crate) struct Negotiating {
+    owner: Negotiations,
+    ip: IpAddr,
+}
+
+impl Drop for Negotiating {
+    fn drop(&mut self) {
+        let mut m = self.owner.0.lock();
+        if let Some(n) = m.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&self.ip);
+            }
+        }
+    }
+}
+
 /// Counters for things only the web side sees.
 #[derive(Default)]
 pub(crate) struct WebStats {
@@ -117,6 +185,9 @@ pub(crate) struct WebState {
     pub srv: Arc<Server>,
     pub bosh: bosh::Registry,
     pub stats: WebStats,
+    /// Open connections, across listeners (`MAX_CONNECTIONS` permits).
+    pub connections: Arc<Semaphore>,
+    pub negotiations: Negotiations,
 }
 
 type AppState = State<Arc<WebState>>;
@@ -129,10 +200,18 @@ pub async fn start(srv: &Arc<Server>) -> anyhow::Result<Vec<std::net::SocketAddr
     }
     let dir = crate::modules::upload::dir(srv);
     tokio::fs::create_dir_all(&dir).await.with_context(|| format!("creating {}", dir.display()))?;
-    let state = Arc::new(WebState { srv: srv.clone(), bosh: bosh::Registry::default(), stats: WebStats::default() });
+    // Nothing is uploading yet, so uploads a restart cut off give their slots back.
+    crate::modules::upload::reset_interrupted(srv).await;
+    let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let state = Arc::new(WebState {
+        srv: srv.clone(),
+        bosh: bosh::Registry::default(),
+        stats: WebStats::default(),
+        connections: limit.clone(),
+        negotiations: Negotiations::default(),
+    });
     let app = router(srv, state.clone());
     let tls = cfg.http.tls.then(|| srv.certs.server_config(&[b"http/1.1"]));
-    let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut out = Vec::new();
     for addr in cfg.listen.http.iter().copied() {
         let listener = TcpListener::bind(addr).await.with_context(|| format!("listening on {addr}"))?;
@@ -189,15 +268,15 @@ async fn accept_loop(
         };
         let (state, app, tls, shutdown) = (state.clone(), app.clone(), tls.clone(), state.srv.shutdown_signal());
         tokio::spawn(async move {
-            let _permit = permit;
+            let permit = Some(Arc::new(permit));
             let _ = tcp.set_nodelay(true);
             let peer = SocketAddr::new(addr.ip().to_canonical(), addr.port());
             match tls {
-                None => serve_conn(TokioIo::new(tcp), Conn { peer, tls: None }, app, state, shutdown).await,
+                None => serve_conn(TokioIo::new(tcp), Conn { peer, tls: None, permit }, app, state, shutdown).await,
                 Some(cfg) => {
                     let Some(stream) = handshake(tcp, cfg).await else { return };
                     let (sni, _, cb) = crate::tls::session_facts(&stream, &state.srv.certs);
-                    let conn = Conn { peer, tls: Some(Arc::new(TlsFacts { sni, cb })) };
+                    let conn = Conn { peer, tls: Some(Arc::new(TlsFacts { sni, cb })), permit };
                     serve_conn(TokioIo::new(stream), conn, app, state, shutdown).await
                 }
             }
@@ -326,10 +405,19 @@ async fn index(State(st): AppState, headers: HeaderMap) -> Response {
         .into_response()
 }
 
-/// Prometheus text format, for loopback and private-network scrapers only.
+/// Prometheus text format, for private-network scrapers or holders of `http.metrics_token`.
 async fn metrics(State(st): AppState, Extension(conn): Extension<Conn>, headers: HeaderMap) -> Response {
     let srv = &st.srv;
-    if !srv.config().http.metrics || !is_private(peer(&conn, &headers).ip) {
+    let cfg = srv.config();
+    let token = cfg.http.metrics_token.as_deref().filter(|t| !t.is_empty());
+    if !cfg.http.metrics {
+        return (StatusCode::NOT_FOUND, "Nothing here.\n").into_response();
+    }
+    if !metrics_allowed(token, &conn, &headers) {
+        if token.is_some() {
+            return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")], "The metrics token is missing or wrong.\n")
+                .into_response();
+        }
         return (StatusCode::NOT_FOUND, "Nothing here.\n").into_response();
     }
     let mut by_transport: Vec<(&'static str, u64)> = Vec::new();
@@ -369,6 +457,8 @@ async fn metrics(State(st): AppState, Extension(conn): Extension<Conn>, headers:
         &[("{direction=\"in\"}", s2s_in as u64), ("{direction=\"out\"}", s2s_out as u64)],
     );
     metric("quark_http_requests_total", "counter", "Web requests served.", &[("", load(&w.requests))]);
+    let open = MAX_CONNECTIONS.saturating_sub(st.connections.available_permits()) as u64;
+    metric("quark_http_connections", "gauge", "Open web connections, WebSockets included.", &[("", open)]);
     metric("quark_websocket_connections_total", "counter", "WebSocket connections opened.", &[("", load(&w.websockets))]);
     metric("quark_bosh_sessions", "gauge", "Open BOSH sessions.", &[("", st.bosh.len() as u64)]);
     metric("quark_bosh_sessions_total", "counter", "BOSH sessions created.", &[("", load(&w.bosh_sessions))]);
@@ -403,7 +493,7 @@ mod tests {
     use super::*;
 
     fn conn(ip: &str) -> Conn {
-        Conn { peer: SocketAddr::new(ip.parse().unwrap(), 4000), tls: None }
+        Conn { peer: SocketAddr::new(ip.parse().unwrap(), 4000), tls: None, permit: None }
     }
 
     fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
@@ -429,6 +519,35 @@ mod tests {
         assert_eq!(peer(&conn("10.0.0.1"), &h).ip, "203.0.113.9".parse::<IpAddr>().unwrap());
         let h = headers(&[("x-forwarded-for", "garbage, 192.168.1.5")]);
         assert_eq!(peer(&conn("10.0.0.1"), &h).ip, "192.168.1.5".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn metrics_need_a_private_client_or_the_token() {
+        let local = conn("127.0.0.1");
+        assert!(metrics_allowed(None, &local, &headers(&[])));
+        // A proxy that says who the client is.
+        assert!(metrics_allowed(None, &local, &headers(&[("x-forwarded-for", "10.0.0.9")])));
+        assert!(!metrics_allowed(None, &local, &headers(&[("x-forwarded-for", "203.0.113.5")])));
+        // A proxy that doesn't: its own loopback address says nothing about the client.
+        assert!(!metrics_allowed(None, &local, &headers(&[("x-forwarded-proto", "https")])));
+        assert!(!metrics_allowed(None, &local, &headers(&[("x-real-ip", "203.0.113.5")])));
+        assert!(!metrics_allowed(None, &conn("203.0.113.5"), &headers(&[])));
+        // With a token, only the token counts, from anywhere.
+        assert!(!metrics_allowed(Some("s3cret"), &local, &headers(&[])));
+        assert!(metrics_allowed(Some("s3cret"), &conn("203.0.113.5"), &headers(&[("authorization", "Bearer s3cret")])));
+        assert!(!metrics_allowed(Some("s3cret"), &local, &headers(&[("authorization", "Bearer nope")])));
+    }
+
+    #[test]
+    fn negotiations_are_capped_per_address() {
+        let n = Negotiations::default();
+        let a: IpAddr = "203.0.113.5".parse().unwrap();
+        let held: Vec<_> = (0..NEGOTIATIONS_PER_IP).map(|_| n.begin(a).unwrap()).collect();
+        assert!(n.begin(a).is_none());
+        assert!(n.begin("203.0.113.6".parse().unwrap()).is_some(), "other addresses aren't affected");
+        drop(held);
+        assert!(n.begin(a).is_some());
+        assert!(n.0.lock().is_empty(), "addresses with nothing open are forgotten");
     }
 
     #[test]

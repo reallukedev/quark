@@ -256,6 +256,65 @@ pub struct TurnSection {
     pub relay_min: u16,
     #[serde(default = "default_relay_max")]
     pub relay_max: u16,
+    /// Hours the relay credentials handed to clients (XEP-0215) stay valid.
+    #[serde(default = "default_credential_hours")]
+    pub credential_hours: u32,
+    #[serde(default)]
+    pub quota: TurnQuota,
+    /// Which peers the relay may send to (it must never become a way into the server's network).
+    #[serde(default)]
+    pub peers: TurnPeers,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnQuota {
+    /// Relayed addresses open at once, in total.
+    #[serde(default = "default_turn_allocations")]
+    pub allocations: usize,
+    /// Relayed addresses open at once per account.
+    #[serde(default = "default_turn_per_user")]
+    pub allocations_per_user: usize,
+    /// Kilobits per second one relayed address may carry (both directions); 0 for no limit.
+    #[serde(default = "default_turn_kbps")]
+    pub kbps: u32,
+    /// The longest a client may ask a relayed address to live without refreshing it.
+    #[serde(default = "default_turn_lifetime")]
+    pub max_lifetime_secs: u32,
+}
+
+impl Default for TurnQuota {
+    fn default() -> Self {
+        TurnQuota {
+            allocations: default_turn_allocations(),
+            allocations_per_user: default_turn_per_user(),
+            kbps: default_turn_kbps(),
+            max_lifetime_secs: default_turn_lifetime(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnPeers {
+    /// Relay to private (LAN) addresses, so calls between phones on the home Wi-Fi work.
+    #[serde(default = "yes")]
+    pub allow_private: bool,
+    /// Relay to loopback addresses. Only for tests: it exposes services on the server itself.
+    #[serde(default)]
+    pub allow_loopback: bool,
+    /// Networks always allowed (`"10.1.0.0/16"`), checked before everything else.
+    #[serde(default)]
+    pub allow: Vec<crate::turn::Cidr>,
+    /// Networks never relayed to.
+    #[serde(default)]
+    pub deny: Vec<crate::turn::Cidr>,
+}
+
+impl Default for TurnPeers {
+    fn default() -> Self {
+        TurnPeers { allow_private: true, allow_loopback: false, allow: Vec::new(), deny: Vec::new() }
+    }
 }
 
 impl Default for TurnSection {
@@ -267,6 +326,9 @@ impl Default for TurnSection {
             external_ip: None,
             relay_min: default_relay_min(),
             relay_max: default_relay_max(),
+            credential_hours: default_credential_hours(),
+            quota: TurnQuota::default(),
+            peers: TurnPeers::default(),
         }
     }
 }
@@ -349,6 +411,21 @@ fn default_relay_min() -> u16 {
 fn default_relay_max() -> u16 {
     49200
 }
+fn default_credential_hours() -> u32 {
+    24
+}
+fn default_turn_allocations() -> usize {
+    1000
+}
+fn default_turn_per_user() -> usize {
+    16
+}
+fn default_turn_kbps() -> u32 {
+    10_000
+}
+fn default_turn_lifetime() -> u32 {
+    3600
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -417,6 +494,12 @@ impl Config {
         }
         if self.turn.relay_min > self.turn.relay_max {
             return Err(ConfigError::Invalid("turn.relay_min is above turn.relay_max.".into()));
+        }
+        if self.turn.credential_hours == 0 || self.turn.credential_hours > 24 * 30 {
+            return Err(ConfigError::Invalid("turn.credential_hours must be between 1 and 720.".into()));
+        }
+        if self.turn.quota.max_lifetime_secs < 600 {
+            return Err(ConfigError::Invalid("turn.quota.max_lifetime_secs must be at least 600.".into()));
         }
         Ok(())
     }

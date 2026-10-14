@@ -141,6 +141,12 @@ impl CertStore {
         first.and_then(|d| self.find(&d)).or_else(|| self.entries.read().first().cloned())
     }
 
+    /// The certificate and key serving `name` (no default fallback), e.g. to present as a
+    /// client certificate on server-to-server links.
+    pub fn certified_key(&self, name: &str) -> Option<Arc<CertifiedKey>> {
+        self.find(name).map(|e| e.key.clone())
+    }
+
     pub fn info(&self, name: &str) -> Option<CertInfo> {
         self.find(name).map(|e| e.info.clone())
     }

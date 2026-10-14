@@ -37,6 +37,7 @@ pub const TIMEOUT: Duration = Duration::from_secs(5);
 pub struct TestServer {
     pub srv: Arc<Server>,
     pub listening: quark::run::Listening,
+    domain: String,
     _dir: tempfile::TempDir,
 }
 
@@ -49,6 +50,12 @@ pub struct Options {
     pub allow_plain: bool,
     /// Settings for the domain, applied before the listeners start.
     pub settings: Option<quark::settings::Settings>,
+    /// The domain to serve instead of [`DOMAIN`] (to run two servers that federate).
+    pub domain: Option<String>,
+    /// Also listen for servers with direct TLS (XEP-0368).
+    pub s2s_tls: bool,
+    /// Certificates for the cert folder: (domain, certificate PEM, key PEM).
+    pub certs: Vec<(String, String, String)>,
 }
 
 impl TestServer {
@@ -61,12 +68,19 @@ impl TestServer {
         let dir = tempfile::tempdir()?;
         let data = dir.path().join("data");
         let certs = dir.path().join("certs");
+        std::fs::create_dir_all(&certs)?;
+        for (name, crt, key) in &o.certs {
+            std::fs::write(certs.join(format!("{name}.crt")), crt)?;
+            std::fs::write(certs.join(format!("{name}.key")), key)?;
+        }
+        let domain = o.domain.clone().unwrap_or_else(|| DOMAIN.to_string());
+        let s2s_tls = if o.s2s_tls { "[\"127.0.0.1:0\"]" } else { "[]" };
         let local = "127.0.0.1:0";
         let text = format!(
             "[server]\ndata_dir = {data:?}\nlog = \"warn\"\n\n[tls]\ncert_dir = {certs:?}\nrequire_c2s = {}\n\n\
-             [listen]\nc2s = [\"{local}\"]\nc2s_tls = [\"{local}\"]\ns2s = [\"{local}\"]\ns2s_tls = []\nhttp = [\"{local}\"]\n\n\
+             [listen]\nc2s = [\"{local}\"]\nc2s_tls = [\"{local}\"]\ns2s = [\"{local}\"]\ns2s_tls = {s2s_tls}\nhttp = [\"{local}\"]\n\n\
              [turn]\nlisten = \"{local}\"\n\n\
-             [[host]]\ndomain = \"{DOMAIN}\"\nadmins = [\"admin@{DOMAIN}\"]\n\n{}",
+             [[host]]\ndomain = \"{domain}\"\nadmins = [\"admin@{domain}\"]\n\n{}",
             !o.allow_plain, o.extra_config
         );
         let path = dir.path().join("quark.toml");
@@ -74,14 +88,39 @@ impl TestServer {
         let cfg = quark::run::load_config(&path)?;
         let srv = quark::run::build(cfg)?;
         if let Some(s) = o.settings {
-            srv.set_settings(DOMAIN, s).await.map_err(|e| anyhow!(e))?;
+            srv.set_settings(&domain, s).await.map_err(|e| anyhow!(e))?;
         }
         let listening = quark::run::start(&srv).await?;
-        Ok(TestServer { srv, listening, _dir: dir })
+        Ok(TestServer { srv, listening, domain, _dir: dir })
     }
 
     pub fn domain(&self) -> &str {
-        DOMAIN
+        &self.domain
+    }
+
+    /// The server-to-server STARTTLS port.
+    pub fn s2s(&self) -> SocketAddr {
+        self.listening.s2s[0]
+    }
+
+    /// The server-to-server direct TLS port, with `Options::s2s_tls`.
+    pub fn s2s_tls(&self) -> Option<SocketAddr> {
+        self.listening.s2s.get(1).copied()
+    }
+
+    /// Changes the config live (like `quark reload`).
+    pub fn change_config(&self, f: impl FnOnce(&mut quark::config::Config)) -> anyhow::Result<()> {
+        let mut c = (*self.srv.config()).clone();
+        f(&mut c);
+        self.srv.set_config(c)?;
+        Ok(())
+    }
+
+    /// Sends federation traffic for `domain` to `target` (`host:port`, or `tls://host:port`).
+    pub fn route(&self, domain: &str, target: &str) -> anyhow::Result<()> {
+        self.change_config(|c| {
+            c.s2s.routes.insert(domain.to_string(), target.to_string());
+        })
     }
 
     /// The STARTTLS client port.
@@ -100,13 +139,13 @@ impl TestServer {
     }
 
     pub async fn add_user(&self, user: &str, password: &str) -> anyhow::Result<()> {
-        self.srv.accounts.create(DOMAIN, user, password, Role::Member).await?;
+        self.srv.accounts.create(&self.domain, user, password, Role::Member).await?;
         Ok(())
     }
 
     pub async fn add_admin(&self, user: &str, password: &str) -> anyhow::Result<()> {
-        self.srv.accounts.create(DOMAIN, user, password, Role::Admin).await?;
-        if let Some(h) = self.srv.host(DOMAIN) {
+        self.srv.accounts.create(&self.domain, user, password, Role::Admin).await?;
+        if let Some(h) = self.srv.host(&self.domain) {
             h.set_role_cache(user, Role::Admin);
         }
         Ok(())
@@ -114,9 +153,9 @@ impl TestServer {
 
     /// Changes the domain's settings live.
     pub async fn set_settings(&self, f: impl FnOnce(&mut quark::settings::Settings)) -> anyhow::Result<()> {
-        let mut s = (*self.srv.host(DOMAIN).context("no host")?.settings()).clone();
+        let mut s = (*self.srv.host(&self.domain).context("no host")?.settings()).clone();
         f(&mut s);
-        self.srv.set_settings(DOMAIN, s).await.map_err(|e| anyhow!(e))
+        self.srv.set_settings(&self.domain, s).await.map_err(|e| anyhow!(e))
     }
 
     /// Connects, does STARTTLS, signs in with SCRAM-SHA-256 and binds `resource` "test".
@@ -125,7 +164,7 @@ impl TestServer {
     }
 
     pub async fn login_as(&self, user: &str, password: &str, resource: &str) -> anyhow::Result<Client> {
-        let mut c = Client::connect(self.c2s(), DOMAIN).await?;
+        let mut c = Client::connect(self.c2s(), &self.domain).await?;
         c.starttls().await?;
         c.auth_scram("SCRAM-SHA-256", user, password).await?;
         c.bind(Some(resource)).await?;
@@ -616,6 +655,38 @@ impl ScramClient {
             bail!("the server's SCRAM signature is wrong");
         }
         Ok(())
+    }
+}
+
+/// A certificate authority for tests: certificates it issues validate for their names once its
+/// PEM is in `s2s.trusted_certs`.
+pub struct TestCa {
+    cert: rcgen::Certificate,
+    key: rcgen::KeyPair,
+}
+
+impl TestCa {
+    pub fn new() -> anyhow::Result<TestCa> {
+        let mut p = rcgen::CertificateParams::new(Vec::<String>::new())?;
+        p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        p.distinguished_name.push(rcgen::DnType::CommonName, "Quark Test CA");
+        let key = rcgen::KeyPair::generate()?;
+        let cert = p.self_signed(&key)?;
+        Ok(TestCa { cert, key })
+    }
+
+    /// The CA certificate, PEM.
+    pub fn pem(&self) -> String {
+        self.cert.pem()
+    }
+
+    /// A certificate for `domain` and its subdomains, as (domain, certificate PEM, key PEM) for
+    /// `Options::certs`.
+    pub fn issue(&self, domain: &str) -> anyhow::Result<(String, String, String)> {
+        let p = rcgen::CertificateParams::new(vec![domain.to_string(), format!("*.{domain}")])?;
+        let key = rcgen::KeyPair::generate()?;
+        let cert = p.signed_by(&key, &self.cert, &self.key)?;
+        Ok((domain.to_string(), cert.pem(), key.serialize_pem()))
     }
 }
 

@@ -4,3 +4,4 @@
 *.db-shm
 /data
 /.claude/worktrees
+/target-shared

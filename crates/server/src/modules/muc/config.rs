@@ -4,7 +4,7 @@
 use quark_core::Element;
 use serde::{Deserialize, Serialize};
 
-use super::form::{Form, Values};
+use crate::modules::forms::{Form, Values};
 
 pub const ROOMCONFIG: &str = "http://jabber.org/protocol/muc#roomconfig";
 pub const ROOMINFO: &str = "http://jabber.org/protocol/muc#roominfo";

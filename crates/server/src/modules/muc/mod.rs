@@ -19,7 +19,6 @@ use crate::db::Migration;
 use crate::server::{Host, Server};
 
 mod config;
-mod form;
 mod room;
 mod service;
 mod store;

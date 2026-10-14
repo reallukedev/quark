@@ -25,7 +25,8 @@ use crate::server::{Host, Server};
 
 pub static MIGRATION: Migration = Migration {
     module: "invites",
-    steps: &["CREATE TABLE invites (
+    steps: &[
+        "CREATE TABLE invites (
         token TEXT PRIMARY KEY,
         host TEXT NOT NULL,
         -- The username the new account must take, or the account a reset invite is for.
@@ -40,11 +41,29 @@ pub static MIGRATION: Migration = Migration {
         reset INTEGER NOT NULL DEFAULT 0
     ) WITHOUT ROWID;
     CREATE INDEX invites_by_host ON invites (host, expires);
-    CREATE INDEX invites_by_inviter ON invites (host, inviter);"],
+    CREATE INDEX invites_by_inviter ON invites (host, inviter);",
+        // Accounts made with invites people made for friends, kept for NEW_MEMBER_WAIT_MS:
+        // what limits how fast invite trees grow.
+        "CREATE TABLE invite_signups (
+        token TEXT NOT NULL,
+        host TEXT NOT NULL,
+        inviter TEXT NOT NULL,
+        invitee TEXT NOT NULL,
+        at INTEGER NOT NULL
+    );
+    CREATE INDEX invite_signups_by_inviter ON invite_signups (host, inviter, at);
+    CREATE INDEX invite_signups_by_invitee ON invite_signups (host, invitee);
+    CREATE INDEX invite_signups_by_token ON invite_signups (token);",
+    ],
 };
 
-/// Invites one person may have open at once, so a member can't fill the table.
-const MAX_PER_INVITER: i64 = 50;
+/// Invites one member may have open at once, so a member can't fill the table.
+const MAX_PER_INVITER: i64 = 10;
+/// Accounts one member's invites may make a day. With [`NEW_MEMBER_WAIT_MS`] this keeps a
+/// member's invites from snowballing into thousands of accounts in days.
+pub const SIGNUPS_PER_INVITER_PER_DAY: i64 = 5;
+/// How long an account made with a member's invite waits before it can invite others.
+pub const NEW_MEMBER_WAIT_MS: i64 = 7 * DAY_MS;
 /// The longest an invite can last.
 pub const MAX_TTL_MS: i64 = 3_650 * DAY_MS;
 pub const DAY_MS: i64 = 86_400_000;
@@ -79,7 +98,13 @@ impl Module for Invites {
                     _ = shutdown.changed() => return,
                 }
                 let now = quark_core::time::now_ms();
-                match db.write(move |t| t.execute("DELETE FROM invites WHERE expires <= ?1 OR (reusable = 0 AND uses > 0)", [now])).await {
+                let r = db
+                    .write(move |t| {
+                        t.execute("DELETE FROM invite_signups WHERE at <= ?1", [now - NEW_MEMBER_WAIT_MS])?;
+                        t.execute("DELETE FROM invites WHERE expires <= ?1 OR (reusable = 0 AND uses > 0)", [now])
+                    })
+                    .await;
+                match r {
                     Ok(n) if n > 0 => tracing::debug!(removed = n, "expired invites removed"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "invite expiry failed"),
@@ -233,9 +258,18 @@ pub async fn create(srv: &Arc<Server>, n: NewInvite<'_>) -> Result<Invite, Invit
         if !exists && n.reset {
             return Err(InviteError::Invalid(format!("{u}@{} doesn't exist, so there's no password to reset.", host.domain)));
         }
+        // Config admins are admins by name, so that account is never made by redeeming a link.
+        if !n.reset && host.is_admin_jid(&Jid::bare_unchecked(u, &host.domain)) {
+            return Err(InviteError::Invalid(format!(
+                "{u}@{} is an admin in the config file: make that account with quark ctl or the admin API instead.",
+                host.domain
+            )));
+        }
     } else if n.reset {
         return Err(InviteError::Invalid("A password reset invite needs the username it's for.".into()));
     }
+    // Admins invite as much as they like; members are held to the limits above.
+    let limited = n.inviter.filter(|u| !host.is_admin_jid(&Jid::bare_unchecked(u, &host.domain))).is_some();
     let now = quark_core::time::now_ms();
     let s = Stored {
         token: new_token(),
@@ -250,28 +284,37 @@ pub async fn create(srv: &Arc<Server>, n: NewInvite<'_>) -> Result<Invite, Invit
         reset: n.reset,
     };
     let r = s.clone();
-    let inserted = srv
+    let refused = srv
         .db
         .write(move |t| {
-            if let Some(inv) = &r.inviter {
+            if let Some(inv) = r.inviter.as_ref().filter(|_| limited) {
+                let invited: bool = t.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM invite_signups WHERE host = ?1 AND invitee = ?2 AND at > ?3)",
+                    params![r.host, inv, now - NEW_MEMBER_WAIT_MS],
+                    |x| x.get(0),
+                )?;
+                if invited {
+                    return Ok(Some("New accounts made with an invite can invite others after a week.".to_string()));
+                }
+                // Only unused invites count: used ones stay until the hourly cleanup.
                 let open: i64 = t.query_row(
-                    "SELECT COUNT(*) FROM invites WHERE host = ?1 AND inviter = ?2 AND expires > ?3",
+                    "SELECT COUNT(*) FROM invites WHERE host = ?1 AND inviter = ?2 AND expires > ?3 AND uses = 0",
                     params![r.host, inv, now],
                     |x| x.get(0),
                 )?;
                 if open >= MAX_PER_INVITER {
-                    return Ok(false);
+                    return Ok(Some(format!("You have {MAX_PER_INVITER} open invites already. Wait for some to be used or expire.")));
                 }
             }
             t.execute(
                 &format!("INSERT INTO invites ({COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)"),
                 params![r.token, r.host, r.username, r.inviter, r.role.as_str(), r.created, r.expires, r.reusable, r.reset],
             )?;
-            Ok(true)
+            Ok(None)
         })
         .await?;
-    if !inserted {
-        return Err(InviteError::Invalid(format!("You have {MAX_PER_INVITER} open invites already. Wait for some to be used or expire.")));
+    if let Some(why) = refused {
+        return Err(InviteError::Invalid(why));
     }
     Ok(to_api(srv, &host, &s))
 }
@@ -343,10 +386,70 @@ pub async fn claim(srv: &Server, host: &str, token: &str) -> Result<Option<Store
         .await
 }
 
-/// Gives back a use taken by [`claim`] when the redemption failed after all.
+/// What [`claim_signup`] found.
+#[derive(Debug)]
+pub enum SignupClaim {
+    /// The invite as it was before this use.
+    Claimed(Stored),
+    /// Expired, used up, or not for this domain.
+    Gone,
+    /// The member who made it has had [`SIGNUPS_PER_INVITER_PER_DAY`] people join today.
+    InviterBusy,
+}
+
+/// [`claim`] for making the account `invitee`. A member's invite also takes one of the member's
+/// sign-ups for the day and records who invited whom, in the same transaction as the use, so
+/// parallel sign-ups can't get past the limit. [`unclaim`] gives both back.
+pub async fn claim_signup(srv: &Server, host: &Arc<Host>, token: &str, invitee: &str) -> Result<SignupClaim, DbError> {
+    if !plausible_token(token) {
+        return Ok(SignupClaim::Gone);
+    }
+    let (h, t, who, now) = (host.clone(), token.to_string(), invitee.to_string(), quark_core::time::now_ms());
+    srv.db
+        .write(move |x| {
+            let Some(s) = x
+                .query_row(&format!("SELECT {COLS} FROM invites WHERE token = ?1 AND host = ?2"), params![t, h.domain], row)
+                .optional()?
+                .filter(|s| s.usable(now))
+            else {
+                return Ok(SignupClaim::Gone);
+            };
+            if let Some(inv) = &s.inviter {
+                if !h.is_admin_jid(&Jid::bare_unchecked(inv, &h.domain)) {
+                    let today: i64 = x.query_row(
+                        "SELECT COUNT(*) FROM invite_signups WHERE host = ?1 AND inviter = ?2 AND at > ?3",
+                        params![h.domain, inv, now - DAY_MS],
+                        |r| r.get(0),
+                    )?;
+                    if today >= SIGNUPS_PER_INVITER_PER_DAY {
+                        return Ok(SignupClaim::InviterBusy);
+                    }
+                }
+                x.execute(
+                    "INSERT INTO invite_signups (token, host, inviter, invitee, at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![t, h.domain, inv, who, now],
+                )?;
+            }
+            x.execute("UPDATE invites SET uses = uses + 1 WHERE token = ?1", [&t])?;
+            Ok(SignupClaim::Claimed(s))
+        })
+        .await
+}
+
+/// Gives back a use taken by [`claim`] or [`claim_signup`] when the redemption failed after all.
 pub async fn unclaim(srv: &Server, token: &str) {
     let t = token.to_string();
-    if let Err(e) = srv.db.write(move |x| x.execute("UPDATE invites SET uses = MAX(uses - 1, 0) WHERE token = ?1", [t])).await {
+    let r = srv
+        .db
+        .write(move |x| {
+            x.execute(
+                "DELETE FROM invite_signups WHERE rowid = (SELECT rowid FROM invite_signups WHERE token = ?1 ORDER BY rowid DESC LIMIT 1)",
+                [&t],
+            )?;
+            x.execute("UPDATE invites SET uses = MAX(uses - 1, 0) WHERE token = ?1", [&t])
+        })
+        .await;
+    if let Err(e) = r {
         tracing::warn!(error = %e, "couldn't give an invite use back");
     }
 }

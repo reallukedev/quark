@@ -48,7 +48,7 @@ resume_secs = 600               # how long a dropped phone can resume its sessio
 max_queue = 10000               # stanzas queued for a slow client before it's cut off
 max_sessions_per_account = 64
 auth_failures_per_minute = 10   # per address
-registrations_per_hour = 5      # per address, open sign-up
+registrations_per_hour = 5      # per address (IPv6: per /64) for open sign-up; 4x for members' invites, 4x that in attempts
 
 [tls]
 cert_dir = "/etc/quark/certs"   # <domain>.crt + <domain>.key, or <domain>/fullchain.pem + privkey.pem; reloaded on change

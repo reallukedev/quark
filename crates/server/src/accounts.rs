@@ -1,12 +1,15 @@
 //! Accounts and their credentials. Passwords are never stored: only SCRAM keys (RFC 5802) for
 //! SHA-1, SHA-256 and SHA-512, derived once with PBKDF2, which also serve PLAIN sign-ins.
 
+use std::sync::Arc;
+
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::Serialize;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use subtle::ConstantTimeEq;
+use tokio::sync::Semaphore;
 
 use crate::db::{params, Db, DbError, Migration, OptionalExtension};
 
@@ -215,11 +218,30 @@ pub fn check_password(p: &str) -> Result<(), AccountError> {
 #[derive(Clone)]
 pub struct Accounts {
     db: Db,
+    /// PBKDF2 runs allowed at once. Each takes a CPU for milliseconds; without a cap a flood of
+    /// sign-ups or PLAIN sign-ins fills the blocking pool the database needs too.
+    slots: Arc<Semaphore>,
 }
 
 impl Accounts {
     pub fn new(db: Db) -> Self {
-        Accounts { db }
+        Self::with_slots(db, std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 16))
+    }
+
+    fn with_slots(db: Db, slots: usize) -> Self {
+        Accounts { db, slots: Arc::new(Semaphore::new(slots)) }
+    }
+
+    /// Runs password hashing on a blocking thread once a slot is free. The slot goes with the
+    /// work, so a caller that gives up waiting doesn't let another run start early.
+    async fn hashing<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> Result<T, DbError> {
+        let slot = self.slots.clone().acquire_owned().await.map_err(|e| DbError::Join(e.to_string()))?;
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            f()
+        })
+        .await
+        .map_err(|e| DbError::Join(e.to_string()))
     }
 
     pub async fn create(&self, host: &str, user: &str, password: &str, role: Role) -> Result<(), AccountError> {
@@ -229,10 +251,15 @@ impl Accounts {
             ));
         }
         check_password(password)?;
-        let pw = password.to_string();
-        let d = tokio::task::spawn_blocking(move || derive(&pw)).await.map_err(|e| DbError::Join(e.to_string()))?;
-        let (host, user) = (host.to_string(), user.to_string());
         let jid = format!("{user}@{host}");
+        // A taken name is refused before hashing: trying names that exist must stay cheap. The
+        // insert below still settles a race between two sign-ups for one name.
+        if self.exists(host, user).await? {
+            return Err(AccountError::Exists(jid));
+        }
+        let pw = password.to_string();
+        let d = self.hashing(move || derive(&pw)).await?;
+        let (host, user) = (host.to_string(), user.to_string());
         let now = quark_core::time::now_ms();
         let inserted = self
             .db
@@ -394,7 +421,7 @@ impl Accounts {
     /// Fills in keys an import lacked, from a password just checked; the password stays the same.
     async fn complete_keys(&self, host: &str, user: &str, password: &str) -> Result<(), DbError> {
         let pw = password.to_string();
-        let d = tokio::task::spawn_blocking(move || derive(&pw)).await.map_err(|e| DbError::Join(e.to_string()))?;
+        let d = self.hashing(move || derive(&pw)).await?;
         let (h, u) = (host.to_string(), user.to_string());
         self.db
             .write(move |t| {
@@ -423,12 +450,12 @@ impl Accounts {
         };
         let pw = password.to_string();
         let (salt, iterations) = (k.salt.clone(), k.iterations);
-        let ok = tokio::task::spawn_blocking(move || {
-            let (stored, _) = h.keys(&h.salted_password(saslprep(&pw).as_bytes(), &salt, iterations));
-            bool::from(stored.ct_eq(&stored_key))
-        })
-        .await
-        .map_err(|e| DbError::Join(e.to_string()))?;
+        let ok = self
+            .hashing(move || {
+                let (stored, _) = h.keys(&h.salted_password(saslprep(&pw).as_bytes(), &salt, iterations));
+                bool::from(stored.ct_eq(&stored_key))
+            })
+            .await?;
         if ok && k.keys.iter().any(Option::is_none) {
             self.complete_keys(host, user, password).await?;
         }
@@ -438,7 +465,7 @@ impl Accounts {
     pub async fn set_password(&self, host: &str, user: &str, password: &str) -> Result<(), AccountError> {
         check_password(password)?;
         let pw = password.to_string();
-        let d = tokio::task::spawn_blocking(move || derive(&pw)).await.map_err(|e| DbError::Join(e.to_string()))?;
+        let d = self.hashing(move || derive(&pw)).await?;
         let (h, u) = (host.to_string(), user.to_string());
         let now = quark_core::time::now_ms();
         let n = self
@@ -551,6 +578,19 @@ mod tests {
         assert!(a.keys("a.test", "kim").await.unwrap().unwrap().keys.iter().all(Option::is_some));
         assert!(a.verify_password("a.test", "kim", "old pw").await.unwrap());
         assert!(matches!(a.create_with_keys("a.test", "kim", &k, &facts).await, Err(AccountError::Exists(_))));
+    }
+
+    #[tokio::test]
+    async fn taken_names_are_refused_without_hashing() {
+        let db = Db::memory().unwrap();
+        db.migrate(&[&MIGRATION]).unwrap();
+        Accounts::new(db.clone()).create("a.test", "sam", "correct horse", Role::Member).await.unwrap();
+        // No hashing slots at all: anything that hashes waits forever.
+        let a = Accounts::with_slots(db, 0);
+        let wait = std::time::Duration::from_millis(300);
+        let taken = tokio::time::timeout(wait, a.create("a.test", "sam", "correct horse", Role::Member)).await;
+        assert!(matches!(taken, Ok(Err(AccountError::Exists(_)))), "{taken:?}");
+        assert!(tokio::time::timeout(wait, a.create("a.test", "kim", "correct horse", Role::Member)).await.is_err());
     }
 
     #[tokio::test]

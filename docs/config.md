@@ -16,6 +16,7 @@ seeds them for a domain Quark hasn't seen before.
 | `QUARK_DOMAIN` | Comma-separated domains to serve, added to those in the file. |
 | `QUARK_ADMINS` | Comma-separated admin JIDs (each added to its domain). |
 | `QUARK_DATA_DIR` | Overrides `server.data_dir`. |
+| `QUARK_TURN_PORT`, `QUARK_TURN_RELAY_MIN`, `QUARK_TURN_RELAY_MAX` | Move the call relay (`turn.listen` port and relay range). In a container, publish them with the same numbers outside and inside. |
 | `QUARK_LOG` | Overrides `server.log` (a `tracing` filter, e.g. `quark=debug`). |
 | `QUARK_TURN_EXTERNAL_IP` | Overrides `turn.external_ip`: the public IP the call relay advertises. Needed in Docker and behind NAT. |
 

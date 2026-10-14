@@ -1357,7 +1357,7 @@ checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quark"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1415,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "quark-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "quick-xml",
  "rand 0.8.8",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "quark-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rand 0.8.8",
  "rmcp",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "quark-testkit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",

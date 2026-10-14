@@ -571,7 +571,9 @@ impl Config {
     /// Applies environment overrides, for containers: `QUARK_DOMAIN` (comma separated) adds
     /// domains, `QUARK_ADMINS` adds admins to them, `QUARK_DATA_DIR` moves the data, and
     /// `QUARK_TURN_EXTERNAL_IP` sets `turn.external_ip` (in a container the relay can't see the
-    /// host's public address, only its bridge network's).
+    /// host's public address, only its bridge network's), and `QUARK_TURN_PORT`,
+    /// `QUARK_TURN_RELAY_MIN` and `QUARK_TURN_RELAY_MAX` move the relay, which must use the same
+    /// port numbers inside and outside a container because it tells clients where to send.
     pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<(), ConfigError> {
         if let Some(dir) = env("QUARK_DATA_DIR").filter(|s| !s.is_empty()) {
             self.server.data_dir = PathBuf::from(dir);
@@ -579,6 +581,26 @@ impl Config {
         if let Some(ip) = env("QUARK_TURN_EXTERNAL_IP").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
             let ip = ip.parse().map_err(|_| ConfigError::Invalid(format!("QUARK_TURN_EXTERNAL_IP: \"{ip}\" isn't an IP address.")))?;
             self.turn.external_ip = Some(ip);
+        }
+        let port = |k: &str| -> Result<Option<u16>, ConfigError> {
+            match env(k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                None => Ok(None),
+                Some(v) => v
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|p| *p > 0)
+                    .map(Some)
+                    .ok_or_else(|| ConfigError::Invalid(format!("{k}: \"{v}\" isn't a port number."))),
+            }
+        };
+        if let Some(p) = port("QUARK_TURN_PORT")? {
+            self.turn.listen.set_port(p);
+        }
+        if let Some(p) = port("QUARK_TURN_RELAY_MIN")? {
+            self.turn.relay_min = p;
+        }
+        if let Some(p) = port("QUARK_TURN_RELAY_MAX")? {
+            self.turn.relay_max = p;
         }
         if let Some(domains) = env("QUARK_DOMAIN") {
             for d in domains.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -672,6 +694,23 @@ mod tests {
         assert_eq!(c.turn.external_ip, Some("203.0.113.7".parse().unwrap()));
         let mut c = Config::parse("", Path::new("x")).unwrap();
         assert!(c.apply_env(|k| (k == "QUARK_TURN_EXTERNAL_IP").then(|| "turn.example".into())).is_err());
+    }
+
+    #[test]
+    fn env_moves_the_relay_ports() {
+        let mut c = Config::parse("", Path::new("x")).unwrap();
+        c.apply_env(|k| match k {
+            "QUARK_TURN_PORT" => Some("3479".into()),
+            "QUARK_TURN_RELAY_MIN" => Some("49210".into()),
+            "QUARK_TURN_RELAY_MAX" => Some("49250".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!((c.turn.listen.port(), c.turn.relay_min, c.turn.relay_max), (3479, 49210, 49250));
+        let mut c = Config::parse("", Path::new("x")).unwrap();
+        assert!(c.apply_env(|k| (k == "QUARK_TURN_PORT").then(|| "nope".into())).is_err());
+        let mut c = Config::parse("", Path::new("x")).unwrap();
+        assert!(c.apply_env(|k| (k == "QUARK_TURN_RELAY_MIN").then(|| "60000".into())).is_err(), "min above max is refused");
     }
 
     #[test]

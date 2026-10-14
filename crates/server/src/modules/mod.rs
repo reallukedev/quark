@@ -151,14 +151,6 @@ pub enum Event {
     SettingsChanged {
         domain: String,
     },
-    /// Local people were mentioned in a group chat while none of their devices in it was awake
-    /// (not joined, or only from devices that are asleep or in the background), so push can
-    /// wake one. `message` is the groupchat message as the room sent it.
-    RoomMention {
-        room: Jid,
-        users: Vec<Jid>,
-        message: Element,
-    },
     /// An account stored a new vcard-temp (PEP mirrors its avatar, XEP-0398).
     VCardChanged {
         jid: Jid,

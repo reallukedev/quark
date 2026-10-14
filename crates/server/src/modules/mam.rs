@@ -469,6 +469,38 @@ pub async fn fetch(srv: &Server, archive: &Jid, ids: &[String]) -> Vec<(String, 
     })
 }
 
+/// Replaces an archived message with what `replace` makes of it (a tombstone, XEP-0424 §6 and
+/// XEP-0425 §5), taking it out of the search index. `replace` sees the stored message and
+/// returns None to leave it alone. True when a message was replaced.
+pub async fn tombstone(
+    srv: &Server,
+    archive: &Jid,
+    stanza_id: &str,
+    replace: impl FnOnce(&Element) -> Option<Element> + Send + 'static,
+) -> Result<bool, StanzaError> {
+    let Some(id) = decode_id(stanza_id) else { return Ok(false) };
+    let jid = archive.to_bare().to_string();
+    srv.db
+        .write(move |t| {
+            let row: Option<(Vec<u8>, bool)> = t
+                .prepare_cached(
+                    "SELECT m.xml, m.indexed FROM mam m JOIN mam_archives a ON a.id = m.archive WHERE a.jid = ?1 AND m.id = ?2",
+                )?
+                .query_row(params![jid, id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            let Some((blob, indexed)) = row else { return Ok(false) };
+            let Some(new) = codec::unpack(&blob).and_then(|old| replace(&old)) else { return Ok(false) };
+            let new = for_storage(&new, &jid);
+            if indexed {
+                t.prepare_cached("DELETE FROM mam_fts WHERE rowid = ?1")?.execute([id])?;
+            }
+            t.prepare_cached("UPDATE mam SET xml = ?2, indexed = 0 WHERE id = ?1")?.execute(params![id, codec::pack(&new)])?;
+            Ok(true)
+        })
+        .await
+        .map_err(db_error)
+}
+
 // ---------------------------------------------------------------- preferences (XEP-0441)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

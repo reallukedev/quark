@@ -17,8 +17,9 @@ pub const MSG_MODERATE_1: &str = "urn:xmpp:message-moderate:1";
 pub const RETRACT_0: &str = "urn:xmpp:message-retract:0";
 pub const FASTEN: &str = "urn:xmpp:fasten:0";
 pub const REACTIONS: &str = "urn:xmpp:reactions:0";
-pub const REFERENCE: &str = "urn:xmpp:reference:0";
 const OMEMO_2: &str = "urn:xmpp:omemo:2";
+/// XEP-0317: hats are the room's to hand out, and this one hands out none.
+const HATS: &str = "urn:xmpp:hats:0";
 
 /// Devices one person can join with under the same nickname.
 const MAX_SESSIONS: usize = 20;
@@ -34,9 +35,19 @@ const MAX_PENDING_IQS: usize = 256;
 const PENDING_IQ_TTL: Duration = Duration::from_secs(60);
 const VOICE_REQUEST_EVERY: Duration = Duration::from_secs(60);
 pub const MAX_ITEMS_PER_REQUEST: usize = 100;
-/// Affiliations a room can hold (members, admins, bans…).
+/// Affiliations other than bans a room can hold (members, admins, owners).
 const MAX_AFFILIATIONS: usize = 10_000;
+/// Bans a room can hold, counted apart so that a full member list never stops a ban.
+const MAX_BANS: usize = 10_000;
+/// Above this many affiliations other than bans, only admins add more: people registering
+/// themselves or members inviting others can't fill the room's list.
+const MAX_SELF_SERVICE: usize = 5_000;
 const MAX_INVITES_PER_MESSAGE: usize = 10;
+/// The text of an invitation's or a decline's reason.
+const MAX_REASON_BYTES: usize = 1024;
+/// Invitations remembered so the invitee can decline them, and for how long.
+const MAX_PENDING_INVITES: usize = 1_000;
+const INVITE_TTL: Duration = Duration::from_secs(24 * 3600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Affiliation {
@@ -184,23 +195,16 @@ struct Proxied {
     at: Instant,
 }
 
-/// Someone mentioned in a message, with the devices they're in the room with.
-#[derive(Debug, Clone)]
-pub struct Mention {
-    pub user: Jid,
-    pub sessions: Vec<Jid>,
-}
-
 /// What handling a stanza produced.
 #[derive(Debug, Default)]
 pub struct Out {
     /// For people in the room (or asking it something), delivered in order.
     pub send: Vec<Element>,
-    /// For people who may be offline (invitations, declines): routed so they can be stored.
+    /// Invitations, declines and private messages: routed like any message to a person, so
+    /// they're stored for people who are offline, archived, pushed to sleeping phones and kept
+    /// from people who blocked the sender.
     pub route: Vec<Element>,
     pub db: Vec<Op>,
-    pub mentions: Vec<Mention>,
-    pub mention_msg: Option<Element>,
     /// The room is gone: destroyed, or temporary and empty.
     pub closed: bool,
     pub delete_archive: bool,
@@ -217,6 +221,46 @@ pub struct Prepared {
     pub history: bool,
     pub subject: Option<String>,
     pub nick: Option<String>,
+    /// XEP-0424: the stanza id of the sender's own message this takes back.
+    pub retracts: Option<String>,
+    /// What replaces a message in the room's archive once this went out.
+    pub tombstone: Option<Tombstone>,
+}
+
+/// A message to replace in the room's archive with what's left of it (XEP-0424, XEP-0425):
+/// who sent it and when, and how it went, nothing of what it said.
+#[derive(Debug, Clone)]
+pub struct Tombstone {
+    pub sid: String,
+    /// Elements saying how the message went (`<retracted/>` and the like).
+    pub marks: Vec<Element>,
+    /// Only replaced when the archived message has this occupant id: people retract only
+    /// their own messages, and the archive reaches further back than the join history.
+    pub sender_id: Option<String>,
+}
+
+impl Tombstone {
+    /// The archived message `original` as its tombstone, or None when it isn't one this
+    /// tombstone may replace.
+    pub fn apply(&self, original: &Element) -> Option<Element> {
+        let oid = original.get_child("occupant-id", ns::OCCUPANT_ID);
+        if let Some(want) = &self.sender_id {
+            if oid.and_then(|o| o.attr("id")) != Some(want.as_str()) {
+                return None;
+            }
+        }
+        let mut t = Element::new("message", ns::CLIENT);
+        for a in ["from", "type", "id"] {
+            t.set_attr_opt(a, original.attr(a));
+        }
+        for m in &self.marks {
+            t.append(m.clone());
+        }
+        if let Some(o) = oid {
+            t.append(o.clone());
+        }
+        Some(t)
+    }
 }
 
 /// A join request.
@@ -246,12 +290,7 @@ pub fn occupant_id(salt: &str, bare: &Jid) -> String {
 
 /// What a client puts in its presence that the room replaces with its own.
 fn room_owned(e: &Element) -> bool {
-    e.ns() == ns::MUC || e.ns() == ns::MUC_USER || e.is("occupant-id", ns::OCCUPANT_ID)
-}
-
-/// Body text of a message, if any.
-fn body(msg: &Element) -> Option<String> {
-    msg.child_text("body", ns::CLIENT)
+    e.ns() == ns::MUC || e.ns() == ns::MUC_USER || e.is("occupant-id", ns::OCCUPANT_ID) || e.ns() == HATS
 }
 
 fn default_role(aff: Affiliation, moderated: bool) -> Role {
@@ -280,6 +319,12 @@ pub fn check_role_change(
     }
     if target_aff >= Affiliation::Admin && new < Role::Moderator {
         return Err(err(Condition::NotAllowed, "Admins and owners can't be kicked or silenced; change their affiliation first."));
+    }
+    // §8.2, §8.4: nobody kicks or silences someone whose affiliation is at or above their own.
+    // People without one are the exception: a moderator who has no affiliation either still
+    // has to be able to deal with strangers, who are what moderation is for.
+    if new < target_role && target_aff > Affiliation::None && target_aff >= actor_aff {
+        return Err(err(Condition::NotAllowed, "You can't kick or silence someone whose affiliation is at or above yours."));
     }
     Ok(())
 }
@@ -339,6 +384,8 @@ pub struct Room {
     pub vcard: Option<String>,
     pub avatar_hash: Option<String>,
     pending: HashMap<String, Proxied>,
+    /// Invitee (bare) → who invited them and when, so only someone invited can decline.
+    invited: HashMap<Jid, (Jid, Instant)>,
     /// Messages are archived: the room's setting and the domain's history setting both allow it.
     pub logging: bool,
     /// When the last person left (for unloading idle persistent rooms).
@@ -364,6 +411,7 @@ impl Room {
             vcard: None,
             avatar_hash: None,
             pending: HashMap::new(),
+            invited: HashMap::new(),
             logging: false,
             empty_since: Some(Instant::now()),
             destroyed: false,
@@ -494,6 +542,12 @@ impl Room {
         let mut v: Vec<String> = self.affiliations.iter().filter(|(_, a)| a.affiliation == aff).map(|(j, _)| j.to_string()).collect();
         v.sort();
         v
+    }
+
+    /// Affiliations other than bans, and bans (each has its own limit).
+    fn affiliation_counts(&self) -> (usize, usize) {
+        let bans = self.affiliations.values().filter(|a| a.affiliation == Affiliation::Outcast).count();
+        (self.affiliations.len() - bans, bans)
     }
 
     // ---------------------------------------------------------------- presence
@@ -1013,7 +1067,7 @@ impl Room {
         m.remove_attr("to");
         m.set_attr("type", "groupchat");
         m.remove_children(|c| room_owned(c) || (c.is("stanza-id", ns::SID) && c.attr("by") == Some(&room)) || c.is("delay", ns::DELAY));
-        m.append(Element::new("occupant-id", ns::OCCUPANT_ID).attr_set("id", oid));
+        m.append(Element::new("occupant-id", ns::OCCUPANT_ID).attr_set("id", oid.as_str()));
         let no_store = msg.has_child("no-store", ns::HINTS) || msg.has_child("no-permanent-store", ns::HINTS);
         let retract = msg.get_child("retract", ns::RETRACT).and_then(|r| r.attr("id")).map(str::to_string);
         let archive = !no_store
@@ -1025,16 +1079,23 @@ impl Room {
                 || msg.has_child("reactions", REACTIONS)
                 || msg.has_child("apply-to", FASTEN)
                 || msg.has_child("store", ns::HINTS));
-        if let Some(id) = retract {
-            // XEP-0424: the sender takes back their own message; people joining later won't see it.
-            if let Some(i) = self.history.iter().position(|h| h.sid == id && h.sender == sender) {
-                if let Some(h) = self.history.remove(i) {
-                    self.history_bytes -= h.bytes;
-                }
-            }
-        }
+        // XEP-0424 §6: the archive keeps that the sender took the message back, not what it said.
+        let tombstone = retract.as_ref().filter(|_| archive).map(|id| Tombstone {
+            sid: id.clone(),
+            marks: vec![Element::new("retracted", ns::RETRACT).attr_set("stamp", quark_core::time::xep82(quark_core::time::now_ms()))],
+            sender_id: Some(oid.clone()),
+        });
         let history = archive && !is_subject && !msg.has_child("retract", ns::RETRACT) && !msg.has_child("apply-to", FASTEN);
-        Ok(Some(Prepared { msg: m, sender, archive, history, subject: is_subject.then(|| subject.unwrap_or_default()), nick: Some(nick) }))
+        Ok(Some(Prepared {
+            msg: m,
+            sender,
+            archive,
+            history,
+            subject: is_subject.then(|| subject.unwrap_or_default()),
+            nick: Some(nick),
+            retracts: retract,
+            tombstone,
+        }))
     }
 
     /// A message from the server under `nick`, with nobody joined as that nick (Gluon alerts).
@@ -1046,7 +1107,16 @@ impl Room {
             .attr_set("id", quark_core::new_id())
             .text_child("body", ns::CLIENT, body)
             .child(Element::new("occupant-id", ns::OCCUPANT_ID).attr_set("id", occupant_id(&self.salt, &self.jid)));
-        Ok(Prepared { msg, sender: self.jid.clone(), archive: true, history: true, subject: None, nick: Some(nick.to_string()) })
+        Ok(Prepared {
+            msg,
+            sender: self.jid.clone(),
+            archive: true,
+            history: true,
+            subject: None,
+            nick: Some(nick.to_string()),
+            retracts: None,
+            tombstone: None,
+        })
     }
 
     /// Sends a prepared message to everyone, with its stanza id, and keeps it for people joining.
@@ -1065,19 +1135,16 @@ impl Room {
             self.subject = Some(Subject { text, nick: p.nick.clone(), at: now });
             self.save(out);
         }
-        if let Some(b) = body(&p.msg) {
-            let refs: Vec<String> = p
-                .msg
-                .children()
-                .filter(|c| c.is("reference", REFERENCE) && c.attr("type") == Some("mention"))
-                .filter_map(|c| c.attr("uri"))
-                .filter_map(|u| Jid::parse(u.strip_prefix("xmpp:")?).ok())
-                .filter(|j| j.to_bare() == self.jid)
-                .filter_map(|j| j.resource().map(str::to_string))
-                .collect();
-            out.mentions = self.mentions(&b, &refs, &p.sender);
-            if !out.mentions.is_empty() {
-                out.mention_msg = Some(p.msg.clone());
+        if let Some(id) = &p.retracts {
+            // XEP-0424: the sender takes back their own message; people joining later won't
+            // see it, here or after the room was read back from storage.
+            if let Some(i) = self.history.iter().position(|h| h.sid == *id && h.sender == p.sender) {
+                if let Some(h) = self.history.remove(i) {
+                    self.history_bytes -= h.bytes;
+                }
+                if self.config.persistent {
+                    out.db.push(Op::Unhistory { sid: id.clone() });
+                }
             }
         }
         if p.history && self.config.history_length > 0 {
@@ -1102,31 +1169,6 @@ impl Room {
                 self.history_bytes -= old.bytes;
             }
         }
-    }
-
-    /// People mentioned by nickname in `text` (or by XEP-0372 reference), other than the sender:
-    /// occupants and members with a known nickname.
-    fn mentions(&self, text: &str, refs: &[String], sender: &Jid) -> Vec<Mention> {
-        let lower = text.to_lowercase();
-        let mut found: Vec<Mention> = Vec::new();
-        let mut add = |user: &Jid, sessions: Vec<Jid>| {
-            if user != sender && !found.iter().any(|m| m.user == *user) {
-                found.push(Mention { user: user.clone(), sessions });
-            }
-        };
-        let hit = |nick: &str| refs.iter().any(|r| r == nick) || mentioned(&lower, nick);
-        for o in self.occupants.values() {
-            if hit(&o.nick) {
-                add(&o.bare, o.sessions.iter().map(|s| s.jid.clone()).collect());
-            }
-        }
-        for (j, a) in self.affiliations.iter().filter(|(_, a)| a.affiliation >= Affiliation::Member) {
-            let known = [a.nick.as_deref(), a.last_nick.as_deref()];
-            if known.into_iter().flatten().any(hit) {
-                add(j, Vec::new());
-            }
-        }
-        found
     }
 
     /// A private message to `nick` (XEP-0045 §7.5).
@@ -1158,10 +1200,12 @@ impl Room {
         m.remove_children(room_owned);
         m.append(Element::new("x", ns::MUC_USER));
         m.append(Element::new("occupant-id", ns::OCCUPANT_ID).attr_set("id", oid));
+        // Routed, not sent straight to the device: it's a message to a person, which their
+        // block list, archive and push notifications apply to.
         for s in &target.sessions {
             let mut m = m.clone();
             m.set_attr("to", s.jid.to_string());
-            out.send.push(m);
+            out.route.push(m);
         }
         Ok(())
     }
@@ -1170,14 +1214,29 @@ impl Room {
     pub fn invitations(&mut self, from: &Jid, admin: bool, x: &Element, out: &mut Out) -> Result<(), StanzaError> {
         let bare = from.to_bare();
         let aff = self.aff(&bare, admin);
-        for d in x.children().filter(|c| c.is("decline", ns::MUC_USER)).take(1) {
-            let Some(to) = d.attr("to").and_then(|t| Jid::parse(t).ok()) else {
-                return Err(err(Condition::JidMalformed, "That decline doesn't say who it's for."));
-            };
-            let mut dec = Element::new("decline", ns::MUC_USER).attr_set("from", bare.to_string());
-            if let Some(r) = d.get_child("reason", ns::MUC_USER) {
-                dec.append(r.clone());
+        let reason_of = |e: &Element| -> Result<Option<Element>, StanzaError> {
+            match e.child_text("reason", ns::MUC_USER) {
+                Some(r) if r.len() > MAX_REASON_BYTES => Err(err(Condition::NotAcceptable, "That reason is too long.")),
+                // Rebuilt from its text: what a client nests inside isn't passed on.
+                r => Ok(r.map(|r| Element::new("reason", ns::MUC_USER).text(r))),
             }
+        };
+        let now = Instant::now();
+        self.invited.retain(|_, (_, at)| now.duration_since(*at) < INVITE_TTL);
+        for d in x.children().filter(|c| c.is("decline", ns::MUC_USER)).take(1) {
+            // Only someone the room invited can decline, and only once: the decline goes to
+            // whoever invited them, so nobody can use the room to message people at will.
+            let Some((to, _)) = self.invited.get(&bare).cloned() else {
+                return Err(err(Condition::NotAcceptable, "You haven't been invited to this group chat."));
+            };
+            if d.attr("to").and_then(|t| Jid::parse(t).ok()).is_some_and(|t| t.to_bare() != to) {
+                return Err(err(Condition::NotAcceptable, "You weren't invited by that person."));
+            }
+            let mut dec = Element::new("decline", ns::MUC_USER).attr_set("from", bare.to_string());
+            if let Some(r) = reason_of(d)? {
+                dec.append(r);
+            }
+            self.invited.remove(&bare);
             out.route.push(
                 Element::new("message", ns::CLIENT)
                     .attr_set("from", self.jid.to_string())
@@ -1206,19 +1265,38 @@ impl Room {
             let Some(to) = i.attr("to").and_then(|t| Jid::parse(t).ok()) else {
                 return Err(err(Condition::JidMalformed, "That invitation doesn't say who it's for."));
             };
-            targets.push((to, i.get_child("reason", ns::MUC_USER).cloned(), i.get_child("continue", ns::MUC_USER).cloned()));
+            let cont =
+                i.get_child("continue", ns::MUC_USER).map(|c| Element::new("continue", ns::MUC_USER).attr_opt("thread", c.attr("thread")));
+            targets.push((to, reason_of(i)?, cont));
         }
+        // Each invitation costs what a message does, so invitations can't flood people.
+        if let Some(o) = inviter_nick.as_ref().and_then(|n| self.occupants.get_mut(n)) {
+            if !(0..targets.len()).all(|_| o.bucket.take()) {
+                return Err(
+                    err(Condition::ResourceConstraint, "You're sending invitations too fast; wait a moment.").with_type(ErrorType::Wait)
+                );
+            }
+        }
+        let limit = if aff >= Affiliation::Admin { MAX_AFFILIATIONS } else { MAX_SELF_SERVICE };
+        let (mut standing, _) = self.affiliation_counts();
         let name = self.config.name.clone().unwrap_or_else(|| self.jid.to_string());
         for (to, reason, cont) in targets {
             let invitee = to.to_bare();
             if self.config.members_only && self.aff(&invitee, false) == Affiliation::None {
-                if self.affiliations.len() >= MAX_AFFILIATIONS {
+                if standing >= limit {
                     return Err(err(Condition::ResourceConstraint, "This group chat has too many members."));
                 }
+                standing += 1;
                 self.affiliations
                     .insert(invitee.clone(), AffEntry { affiliation: Affiliation::Member, reason: None, nick: None, last_nick: None });
                 self.save_affiliation(&invitee, out);
             }
+            if self.invited.len() >= MAX_PENDING_INVITES && !self.invited.contains_key(&invitee) {
+                if let Some(oldest) = self.invited.iter().min_by_key(|(_, (_, at))| *at).map(|(j, _)| j.clone()) {
+                    self.invited.remove(&oldest);
+                }
+            }
+            self.invited.insert(invitee, (bare.clone(), now));
             let mut inv = Element::new("invite", ns::MUC_USER).attr_set("from", bare.to_string());
             if let Some(r) = reason {
                 inv.append(r);
@@ -1339,7 +1417,33 @@ impl Room {
             .attr_set("id", quark_core::new_id())
             .child(v1)
             .child(Element::new("apply-to", FASTEN).attr_set("id", sid).child(moderated0));
-        Ok(Prepared { msg, sender: self.jid.clone(), archive: true, history: false, subject: None, nick: None })
+        // What the archive keeps instead (XEP-0425 §5), in both versions too.
+        let stamp = quark_core::time::xep82(quark_core::time::now_ms());
+        let mut retracted = Element::new("retracted", ns::RETRACT).attr_set("stamp", stamp.as_str()).child(
+            Element::new("moderated", MSG_MODERATE_1)
+                .attr_set("by", by.as_str())
+                .child(Element::new("occupant-id", ns::OCCUPANT_ID).attr_set("id", oid.as_str())),
+        );
+        if let Some(r) = reason_el(ns::RETRACT) {
+            retracted.append(r);
+        }
+        let mut retracted0 = Element::new("moderated", MSG_MODERATE_0)
+            .attr_set("by", by.as_str())
+            .child(Element::new("retracted", RETRACT_0).attr_set("stamp", stamp.as_str()));
+        if let Some(r) = reason_el(MSG_MODERATE_0) {
+            retracted0.append(r);
+        }
+        let tombstone = Tombstone { sid: sid.to_string(), marks: vec![retracted, retracted0], sender_id: None };
+        Ok(Prepared {
+            msg,
+            sender: self.jid.clone(),
+            archive: true,
+            history: false,
+            subject: None,
+            nick: None,
+            retracts: None,
+            tombstone: Some(tombstone),
+        })
     }
 
     // ---------------------------------------------------------------- admin (XEP-0045 §8–9)
@@ -1446,12 +1550,31 @@ impl Room {
         if had_owner && owners.is_empty() {
             return Err(err(Condition::Conflict, "A group chat needs at least one owner."));
         }
-        let new_entries = plan
-            .iter()
-            .filter(|c| matches!(c, Change::Aff { jid, aff, .. } if *aff != Affiliation::None && !self.affiliations.contains_key(jid)))
-            .count();
-        if self.affiliations.len() + new_entries > MAX_AFFILIATIONS {
-            return Err(err(Condition::ResourceConstraint, "This group chat has too many affiliations."));
+        // Bans and everything else have limits of their own, so a full member list (people can
+        // register themselves) never stops a ban. A change that shrinks a list is always fine.
+        let (standing, bans) = self.affiliation_counts();
+        let (mut standing_after, mut bans_after) = (standing, bans);
+        let mut planned: HashMap<&Jid, Affiliation> = HashMap::new();
+        for c in &plan {
+            if let Change::Aff { jid, aff, .. } = c {
+                let before =
+                    planned.get(jid).copied().unwrap_or_else(|| self.affiliations.get(jid).map_or(Affiliation::None, |a| a.affiliation));
+                for (a, delta) in [(before, -1isize), (*aff, 1)] {
+                    let slot = match a {
+                        Affiliation::None => continue,
+                        Affiliation::Outcast => &mut bans_after,
+                        _ => &mut standing_after,
+                    };
+                    *slot = slot.saturating_add_signed(delta);
+                }
+                planned.insert(jid, *aff);
+            }
+        }
+        if standing_after > standing && standing_after > MAX_AFFILIATIONS {
+            return Err(err(Condition::ResourceConstraint, "This group chat has too many members."));
+        }
+        if bans_after > bans && bans_after > MAX_BANS {
+            return Err(err(Condition::ResourceConstraint, "This group chat has banned as many people as it can; lift some bans first."));
         }
         let actor = actor_nick.as_deref();
         for c in plan {
@@ -1500,8 +1623,9 @@ impl Room {
     /// Applies a submitted configuration form.
     pub fn configure(&mut self, v: &super::form::Values, out: &mut Out) -> Result<(), StanzaError> {
         let was_persistent = self.config.persistent;
-        let was_locked = self.locked_since.take().is_some();
+        // A form that's refused leaves everything as it was, a new room still locked included.
         let changes = self.config.apply(v).map_err(|t| err(Condition::NotAcceptable, &t))?;
+        let was_locked = self.locked_since.take().is_some();
         if self.config.persistent && !was_persistent {
             out.db.push(Op::Snapshot(Box::new(self.snapshot())));
         } else if changes.became_temporary {
@@ -1612,10 +1736,21 @@ impl Room {
         if self.reserved_by_other(&nick, &bare) || self.occupants.get(&nick).is_some_and(|o| o.bare != bare) {
             return Err(err(Condition::Conflict, "That nickname is taken."));
         }
-        if !self.affiliations.contains_key(&bare) && self.affiliations.len() >= MAX_AFFILIATIONS {
-            return Err(err(Condition::ResourceConstraint, "This group chat has too many members."));
-        }
         let became_member = aff < Affiliation::Member;
+        if became_member {
+            // Registering makes someone a member, and members talk without being given a voice.
+            // So only someone in the room who may talk already can make themselves one (anyone
+            // else would be a stranger, or a remote server, filling the member list).
+            let Some(o) = self.occupant_of(from) else {
+                return Err(err(Condition::NotAcceptable, "Join the group chat before registering with it."));
+            };
+            if o.role < Role::Participant {
+                return Err(err(Condition::NotAllowed, "You need a voice in this group chat before you can register with it."));
+            }
+            if self.affiliation_counts().0 >= MAX_SELF_SERVICE {
+                return Err(err(Condition::ResourceConstraint, "This group chat has too many members; ask an admin to add you."));
+            }
+        }
         let e = self.affiliations.entry(bare.clone()).or_insert(AffEntry {
             affiliation: Affiliation::Member,
             reason: None,
@@ -1628,14 +1763,10 @@ impl Room {
         e.nick = Some(nick);
         self.save_affiliation(&bare, out);
         if became_member {
-            let nicks: Vec<String> = self.occupants.values().filter(|o| o.bare == bare).map(|o| o.nick.clone()).collect();
-            for n in nicks {
-                let mut was = Role::Participant;
-                if let Some(o) = self.occupants.get_mut(&n) {
-                    was = o.role;
-                    o.role = o.role.max(Role::Participant);
-                }
-                self.announce(&n, None, None, was, out);
+            // Their role stays: they could talk already, and nothing else changes with it.
+            let nicks: Vec<(String, Role)> = self.occupants.values().filter(|o| o.bare == bare).map(|o| (o.nick.clone(), o.role)).collect();
+            for (n, role) in nicks {
+                self.announce(&n, None, None, role, out);
             }
         }
         Ok(())
@@ -1743,7 +1874,9 @@ impl Room {
         self.pending.retain(|_, p| now.duration_since(p.at) < PENDING_IQ_TTL);
     }
 
-    /// Who may read the archive (XEP-0313 on a room).
+    /// Who may read the archive (XEP-0313 §5.1.2 on a room): whoever could join it. A password
+    /// can't be checked on a query, so in a room that has one only the people in it now (who
+    /// gave it) and those who never need it (admins and owners) may read back.
     pub fn may_read_archive(&self, from: &Jid, admin: bool) -> Result<(), StanzaError> {
         let aff = self.aff(&from.to_bare(), admin);
         if aff == Affiliation::Outcast {
@@ -1751,6 +1884,9 @@ impl Room {
         }
         if self.config.members_only && aff < Affiliation::Member {
             return Err(err(Condition::Forbidden, "Only members can read this group chat's history."));
+        }
+        if self.config.password.is_some() && aff < Affiliation::Admin && self.occupant_of(from).is_none() {
+            return Err(err(Condition::Forbidden, "Join the group chat to read its history."));
         }
         Ok(())
     }
@@ -1782,16 +1918,6 @@ fn aff_row(j: &Jid, a: &AffEntry) -> AffRow {
         nick: a.nick.clone(),
         last_nick: a.last_nick.clone(),
     }
-}
-
-/// Whether `nick` appears in `lower` (already lowercased) as a whole word.
-fn mentioned(lower: &str, nick: &str) -> bool {
-    let n = nick.to_lowercase();
-    if n.is_empty() {
-        return false;
-    }
-    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
-    lower.match_indices(&n).any(|(i, m)| !word(lower[..i].chars().next_back()) && !word(lower[i + m.len()..].chars().next()))
 }
 
 #[cfg(test)]
@@ -1917,15 +2043,6 @@ mod tests {
     }
 
     #[test]
-    fn mentions_are_whole_words() {
-        assert!(mentioned("hey alice, look", "Alice"));
-        assert!(mentioned("alice: hi", "alice"));
-        assert!(!mentioned("malice", "alice"));
-        assert!(!mentioned("alicea", "alice"));
-        assert!(mentioned("über cool @jürgen!", "Jürgen"));
-    }
-
-    #[test]
     fn messages_need_voice_and_get_occupant_ids() {
         let mut r = room();
         r.config.moderated = true;
@@ -1942,6 +2059,208 @@ mod tests {
         assert_eq!(out.send.len(), 2, "both occupants, the sender included");
         assert!(out.send.iter().all(|m| m.get_child("stanza-id", ns::SID).and_then(|s| s.attr("id")) == Some("sid1")));
         assert_eq!(r.prepare_message(&j("c@x/1"), &msg).unwrap_err().condition, Condition::NotAcceptable);
+    }
+
+    fn aff(a: Affiliation) -> AffEntry {
+        AffEntry { affiliation: a, reason: None, nick: None, last_nick: None }
+    }
+
+    fn register(nick: &str) -> Element {
+        let form = super::super::form::Form::new("submit", "http://jabber.org/protocol/muc#register")
+            .field("muc#register_roomnick", "text-single", "", Some(nick))
+            .build();
+        Element::new("query", ns::REGISTER).child(form)
+    }
+
+    #[test]
+    fn registering_needs_to_be_in_the_room_with_a_voice() {
+        let mut r = room();
+        r.config.moderated = true;
+        let mut out = Out::default();
+        // From outside (a remote server filling the list, say): refused.
+        assert_eq!(
+            r.register_set(&j("far@away.example/x"), false, &register("far"), &mut out).unwrap_err().condition,
+            Condition::NotAcceptable
+        );
+        assert!(r.affiliations.is_empty());
+        // A visitor in a moderated room can't give themselves a voice by registering.
+        join(&mut r, "v@x/1", "vis").unwrap();
+        assert_eq!(r.occupant("vis").unwrap().role, Role::Visitor);
+        assert_eq!(r.register_set(&j("v@x/1"), false, &register("vis"), &mut out).unwrap_err().condition, Condition::NotAllowed);
+        assert_eq!(r.occupant("vis").unwrap().role, Role::Visitor);
+        // Someone who may talk registers and keeps their role.
+        r.occupants.get_mut("vis").unwrap().role = Role::Participant;
+        r.register_set(&j("v@x/1"), false, &register("vis"), &mut out).unwrap();
+        assert_eq!(r.aff(&j("v@x"), false), Affiliation::Member);
+        assert_eq!(r.reserved_nick(&j("v@x")), Some("vis"));
+    }
+
+    #[test]
+    fn self_service_stops_short_so_bans_always_fit() {
+        let mut r = room();
+        r.affiliations.insert(j("o@x"), aff(Affiliation::Owner));
+        for i in 0..MAX_SELF_SERVICE {
+            r.affiliations.insert(j(&format!("m{i}@x")), aff(Affiliation::Member));
+        }
+        join(&mut r, "p@x/1", "p").unwrap();
+        let mut out = Out::default();
+        assert_eq!(r.register_set(&j("p@x/1"), false, &register("p"), &mut out).unwrap_err().condition, Condition::ResourceConstraint);
+        // The list of members can still grow through admins, up to its own limit…
+        for i in MAX_SELF_SERVICE..MAX_AFFILIATIONS - 1 {
+            r.affiliations.insert(j(&format!("m{i}@x")), aff(Affiliation::Member));
+        }
+        let add = |who: &str, a: &str| {
+            Element::new("query", ns::MUC_ADMIN).child(Element::new("item", ns::MUC_ADMIN).attr_set("jid", who).attr_set("affiliation", a))
+        };
+        assert_eq!(
+            r.admin_set(&j("o@x/1"), false, &add("new@x", "member"), &mut out).unwrap_err().condition,
+            Condition::ResourceConstraint
+        );
+        // …and a ban still goes through, of a stranger or of a member.
+        r.admin_set(&j("o@x/1"), false, &add("spam@x", "outcast"), &mut out).unwrap();
+        r.admin_set(&j("o@x/1"), false, &add("m1@x", "outcast"), &mut out).unwrap();
+        assert_eq!(r.aff(&j("spam@x"), false), Affiliation::Outcast);
+        assert_eq!(r.aff(&j("m1@x"), false), Affiliation::Outcast);
+    }
+
+    #[test]
+    fn a_password_keeps_the_archive_to_the_people_in_the_room() {
+        let mut r = room();
+        r.config.password = Some("pw".into());
+        r.affiliations.insert(j("m@x"), aff(Affiliation::Member));
+        r.affiliations.insert(j("a@x"), aff(Affiliation::Admin));
+        assert_eq!(r.may_read_archive(&j("s@x/1"), false).unwrap_err().condition, Condition::Forbidden);
+        assert_eq!(r.may_read_archive(&j("m@x/1"), false).unwrap_err().condition, Condition::Forbidden);
+        assert!(r.may_read_archive(&j("a@x/1"), false).is_ok(), "admins don't need the password to join either");
+        let p = Element::new("presence", ns::CLIENT).child(Element::new("x", ns::MUC).child(Element::new("password", ns::MUC).text("pw")));
+        let mut out = Out::default();
+        r.join(Join { from: &j("s@x/1"), nick: "s", presence: &p, admin: false, created: false, now: 0 }, &mut out).unwrap();
+        assert!(r.may_read_archive(&j("s@x/1"), false).is_ok());
+        r.config.password = None;
+        assert!(r.may_read_archive(&j("m@x/1"), false).is_ok());
+    }
+
+    #[test]
+    fn a_refused_configuration_leaves_a_new_room_locked() {
+        let mut r = room();
+        r.locked_since = Some(Instant::now());
+        let bad = super::super::form::Values::parse(
+            &super::super::form::Form::new("submit", super::super::config::ROOMCONFIG)
+                .field("muc#roomconfig_roomname", "text-single", "", Some(&"n".repeat(10_000)))
+                .build(),
+        );
+        let mut out = Out::default();
+        assert!(r.configure(&bad, &mut out).is_err());
+        assert!(r.locked_since.is_some());
+        let good = super::super::form::Values::parse(
+            &super::super::form::Form::new("submit", super::super::config::ROOMCONFIG)
+                .field("muc#roomconfig_roomname", "text-single", "", Some("Tea"))
+                .build(),
+        );
+        r.configure(&good, &mut out).unwrap();
+        assert!(r.locked_since.is_none());
+    }
+
+    #[test]
+    fn retractions_are_saved_and_leave_a_tombstone_for_the_sender_only() {
+        let mut r = room();
+        r.config.persistent = true;
+        join(&mut r, "a@x/1", "alice").unwrap();
+        join(&mut r, "b@x/1", "bob").unwrap();
+        let msg = Element::new("message", ns::CLIENT).attr_set("type", "groupchat").text_child("body", ns::CLIENT, "oops");
+        let p = r.prepare_message(&j("a@x/1"), &msg).unwrap().unwrap();
+        let mut out = Out::default();
+        r.commit_message(p, Some("sid1".into()), 5, &mut out);
+        let archived = r.history.back().unwrap().msg.clone();
+        let retract = Element::new("message", ns::CLIENT)
+            .attr_set("type", "groupchat")
+            .child(Element::new("retract", ns::RETRACT).attr_set("id", "sid1"));
+        // Bob can't take back Alice's message.
+        let p = r.prepare_message(&j("b@x/1"), &retract).unwrap().unwrap();
+        assert!(p.tombstone.as_ref().unwrap().apply(&archived).is_none());
+        let mut out = Out::default();
+        r.commit_message(p, Some("sid2".into()), 6, &mut out);
+        assert_eq!(r.history.len(), 1);
+        assert!(!out.db.iter().any(|o| matches!(o, Op::Unhistory { .. })));
+        // Alice can, and it's saved.
+        let p = r.prepare_message(&j("a@x/1"), &retract).unwrap().unwrap();
+        let t = p.tombstone.clone().unwrap().apply(&archived).unwrap();
+        assert!(t.has_child("retracted", ns::RETRACT) && !t.has_child("body", ns::CLIENT));
+        assert_eq!(t.attr("from"), Some("tea@rooms.x/alice"));
+        assert!(t.has_child("occupant-id", ns::OCCUPANT_ID));
+        let mut out = Out::default();
+        r.commit_message(p, Some("sid3".into()), 7, &mut out);
+        assert!(r.history.is_empty());
+        assert!(out.db.iter().any(|o| matches!(o, Op::Unhistory { sid } if sid == "sid1")));
+    }
+
+    fn invite(to: &str, reason: &str) -> Element {
+        Element::new("invite", ns::MUC_USER).attr_set("to", to).text_child("reason", ns::MUC_USER, reason)
+    }
+
+    #[test]
+    fn invitations_are_rate_limited_and_only_invitees_decline() {
+        let mut r = room();
+        join(&mut r, "a@x/1", "alice").unwrap();
+        let mut out = Out::default();
+        // Nobody invited Eve: she can't use the room to message Alice.
+        let decline = |to: &str| Element::new("x", ns::MUC_USER).child(Element::new("decline", ns::MUC_USER).attr_set("to", to));
+        assert_eq!(r.invitations(&j("e@evil/1"), false, &decline("a@x"), &mut out).unwrap_err().condition, Condition::NotAcceptable);
+        assert!(out.route.is_empty());
+        // Reasons are bounded.
+        let x = Element::new("x", ns::MUC_USER).child(invite("b@x", &"r".repeat(MAX_REASON_BYTES + 1)));
+        assert_eq!(r.invitations(&j("a@x/1"), false, &x, &mut out).unwrap_err().condition, Condition::NotAcceptable);
+        r.invitations(&j("a@x/1"), false, &Element::new("x", ns::MUC_USER).child(invite("b@x", "tea?")), &mut out).unwrap();
+        assert_eq!(out.route.len(), 1);
+        // Bob declines once; to Alice, whoever he names.
+        r.invitations(&j("b@x/phone"), false, &decline("a@x"), &mut out).unwrap();
+        assert_eq!(out.route.last().unwrap().attr("to"), Some("a@x"));
+        assert!(r.invitations(&j("b@x/phone"), false, &decline("a@x"), &mut out).is_err());
+        // Invitations draw on the same allowance as messages.
+        let mut refused = false;
+        for i in 0..10 {
+            let x =
+                Element::new("x", ns::MUC_USER).children_from((0..MAX_INVITES_PER_MESSAGE).map(|k| invite(&format!("p{i}{k}@x"), "hi")));
+            if let Err(e) = r.invitations(&j("a@x/1"), false, &x, &mut out) {
+                assert_eq!(e.condition, Condition::ResourceConstraint);
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused);
+    }
+
+    #[test]
+    fn moderators_spare_people_at_or_above_their_affiliation() {
+        use Affiliation as A;
+        // A member who's a moderator can't kick or silence another member…
+        assert_eq!(
+            check_role_change(A::Member, Role::Moderator, A::Member, Role::Participant, Role::None).unwrap_err().condition,
+            Condition::NotAllowed
+        );
+        assert!(check_role_change(A::Member, Role::Moderator, A::Member, Role::Participant, Role::Visitor).is_err());
+        // …but can deal with strangers, and an admin can deal with members.
+        assert!(check_role_change(A::Member, Role::Moderator, A::None, Role::Participant, Role::None).is_ok());
+        assert!(check_role_change(A::None, Role::Moderator, A::None, Role::Participant, Role::Visitor).is_ok());
+        assert!(check_role_change(A::Admin, Role::Moderator, A::Member, Role::Participant, Role::None).is_ok());
+        // Giving a voice isn't taking anything away.
+        assert!(check_role_change(A::Member, Role::Moderator, A::Member, Role::Visitor, Role::Participant).is_ok());
+    }
+
+    #[test]
+    fn clients_cant_hand_themselves_hats() {
+        let mut r = room();
+        let p = Element::new("presence", ns::CLIENT)
+            .child(Element::new("x", ns::MUC))
+            .child(Element::new("hats", HATS).child(Element::new("hat", HATS).attr_set("title", "Owner").attr_set("uri", "urn:x")));
+        let mut out = Out::default();
+        let from = j("a@x/1");
+        r.join(Join { from: &from, nick: "alice", presence: &p, admin: false, created: false, now: 0 }, &mut out).unwrap();
+        join(&mut r, "b@x/1", "bob").unwrap();
+        assert!(out.send.iter().all(|e| !e.has_child("hats", HATS)));
+        let mut out = Out::default();
+        r.send_roster(&j("b@x/1"), "bob", &mut out);
+        assert!(!out.send.is_empty() && out.send.iter().all(|e| !e.has_child("hats", HATS)));
     }
 
     #[test]

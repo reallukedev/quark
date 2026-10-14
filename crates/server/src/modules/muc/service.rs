@@ -8,7 +8,7 @@
 //! synchronous, which keeps every occupant's view in order and means a reply that loops back
 //! into the room can't deadlock it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use super::config::{AllowPm, Config, ROOMINFO};
 use super::form::{self, Form, Values};
 use super::room::{Affiliation, Join, Out, Prepared, Role, Room, FASTEN, MSG_MODERATE_0, MSG_MODERATE_1};
 use super::store;
-use crate::modules::{mam, Component, Event, IqReply};
+use crate::modules::{mam, Component, Flow, IqReply, StanzaCtx};
 use crate::server::{Dest, Server};
 
 pub const MUC_UNIQUE: &str = "http://jabber.org/protocol/muc#unique";
@@ -66,6 +66,31 @@ impl Summary {
             creator: r.creator.as_ref().map(Jid::to_string),
         }
     }
+
+    /// What a persistent room looks like while it's only in storage.
+    fn stored(r: &Room) -> Summary {
+        Summary { locked: false, occupants: 0, ..Summary::of(r) }
+    }
+
+    fn from_config(json: &str) -> Summary {
+        let c: Config = serde_json::from_str(json).unwrap_or_default();
+        Summary {
+            name: c.name,
+            description: c.description,
+            public: c.public,
+            members_only: c.members_only,
+            persistent: true,
+            locked: false,
+            occupants: 0,
+            creator: None,
+        }
+    }
+}
+
+/// Rooms `creator` has made: those in storage plus the temporary ones in memory (persistent
+/// rooms in memory are in storage too, so they're counted once).
+fn rooms_created_by<'a>(in_memory: impl IntoIterator<Item = &'a Summary>, creator: &str, stored: usize) -> usize {
+    stored + in_memory.into_iter().filter(|s| !s.persistent && s.creator.as_deref() == Some(creator)).count()
 }
 
 pub struct RoomCell {
@@ -93,6 +118,10 @@ pub struct Service {
     /// The domain whose accounts, admins and settings this service belongs to.
     pub host: String,
     rooms: RwLock<HashMap<String, Arc<RoomCell>>>,
+    /// Every persistent room as stored, read from the database once and kept up to date as
+    /// rooms are saved, so listing rooms (anyone may ask for the public ones) never reads or
+    /// parses every room's configuration again. None until first needed.
+    index: tokio::sync::Mutex<Option<BTreeMap<String, Summary>>>,
 }
 
 fn err(c: Condition, text: &str) -> StanzaError {
@@ -105,7 +134,39 @@ fn no_room(jid: &str) -> StanzaError {
 
 impl Service {
     pub fn new(domain: &str, jid: Jid, host: &str) -> Service {
-        Service { domain: domain.to_string(), jid, host: host.to_string(), rooms: RwLock::new(HashMap::new()) }
+        Service {
+            domain: domain.to_string(),
+            jid,
+            host: host.to_string(),
+            rooms: RwLock::new(HashMap::new()),
+            index: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Runs `f` on the index of stored rooms, reading it first if this is the first time.
+    async fn with_index<T>(&self, srv: &Arc<Server>, f: impl FnOnce(&BTreeMap<String, Summary>) -> T) -> T {
+        let mut idx = self.index.lock().await;
+        if idx.is_none() {
+            match store::list(&srv.db, &self.domain).await {
+                Ok(rows) => *idx = Some(rows.into_iter().map(|(node, json)| (node, Summary::from_config(&json))).collect()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "couldn't list group chats");
+                    return f(&BTreeMap::new());
+                }
+            }
+        }
+        f(idx.as_ref().unwrap_or(&BTreeMap::new()))
+    }
+
+    /// A room was saved: `Some` with how it's stored now, `None` when it's no longer stored.
+    async fn index_update(&self, node: &str, stored: Option<Summary>) {
+        // Not read yet: the first read will find the change in the database.
+        let mut idx = self.index.lock().await;
+        let Some(idx) = idx.as_mut() else { return };
+        match stored {
+            Some(s) => idx.insert(node.to_string(), s),
+            None => idx.remove(node),
+        };
     }
 
     pub fn cells(&self) -> Vec<Arc<RoomCell>> {
@@ -157,35 +218,92 @@ impl Service {
         }
     }
 
-    /// Delivers stanzas: straight to local sessions, through s2s for others. Returns the local
-    /// devices that turned out to be gone.
-    pub fn deliver(&self, srv: &Arc<Server>, stanzas: Vec<Element>) -> Vec<Jid> {
+    /// Delivers what a room says to the people in it: straight to local sessions, through s2s
+    /// for others. Returns the local devices that turned out to be gone.
+    ///
+    /// The shortcut to local sessions keeps what the normal path would do for room traffic:
+    /// nothing reaches someone who blocked the room or the occupant it's from (XEP-0191), and
+    /// messages for a device that's asleep (its connection waiting to be resumed, or its app in
+    /// the background) go through the message hooks, so push can wake the phone. Messages to a
+    /// person rather than to the room's occupants (private messages, invitations) aren't sent
+    /// this way at all but routed (see [`Out::route`]).
+    async fn deliver(&self, srv: &Arc<Server>, stanzas: Vec<Element>) -> Vec<Jid> {
         let mut gone = Vec::new();
-        for el in stanzas {
+        // Most of a batch comes from one occupant: parse its address once.
+        let mut last_from: Option<(String, Jid)> = None;
+        for mut el in stanzas {
             let Some(to) = el.attr("to").and_then(|t| Jid::parse(t).ok()) else { continue };
             match srv.resolve(to.domain()) {
-                Dest::Local(_) if to.is_full() => match srv.sessions.get(&to) {
-                    Some(s) => {
-                        s.send(el);
+                Dest::Local(host) if to.is_full() => {
+                    let Some(s) = srv.sessions.get(&to) else {
+                        gone.push(to);
+                        continue;
+                    };
+                    let Some(f) = el.attr("from") else { continue };
+                    if last_from.as_ref().is_none_or(|(raw, _)| raw != f) {
+                        let Ok(j) = Jid::parse(f) else { continue };
+                        last_from = Some((f.to_string(), j));
                     }
-                    None => gone.push(to),
-                },
+                    let Some((_, from)) = &last_from else { continue };
+                    if crate::modules::blocking::is_blocked(srv, &to.to_bare(), from).await {
+                        continue;
+                    }
+                    let asleep = el.name() == "message" && {
+                        let f = s.flags.lock();
+                        f.hibernating || f.inactive
+                    };
+                    if asleep && !self.message_hooks(srv, &host, from, &to, &mut el).await {
+                        continue;
+                    }
+                    s.send(el);
+                }
                 // To an account (a relayed vCard request) or another component: through the
                 // router, off this task, since the answer may come back to this very room.
                 Dest::Local(_) | Dest::Component(_) => {
                     let srv = srv.clone();
                     tokio::spawn(async move { srv.route(el).await });
                 }
-                Dest::Remote => {
-                    let allowed = srv.host(&self.host).is_some_and(|h| h.settings().federation)
-                        && !srv.config().s2s.blocked.iter().any(|b| b == to.domain());
-                    if let (true, Some(r)) = (allowed, srv.remote()) {
-                        r.send(&self.domain, to.domain(), el);
-                    }
-                }
+                Dest::Remote => self.send_remote(srv, &to, el),
             }
         }
         gone
+    }
+
+    /// Runs the message hooks (archive, push) for room traffic to a local device, as the router
+    /// would. False when a hook took the message.
+    async fn message_hooks(&self, srv: &Arc<Server>, host: &Arc<crate::server::Host>, from: &Jid, to: &Jid, el: &mut Element) -> bool {
+        let cx = StanzaCtx { srv, host, from, to, session: None };
+        for m in &srv.modules {
+            if !matches!(m.message_in(&cx, el).await, Flow::Continue) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Sends an answer to whoever asked (they asked, so no block list or push applies).
+    fn reply(&self, srv: &Arc<Server>, el: Element) {
+        let Some(to) = el.attr("to").and_then(|t| Jid::parse(t).ok()) else { return };
+        match srv.resolve(to.domain()) {
+            Dest::Local(_) if to.is_full() => {
+                if let Some(s) = srv.sessions.get(&to) {
+                    s.send(el);
+                }
+            }
+            Dest::Local(_) | Dest::Component(_) => {
+                let srv = srv.clone();
+                tokio::spawn(async move { srv.route(el).await });
+            }
+            Dest::Remote => self.send_remote(srv, &to, el),
+        }
+    }
+
+    fn send_remote(&self, srv: &Arc<Server>, to: &Jid, el: Element) {
+        let allowed =
+            srv.host(&self.host).is_some_and(|h| h.settings().federation) && !srv.config().s2s.blocked.iter().any(|b| b == to.domain());
+        if let (true, Some(r)) = (allowed, srv.remote()) {
+            r.send(&self.domain, to.domain(), el);
+        }
     }
 
     /// Delivers, saves and cleans up after a room handled something. The room stays locked
@@ -193,7 +311,7 @@ impl Service {
     async fn finish(&self, srv: &Arc<Server>, cell: &Arc<RoomCell>, mut room: OwnedMutexGuard<Room>, mut out: Out) {
         // Devices that vanished without saying goodbye leave (status 333), a few rounds at most.
         for _ in 0..3 {
-            let gone = self.deliver(srv, std::mem::take(&mut out.send));
+            let gone = self.deliver(srv, std::mem::take(&mut out.send)).await;
             if gone.is_empty() {
                 break;
             }
@@ -201,11 +319,16 @@ impl Service {
                 room.leave(&g, None, &[333], &mut out);
             }
         }
-        self.deliver(srv, std::mem::take(&mut out.send));
+        self.deliver(srv, std::mem::take(&mut out.send)).await;
         let ops = std::mem::take(&mut out.db);
         if !ops.is_empty() {
-            if let Err(e) = store::apply(&srv.db, &self.domain, &cell.node, ops).await {
-                tracing::warn!(error = %e, room = %cell.jid, "couldn't save a group chat");
+            let deleted = ops.iter().any(|o| matches!(o, store::Op::Delete));
+            match store::apply(&srv.db, &self.domain, &cell.node, ops).await {
+                Ok(()) => {
+                    let keep = (room.config.persistent && !deleted).then(|| Summary::stored(&room));
+                    self.index_update(&cell.node, keep).await;
+                }
+                Err(e) => tracing::warn!(error = %e, room = %cell.jid, "couldn't save a group chat"),
             }
         }
         room.logging = room.config.archive && self.history_on(srv);
@@ -223,35 +346,6 @@ impl Service {
         for el in out.route {
             srv.route(el).await;
         }
-        if !out.mentions.is_empty() {
-            self.announce_mentions(srv, cell, out.mentions, out.mention_msg).await;
-        }
-    }
-
-    /// Tells other modules (push) about local people mentioned while none of their devices in
-    /// the room is awake.
-    async fn announce_mentions(&self, srv: &Arc<Server>, cell: &RoomCell, mentions: Vec<super::room::Mention>, msg: Option<Element>) {
-        let Some(message) = msg else { return };
-        let users: Vec<Jid> = mentions
-            .into_iter()
-            .filter(|m| srv.host(m.user.domain()).is_some())
-            .filter(|m| {
-                !m.sessions.iter().any(|s| {
-                    srv.sessions.get(s).is_some_and(|h| {
-                        let f = h.flags.lock();
-                        !f.hibernating && !f.inactive
-                    })
-                })
-            })
-            .map(|m| m.user)
-            .collect();
-        if !users.is_empty() {
-            srv.emit(&Event::RoomMention { room: cell.jid.clone(), users, message }).await;
-        }
-    }
-
-    fn reply(&self, srv: &Arc<Server>, el: Element) {
-        self.deliver(srv, vec![el]);
     }
 
     fn reply_error(&self, srv: &Arc<Server>, el: &Element, e: StanzaError) {
@@ -306,34 +400,27 @@ impl Service {
 
     /// Every room on the service, from memory and storage: (node, summary).
     pub async fn all_rooms(&self, srv: &Arc<Server>) -> Vec<(String, Summary)> {
-        let mut out: HashMap<String, Summary> = self.cells().into_iter().map(|c| (c.node.clone(), c.summary.lock().clone())).collect();
-        match store::list(&srv.db, &self.domain).await {
-            Ok(rows) => {
-                for (node, json) in rows {
-                    out.entry(node).or_insert_with(|| {
-                        let c: Config = serde_json::from_str(&json).unwrap_or_default();
-                        Summary {
-                            name: c.name,
-                            description: c.description,
-                            public: c.public,
-                            members_only: c.members_only,
-                            persistent: true,
-                            locked: false,
-                            occupants: 0,
-                            creator: None,
-                        }
-                    });
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "couldn't list group chats"),
-        }
-        let mut v: Vec<(String, Summary)> = out.into_iter().collect();
-        v.sort_by(|a, b| a.0.cmp(&b.0));
-        v
+        self.rooms_where(srv, usize::MAX, |_| true).await
+    }
+
+    /// Rooms whose summary passes `keep`, by name, at most `max`: live ones from memory, the
+    /// rest from the index.
+    async fn rooms_where(&self, srv: &Arc<Server>, max: usize, keep: impl Fn(&Summary) -> bool) -> Vec<(String, Summary)> {
+        let live: BTreeMap<String, Summary> = self.cells().into_iter().map(|c| (c.node.clone(), c.summary.lock().clone())).collect();
+        self.with_index(srv, |stored| {
+            let rest = stored.iter().filter(|(n, s)| !live.contains_key(*n) && keep(s));
+            let mut v: Vec<(String, Summary)> =
+                live.iter().filter(|(_, s)| keep(s)).chain(rest).map(|(n, s)| (n.clone(), s.clone())).collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v.truncate(max);
+            v
+        })
+        .await
     }
 
     async fn public_items(&self, srv: &Arc<Server>) -> Element {
-        let items = self.all_rooms(srv).await.into_iter().filter(|(_, s)| s.public && !s.locked).take(MAX_LISTED).map(|(node, s)| {
+        let rooms = self.rooms_where(srv, MAX_LISTED, |s| s.public && !s.locked).await;
+        let items = rooms.into_iter().map(|(node, s)| {
             Element::new("item", ns::DISCO_ITEMS).attr_set("jid", format!("{node}@{}", self.domain)).attr_opt("name", s.name)
         });
         Element::new("query", ns::DISCO_ITEMS).children_from(items)
@@ -357,9 +444,9 @@ impl Service {
             ));
         }
         let creator = bare.to_string();
-        let in_memory = self.cells().iter().filter(|c| c.summary.lock().creator.as_deref() == Some(&creator)).count();
         let stored = store::count_created_by(&srv.db, &self.domain, &creator).await.map_err(|_| StanzaError::internal())?;
-        if in_memory.max(stored) >= MAX_ROOMS_PER_CREATOR {
+        let summaries: Vec<Summary> = self.cells().iter().map(|c| c.summary.lock().clone()).collect();
+        if rooms_created_by(&summaries, &creator, stored) >= MAX_ROOMS_PER_CREATOR {
             return Err(err(Condition::ResourceConstraint, "You've created as many group chats as you can; remove one first."));
         }
         if self.rooms.read().len() >= MAX_TEMPORARY_ROOMS {
@@ -504,7 +591,10 @@ impl Service {
             },
             (_, Some("error")) => {
                 // A device whose server bounces what the room sends it isn't really there (§7.2.?).
+                // Devices on this server are known to be there or not, and their errors can
+                // mean something else (a private message to someone who blocked its sender).
                 if nick.is_some()
+                    && srv.host(from.domain()).is_none()
                     && room.occupant_of(from).is_some()
                     && el.get_child("error", ns::CLIENT).and_then(|e| e.attr("type")) == Some("cancel")
                 {
@@ -544,7 +634,8 @@ impl Service {
     }
 
     /// Archives a prepared message (for its stanza id) and sends it to everyone.
-    async fn publish(&self, srv: &Arc<Server>, room: &mut Room, p: Prepared, out: &mut Out) {
+    async fn publish(&self, srv: &Arc<Server>, room: &mut Room, mut p: Prepared, out: &mut Out) {
+        let tombstone = p.tombstone.take();
         let mut sid = None;
         if p.archive && room.logging {
             let with = p.msg.attr("from").and_then(|f| Jid::parse(f).ok()).unwrap_or_else(|| room.jid.clone());
@@ -560,6 +651,14 @@ impl Service {
             sid = Some(quark_core::new_id());
         }
         room.commit_message(p, sid, quark_core::time::now_ms(), out);
+        // A retracted or moderated message leaves the archive too, with a tombstone in its
+        // place, so reading back doesn't bring it back.
+        if let Some(t) = tombstone.filter(|_| room.logging) {
+            let sid = t.sid.clone();
+            if let Err(e) = mam::tombstone(srv, &room.jid, &sid, move |orig| t.apply(orig)).await {
+                tracing::debug!(error = %e, room = %room.jid, "couldn't replace an archived group chat message");
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -645,6 +744,8 @@ impl Service {
                     Ok(None)
                 }
             }
+            // Only a room that says it keeps an archive answers queries on it.
+            ns::MAM if !room.logging => Err(StanzaError::service_unavailable().with_text("This group chat keeps no message archive.")),
             ns::MAM => {
                 return match room.may_read_archive(from, admin) {
                     Err(e) => {
@@ -855,6 +956,7 @@ impl Service {
         }
         let snap = room.snapshot();
         let persistent = room.config.persistent;
+        let stored = Summary::stored(&room);
         let cell = RoomCell::new(room);
         {
             let mut m = self.rooms.write();
@@ -868,6 +970,7 @@ impl Service {
                 tracing::warn!(error = %e, "couldn't save a new group chat");
                 StanzaError::internal()
             })?;
+            self.index_update(&node, Some(stored)).await;
         }
         Ok(true)
     }
@@ -897,7 +1000,7 @@ impl Service {
             let mut out = Out::default();
             room.shut_down(&mut out);
             room.destroyed = true;
-            self.deliver(srv, out.send);
+            self.deliver(srv, out.send).await;
             drop(room);
             self.forget(&cell);
         }
@@ -920,5 +1023,19 @@ impl Component for Service {
                 self.handle_room(srv, &from, &to, &node, stanza).await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rooms_created_count_stored_and_temporary_ones_once() {
+        let mine = |persistent: bool| Summary { persistent, creator: Some("a@x".into()), ..Summary::default() };
+        // Two stored rooms (one of them loaded), and two temporary ones in memory.
+        let memory = [mine(true), mine(false), mine(false), Summary { creator: Some("b@x".into()), ..Summary::default() }];
+        assert_eq!(rooms_created_by(&memory, "a@x", 2), 4);
+        assert_eq!(rooms_created_by(&memory, "b@x", 0), 1);
     }
 }

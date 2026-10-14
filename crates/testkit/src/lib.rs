@@ -112,6 +112,11 @@ impl TestServer {
         Ok(())
     }
 
+    /// Enables or disables an account.
+    pub async fn set_enabled(&self, user: &str, enabled: bool) -> anyhow::Result<()> {
+        self.srv.accounts.set_enabled(DOMAIN, user, enabled).await.map_err(|e| anyhow!("{e:?}"))
+    }
+
     /// Changes the domain's settings live.
     pub async fn set_settings(&self, f: impl FnOnce(&mut quark::settings::Settings)) -> anyhow::Result<()> {
         let mut s = (*self.srv.host(DOMAIN).context("no host")?.settings()).clone();
@@ -196,6 +201,10 @@ pub struct Client {
     pub features: Option<Element>,
     /// The full JID after binding.
     pub jid: Option<String>,
+    /// Attributes of the server's latest stream header, as `(name, value)` pairs.
+    pub header: Vec<(String, String)>,
+    /// The ALPN protocol the server picked on a direct TLS connection.
+    pub alpn: Option<Vec<u8>>,
     /// Elements read while waiting for something else, handed out by `recv` first.
     backlog: std::collections::VecDeque<Element>,
     /// tls-exporter channel binding, after STARTTLS on TLS 1.3.
@@ -213,6 +222,8 @@ impl Client {
             domain: domain.to_string(),
             features: None,
             jid: None,
+            header: Vec::new(),
+            alpn: None,
             backlog: Default::default(),
             exporter: None,
         };
@@ -220,11 +231,47 @@ impl Client {
         Ok(c)
     }
 
+    /// Opens a TCP connection and sends nothing, for tests that write their own stream header.
+    pub async fn connect_raw(addr: SocketAddr, domain: &str) -> anyhow::Result<Client> {
+        let tcp = TcpStream::connect(addr).await?;
+        let (r, w) = tokio::io::split(Io::Plain(tcp));
+        Ok(Client {
+            reader: Some(StreamReader::new(r, 16 << 20)),
+            writer: Some(w),
+            domain: domain.to_string(),
+            features: None,
+            jid: None,
+            header: Vec::new(),
+            alpn: None,
+            backlog: Default::default(),
+            exporter: None,
+        })
+    }
+
+    /// Sends `raw` (a stream header written by the test) and reads the server's stream header
+    /// into `header`. The features (or a stream error) are left for `recv`.
+    pub async fn open_with(&mut self, raw: &str) -> anyhow::Result<()> {
+        self.send_raw(raw).await?;
+        match self.next_event().await? {
+            StreamEvent::Open { attrs, .. } => {
+                self.header = attrs;
+                Ok(())
+            }
+            e => bail!("expected a stream header, got {e:?}"),
+        }
+    }
+
+    /// An attribute of the server's latest stream header (matched on the local name too).
+    pub fn header_attr(&self, name: &str) -> Option<&str> {
+        self.header.iter().find(|(k, _)| k == name || k.rsplit(':').next() == Some(name)).map(|(_, v)| v.as_str())
+    }
+
     /// Connects with TLS from the first byte (XEP-0368), ALPN `xmpp-client`.
     pub async fn connect_tls(addr: SocketAddr, domain: &str) -> anyhow::Result<Client> {
         let tcp = TcpStream::connect(addr).await?;
         let tls = tls_connect(tcp, domain, &[b"xmpp-client"]).await?;
         let exporter = exporter(&tls);
+        let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
         let (r, w) = tokio::io::split(Io::Tls(Box::new(tls)));
         let mut c = Client {
             reader: Some(StreamReader::new(r, 16 << 20)),
@@ -232,6 +279,8 @@ impl Client {
             domain: domain.to_string(),
             features: None,
             jid: None,
+            header: Vec::new(),
+            alpn,
             backlog: Default::default(),
             exporter,
         };
@@ -244,7 +293,7 @@ impl Client {
         let h = stream_header(ns::CLIENT, None, Some(&self.domain), None, &[]);
         self.send_raw(&h).await?;
         match self.next_event().await? {
-            StreamEvent::Open { .. } => {}
+            StreamEvent::Open { attrs, .. } => self.header = attrs,
             e => bail!("expected a stream header, got {e:?}"),
         }
         let f = self.recv().await?;
@@ -315,7 +364,8 @@ impl Client {
         self.restart().await
     }
 
-    async fn restart(&mut self) -> anyhow::Result<()> {
+    /// Restarts the stream, e.g. after a SASL `<success/>` the test handled itself.
+    pub async fn restart(&mut self) -> anyhow::Result<()> {
         self.reader = self.reader.take().map(StreamReader::restart);
         self.open().await
     }

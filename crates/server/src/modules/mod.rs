@@ -159,6 +159,16 @@ pub enum Event {
         users: Vec<Jid>,
         message: Element,
     },
+    /// An account stored a new vcard-temp (PEP mirrors its avatar, XEP-0398).
+    VCardChanged {
+        jid: Jid,
+        vcard: Element,
+    },
+    /// An account stored something in private XML storage (PEP mirrors bookmarks, XEP-0411).
+    PrivateChanged {
+        jid: Jid,
+        data: Element,
+    },
 }
 
 /// A disco#info identity (XEP-0030).
@@ -289,6 +299,10 @@ pub trait Module: Send + Sync + 'static {
         Flow::Continue
     }
 
+    /// A presence a local client broadcasts (no `to`), before it's stored and sent: available
+    /// presence can still be changed (PEP adds the avatar hash, XEP-0398).
+    async fn presence_out(&self, _srv: &Arc<Server>, _session: &Arc<SessionHandle>, _presence: &mut Element) {}
+
     async fn on_event(&self, _srv: &Arc<Server>, _ev: &Event) {}
 }
 
@@ -312,7 +326,7 @@ pub fn all() -> Vec<Arc<dyn Module>> {
         Arc::new(contact::Contact),
         Arc::new(extdisco::ExtDisco),
         Arc::new(carbons::Carbons),
-        Arc::new(pep::Pep),
+        Arc::new(pep::Pep::default()),
         Arc::new(muc::Muc::new()),
         Arc::new(upload::Upload),
         Arc::new(crate::http::Web),

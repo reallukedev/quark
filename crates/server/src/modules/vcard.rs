@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use quark_core::stanza::IqType;
-use quark_core::{ns, Element, StanzaError};
+use quark_core::{ns, Element, Jid, StanzaError};
 
 use super::{ok, ok_empty, IqCtx, IqResult, IqTarget, Module};
 use crate::db::{params, Migration, OptionalExtension};
@@ -80,11 +80,13 @@ impl Module for VCard {
                     return Err(StanzaError::new(quark_core::Condition::NotAcceptable)
                         .with_text("That profile is too big (a smaller photo helps)."));
                 }
+                let jid = Jid::bare_unchecked(&owner, &h);
                 cx.srv
                     .db
                     .write(move |t| t.execute("INSERT INTO vcards (host, user, xml) VALUES (?1, ?2, ?3) ON CONFLICT(host, user) DO UPDATE SET xml = excluded.xml", params![h, owner, xml]))
                     .await
                     .map_err(|_| StanzaError::internal())?;
+                cx.srv.emit(&super::Event::VCardChanged { jid, vcard: v }).await;
                 ok_empty()
             }
             _ => Err(StanzaError::bad_request()),

@@ -89,6 +89,7 @@ impl Module for Private {
                     })
                     .await
                     .map_err(|_| StanzaError::internal())?;
+                cx.srv.emit(&super::Event::PrivateChanged { jid: me, data: v }).await;
                 ok_empty()
             }
             _ => Err(StanzaError::bad_request()),

@@ -157,7 +157,7 @@ impl Default for TlsSection {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpSection {
     /// The public base URL clients reach the web listener at, e.g. `https://chat.example.com`.
@@ -170,6 +170,16 @@ pub struct HttpSection {
     /// Prometheus metrics at `/metrics` (only from loopback and private addresses).
     #[serde(default = "yes")]
     pub metrics: bool,
+    /// Serve the web listener over TLS itself (certificates from `tls.cert_dir`) instead of
+    /// behind a TLS proxy.
+    #[serde(default)]
+    pub tls: bool,
+}
+
+impl Default for HttpSection {
+    fn default() -> Self {
+        HttpSection { public_url: None, admin_api: false, metrics: true, tls: false }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -301,6 +301,7 @@ pub fn all() -> Vec<Arc<dyn Module>> {
         Arc::new(pep::Pep),
         Arc::new(muc::Muc),
         Arc::new(upload::Upload),
+        Arc::new(crate::http::Web),
         // Archive before push, so notifications can carry the stanza id.
         Arc::new(mam::Mam),
         Arc::new(push::Push),

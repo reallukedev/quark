@@ -27,6 +27,9 @@ use tokio::net::TcpStream;
 
 pub use quark_core;
 
+mod web;
+pub use web::{http_request, BoshClient, HttpResponse, WsClient, VIA_TLS_PROXY};
+
 /// The domain every test server serves.
 pub const DOMAIN: &str = "quark.test";
 

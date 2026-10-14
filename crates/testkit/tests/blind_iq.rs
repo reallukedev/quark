@@ -1,7 +1,7 @@
 //! Black-box IQ tests: semantics (RFC 6120 §8.2.3), routing (RFC 6121 §8.5), vcard-temp
 //! (XEP-0054), private XML storage (XEP-0049), last activity (XEP-0012), account disco (XEP-0030).
 
-mod blind_util;
+use crate::blind_util;
 
 use std::collections::HashMap;
 use std::time::Duration;

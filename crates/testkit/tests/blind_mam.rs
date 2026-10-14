@@ -1,7 +1,7 @@
 //! XEP-0313 Message Archive Management for accounts and rooms, black-box. Also XEP-0359 stanza-id
 //! on delivery, XEP-0441 preferences and XEP-0334 hints.
 
-mod blind_xep;
+use crate::blind_xep;
 
 use std::time::Duration;
 

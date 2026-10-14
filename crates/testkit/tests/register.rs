@@ -1,7 +1,7 @@
 //! In-band registration (XEP-0077): sign-up modes, invites with `<preauth/>` (XEP-0401),
 //! limits, and changing or deleting an account once signed in.
 
-mod common;
+use crate::common;
 
 use common::*;
 use quark::settings::SignUp;

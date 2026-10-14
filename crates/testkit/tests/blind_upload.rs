@@ -1,6 +1,6 @@
 //! XEP-0363 HTTP File Upload. Black-box: written from the XEP only.
 
-mod blind_feat;
+use crate::blind_feat;
 
 use anyhow::{bail, ensure, Context as _};
 use blind_feat::*;

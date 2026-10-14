@@ -1,7 +1,7 @@
 //! XEP-0357 Push Notifications, with a second local account's resource standing in for the
 //! app server. Black-box: written from the XEP only.
 
-mod blind_feat;
+use crate::blind_feat;
 
 use std::time::Duration;
 

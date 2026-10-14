@@ -1,7 +1,7 @@
 //! XEP-0163 Personal Eventing Protocol over XEP-0060, the way OMEMO, avatar, bookmark and nick
 //! clients use it. Black-box: written from the XEPs only.
 
-mod blind_feat;
+use crate::blind_feat;
 
 use std::time::Duration;
 

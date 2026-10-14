@@ -1,7 +1,7 @@
 //! XEP-0215 External Service Discovery with the built-in TURN relay (RFC 8656) and STUN
 //! (RFC 8489). Black-box: written from the specifications only.
 
-mod blind_feat;
+use crate::blind_feat;
 
 use std::net::SocketAddr;
 

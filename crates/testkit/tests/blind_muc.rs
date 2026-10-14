@@ -1,7 +1,7 @@
 //! XEP-0045 Multi-User Chat, black-box, as Conversations / Gajim / Dino use it. Also XEP-0359
 //! stanza-id, XEP-0421 occupant-id and XEP-0410 self-ping on rooms.
 
-mod blind_xep;
+use crate::blind_xep;
 
 use std::time::Duration;
 

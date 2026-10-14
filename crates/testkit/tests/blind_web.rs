@@ -1,7 +1,7 @@
 //! RFC 7395 XMPP over WebSocket, XEP-0124/XEP-0206 BOSH and XEP-0156 host-meta.
 //! Black-box: written from the specifications only.
 
-mod blind_feat;
+use crate::blind_feat;
 
 use std::time::Duration;
 

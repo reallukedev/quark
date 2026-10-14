@@ -1,7 +1,7 @@
 //! Black-box conformance: SASL2 (XEP-0388), Bind2 (XEP-0386), FAST (XEP-0484) and the SASL2
 //! parts of XEP-0198 / XEP-0280 / XEP-0352. Written from the specifications only.
 
-mod blind_common;
+use crate::blind_common;
 
 use blind_common::*;
 use quark_testkit::quark_core::{ns, Element};

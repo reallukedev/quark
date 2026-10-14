@@ -1,7 +1,7 @@
 //! Invites (XEP-0401 / XEP-0379): friends inviting friends, pre-approved contacts, and the
 //! landing page.
 
-mod common;
+use crate::common;
 
 use common::*;
 use quark::settings::SignUp;

@@ -1,6 +1,6 @@
 //! Black-box conformance: stream management (XEP-0198 v1.6). Written from the specification only.
 
-mod blind_common;
+use crate::blind_common;
 
 use blind_common::*;
 use quark_testkit::quark_core::{ns, Element};

@@ -1,6 +1,6 @@
 //! XEP-0191 Blocking Command. Black-box: written from the XEP only.
 
-mod blind_feat;
+use crate::blind_feat;
 
 use anyhow::{bail, ensure, Context as _};
 use blind_feat::*;

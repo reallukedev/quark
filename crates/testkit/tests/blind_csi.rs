@@ -2,7 +2,7 @@
 //! §4 / §5 describe (hold presence and chat states, deliver important messages at once).
 //! Written from the specification only.
 
-mod blind_common;
+use crate::blind_common;
 
 use blind_common::*;
 use quark_testkit::quark_core::{ns, Element};

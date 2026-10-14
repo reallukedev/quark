@@ -1,6 +1,6 @@
 //! Black-box message routing tests (RFC 6121 §8.5, RFC 6120 §8.1.2.1), from the spec.
 
-mod blind_util;
+use crate::blind_util;
 
 use blind_util::*;
 use quark_testkit::message;

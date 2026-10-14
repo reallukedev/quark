@@ -1,7 +1,7 @@
 //! Black-box conformance: SASL (RFC 6120 §6, RFC 4616, RFC 5802, RFC 7677, XEP-0440).
 //! Written from the specifications only.
 
-mod blind_common;
+use crate::blind_common;
 
 use blind_common::*;
 use quark_testkit::quark_core::{ns, Element};

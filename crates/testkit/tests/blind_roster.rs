@@ -1,6 +1,6 @@
 //! Black-box roster tests (RFC 6121 §2), written from the spec.
 
-mod blind_util;
+use crate::blind_util;
 
 use blind_util::*;
 use quark_testkit::quark_core::{ns, Element};

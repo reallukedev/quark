@@ -1,6 +1,6 @@
 //! Black-box Message Carbons tests (XEP-0280), from the spec.
 
-mod blind_util;
+use crate::blind_util;
 
 use blind_util::*;
 use quark_testkit::quark_core::{ns, Element};

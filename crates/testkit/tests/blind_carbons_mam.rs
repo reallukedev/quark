@@ -1,7 +1,7 @@
 //! XEP-0280 Message Carbons across three devices, with XEP-0313 / XEP-0359 ids consistent between
 //! the original, the carbon copies and the archive.
 
-mod blind_xep;
+use crate::blind_xep;
 
 use std::time::Duration;
 

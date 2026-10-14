@@ -1,6 +1,6 @@
 //! Ad-hoc commands (XEP-0050) for admins (XEP-0133) and invites.
 
-mod common;
+use crate::common;
 
 use common::*;
 use quark_testkit::quark_core::{ns, Element};

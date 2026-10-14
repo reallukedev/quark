@@ -1,0 +1,50 @@
+//! The protocol test suite, as one test binary: each file is a module, so the server is
+//! compiled and linked once instead of once per file.
+
+mod blind_common;
+mod blind_feat;
+mod blind_util;
+mod blind_xep;
+mod common;
+
+mod adhoc;
+mod admin;
+mod blind_bind;
+mod blind_blocking;
+mod blind_calls;
+mod blind_carbons;
+mod blind_carbons_mam;
+mod blind_csi;
+mod blind_iq;
+mod blind_mam;
+mod blind_message;
+mod blind_muc;
+mod blind_offline;
+mod blind_pep;
+mod blind_presence;
+mod blind_push;
+mod blind_roster;
+mod blind_sasl;
+mod blind_sasl2;
+mod blind_server_info;
+mod blind_sm;
+mod blind_streams;
+mod blind_subscription;
+mod blind_upload;
+mod blind_web;
+mod blocking;
+mod bosh;
+mod carbons;
+mod extdisco;
+mod http;
+mod invites;
+mod mam;
+mod muc;
+mod pep;
+mod push;
+mod register;
+mod s2s;
+mod smoke;
+mod turn;
+mod upload;
+mod websocket;

@@ -1,6 +1,6 @@
 //! Black-box offline message tests (XEP-0160, XEP-0203, XEP-0334), from the specs.
 
-mod blind_util;
+use crate::blind_util;
 
 use blind_util::*;
 use quark_testkit::message;

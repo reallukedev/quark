@@ -1,7 +1,7 @@
 //! Black-box conformance: stream setup, TLS and stream-level errors (RFC 6120 §4, §5, §11;
 //! XEP-0368). Written from the specifications only.
 
-mod blind_common;
+use crate::blind_common;
 
 use anyhow::Context as _;
 use blind_common::*;

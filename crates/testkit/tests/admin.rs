@@ -1,7 +1,7 @@
 //! The admin API (docs/admin-api.md): the socket, HTTP, accounts, invites, the snapshot, and
 //! account export and import (XEP-0227).
 
-mod common;
+use crate::common;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;

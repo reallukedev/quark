@@ -2,7 +2,7 @@
 //! (XEP-0199), version (XEP-0092), time (XEP-0202), uptime (XEP-0012), disco#info (XEP-0030)
 //! and IQ semantics (RFC 6120 §8.2.3, §8.4). Written from the specifications only.
 
-mod blind_common;
+use crate::blind_common;
 
 use blind_common::*;
 use quark_testkit::quark_core::{ns, Element};

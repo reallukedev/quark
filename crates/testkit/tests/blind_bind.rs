@@ -1,7 +1,7 @@
 //! Black-box conformance: resource binding (RFC 6120 §7, RFC 7622) and the legacy session IQ
 //! (RFC 3921 §3, draft-cridland-xmpp-session). Written from the specifications only.
 
-mod blind_common;
+use crate::blind_common;
 
 use blind_common::*;
 use quark_testkit::quark_core::{ns, Element};

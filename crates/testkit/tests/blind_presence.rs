@@ -1,6 +1,6 @@
 //! Black-box presence tests (RFC 6121 §4), from the spec.
 
-mod blind_util;
+use crate::blind_util;
 
 use blind_util::*;
 use quark_testkit::quark_core::{ns, Element};

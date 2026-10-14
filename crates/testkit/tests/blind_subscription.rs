@@ -3,7 +3,7 @@
 //! Each test checks the presence side first and the roster side (pushes, `subscription`/`ask`)
 //! last, so a roster bug does not hide a presence bug.
 
-mod blind_util;
+use crate::blind_util;
 
 use blind_util::*;
 use quark_testkit::quark_core::{ns, Element};

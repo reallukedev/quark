@@ -295,6 +295,13 @@ impl Module for Push {
         }
     }
 
+    /// XEP-0357 puts the feature on the account, but some clients (ChatSecure) only look at the
+    /// server's disco#info and report "no push support" without it, so it's listed there too,
+    /// as ejabberd and Prosody do.
+    fn server_features(&self, host: &Host) -> Vec<&'static str> {
+        self.account_features(host)
+    }
+
     fn iq_namespaces(&self) -> &'static [(&'static str, IqTarget)] {
         &[(ns::PUSH, IqTarget::Account), (ns::PUSH, IqTarget::Server)]
     }

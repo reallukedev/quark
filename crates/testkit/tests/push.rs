@@ -83,6 +83,8 @@ async fn an_offline_device_is_woken_without_revealing_the_message() -> anyhow::R
     let features: Vec<_> =
         info.get_child("query", ns::DISCO_INFO).unwrap().children().filter_map(|c| c.attr("var")).map(String::from).collect();
     assert!(features.iter().any(|f| f == ns::PUSH) && features.iter().any(|f| f == PRIORITY), "{features:?}");
+    let info = bob.iq_get(Some(DOMAIN), Element::new("query", ns::DISCO_INFO)).await?;
+    assert!(info.to_xml().contains(ns::PUSH), "the server lists push too, for clients that only ask it: {info}");
 
     let r = bob.iq_set(None, enable(&app_jid, "node-1", "s3cret")).await?;
     assert_eq!(r.attr("type"), Some("result"), "{r}");
@@ -191,6 +193,8 @@ async fn push_can_be_turned_off_for_the_domain() -> anyhow::Result<()> {
     let r = bob.iq_set(None, enable(&app_jid, "node-2", "x")).await?;
     assert_eq!(r.attr("type"), Some("error"));
     let info = bob.iq_get(Some(&format!("bob@{DOMAIN}")), Element::new("query", ns::DISCO_INFO)).await?;
+    assert!(!info.to_xml().contains(ns::PUSH), "{info}");
+    let info = bob.iq_get(Some(DOMAIN), Element::new("query", ns::DISCO_INFO)).await?;
     assert!(!info.to_xml().contains(ns::PUSH), "{info}");
 
     bob.close().await?;

@@ -2,7 +2,7 @@
 //! models, publish-options, item limits, last items on coming online, and the conversions to
 //! vCard avatars and legacy bookmarks.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

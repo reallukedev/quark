@@ -215,7 +215,11 @@ impl Server {
                 t.query_row("SELECT json FROM host_settings WHERE domain = ?1", [&hc.domain], |r| r.get(0)).optional()
             })?;
             let settings = match stored.and_then(|j| serde_json::from_str::<Settings>(&j).ok()) {
-                Some(s) => s,
+                // Saved before hosts were stored normalized: route by the normalized form.
+                Some(mut s) => {
+                    let _ = s.normalize_hosts();
+                    s
+                }
                 None => {
                     let mut s = Settings::defaults(&hc.domain);
                     if let Some(p) = &hc.settings {
@@ -317,7 +321,7 @@ impl Server {
     }
 
     /// Changes a domain's settings live: saved, then every part of the server sees them.
-    pub async fn set_settings(self: &Arc<Self>, domain: &str, s: Settings) -> Result<(), String> {
+    pub async fn set_settings(self: &Arc<Self>, domain: &str, mut s: Settings) -> Result<(), String> {
         let host = self.host(domain).ok_or_else(|| format!("{domain} isn't a domain on this server."))?;
         s.validate(domain)?;
         for other in self.hosts() {

@@ -115,11 +115,13 @@ impl Settings {
         }
     }
 
-    /// Checks values that serde can't: component hosts, sizes, the contact address.
-    pub fn validate(&self, domain: &str) -> Result<(), String> {
+    /// Checks values that serde can't (component hosts, sizes, the contact address) and stores
+    /// the component hosts in their normalized form, since that's the form stanzas are routed by
+    /// (`Rooms.Example.com` would otherwise never match a `to`).
+    pub fn validate(&mut self, domain: &str) -> Result<(), String> {
+        self.normalize_hosts()?;
         for (what, h) in [("group chats", &self.groups.host), ("files", &self.files.host)] {
-            let j = quark_core::Jid::domain_jid(h).map_err(|_| format!("The {what} address \"{h}\" isn't a valid domain."))?;
-            if j.domain() == domain {
+            if h == domain {
                 return Err(format!("The {what} address must differ from {domain}, e.g. rooms.{domain}."));
             }
         }
@@ -143,6 +145,15 @@ impl Settings {
             if w.len() > 4096 {
                 return Err("The welcome message is too long (4 KB at most).".into());
             }
+        }
+        Ok(())
+    }
+
+    /// Puts the component hosts in normalized form (RFC 7622 §3.2: lowercase, prepared).
+    pub fn normalize_hosts(&mut self) -> Result<(), String> {
+        for (what, h) in [("group chats", &mut self.groups.host), ("files", &mut self.files.host)] {
+            let j = quark_core::Jid::domain_jid(h).map_err(|_| format!("The {what} address \"{h}\" isn't a valid domain."))?;
+            *h = j.domain().to_string();
         }
         Ok(())
     }
@@ -230,6 +241,21 @@ mod tests {
         let mut s = Settings::defaults("a.test");
         s.groups.host = "a.test".into();
         assert!(s.validate("a.test").is_err());
+        let mut s = Settings::defaults("a.test");
+        s.groups.host = "A.Test".into();
+        assert!(s.validate("a.test").is_err(), "the same domain in other letters");
+    }
+
+    #[test]
+    fn validate_stores_normalized_hosts() {
+        let mut s = Settings::defaults("a.test");
+        s.groups.host = "Rooms.A.Test".into();
+        s.files.host = "UPLOAD.a.test".into();
+        s.validate("a.test").unwrap();
+        assert_eq!(s.groups.host, "rooms.a.test");
+        assert_eq!(s.files.host, "upload.a.test");
+        s.files.host = "Rooms.a.test".into();
+        assert!(s.validate("a.test").is_err(), "the same host in other letters");
     }
 
     #[test]

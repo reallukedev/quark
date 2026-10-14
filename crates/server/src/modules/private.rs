@@ -86,14 +86,15 @@ impl Module for Private {
         vec!["private"]
     }
     fn iq_namespaces(&self) -> &'static [(&'static str, IqTarget)] {
-        &[(ns::PRIVATE, IqTarget::Account), (ns::PRIVATE, IqTarget::Server)]
+        // XEP-0049 storage is the account's own, asked for without a `to` (which reaches the
+        // sender's bare JID). The server domain has none: a query to it is refused by the router.
+        &[(ns::PRIVATE, IqTarget::Account)]
     }
 
     async fn handle_iq(&self, cx: &IqCtx<'_>) -> IqResult {
-        let Some(me) = cx.local_sender() else { return Err(StanzaError::forbidden()) };
-        if cx.to.node().is_some_and(|n| Some(n) != me.node()) {
-            return Err(StanzaError::forbidden());
-        }
+        let Some(me) = cx.local_sender().filter(|_| cx.from_self()) else {
+            return Err(StanzaError::forbidden().with_text("Only the account itself can use its private storage."));
+        };
         let (h, u) = (cx.host.domain.clone(), me.node().unwrap_or_default().to_string());
         let mut children = cx.payload.children();
         let (Some(item), None) = (children.next(), children.next()) else {

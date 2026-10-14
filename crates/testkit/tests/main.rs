@@ -7,6 +7,7 @@ mod blind_util;
 mod blind_xep;
 mod common;
 
+mod addressing;
 mod adhoc;
 mod admin;
 mod blind_bind;

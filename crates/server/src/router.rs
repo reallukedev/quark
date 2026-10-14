@@ -56,8 +56,7 @@ pub async fn from_client(srv: &Arc<Server>, host: &Arc<Host>, session: &Arc<Sess
             }
             carbon_sent(srv, session, &to, &el);
             // The sender's archive id was for its own devices (the sent carbons), not the recipient.
-            let mine = me.to_bare().to_string();
-            crate::modules::mam::strip_stanza_ids(&mut el, &mine);
+            crate::modules::mam::strip_stanza_ids(&mut el, me);
         }
         _ => {}
     }

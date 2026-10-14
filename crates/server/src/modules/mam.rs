@@ -118,8 +118,9 @@ impl Module for Mam {
     }
 
     fn iq_namespaces(&self) -> &'static [(&'static str, IqTarget)] {
-        // Without a `to` an IQ is addressed to the server; MAM then means the sender's archive.
-        &[(ns::MAM, IqTarget::Account), (ns::MAM, IqTarget::Server)]
+        // An IQ without `to` reaches the sender's own bare JID, so that's the account's archive.
+        // The server domain keeps no archive of its own: a query to it is refused by the router.
+        &[(ns::MAM, IqTarget::Account)]
     }
 
     fn start(&self, srv: &Arc<Server>) {
@@ -143,11 +144,10 @@ impl Module for Mam {
 
     async fn handle_iq(&self, cx: &IqCtx<'_>) -> IqResult {
         // Only the account itself reads or changes its archive.
-        let archive = match cx.to.node() {
-            Some(_) if cx.from_self() => cx.to.to_bare(),
-            Some(_) => return Err(StanzaError::forbidden().with_text("Only the account itself can read its message history.")),
-            None => cx.local_sender().ok_or_else(StanzaError::service_unavailable)?,
-        };
+        if !cx.from_self() {
+            return Err(StanzaError::forbidden().with_text("Only the account itself can read its message history."));
+        }
+        let archive = cx.to.to_bare();
         if !cx.host.settings().history.on() {
             return Err(StanzaError::service_unavailable().with_text("Message history is turned off on this server."));
         }
@@ -170,7 +170,7 @@ impl Module for Mam {
     async fn message_out(&self, cx: &StanzaCtx<'_>, msg: &mut Element) -> Flow {
         let me = cx.from.to_bare();
         let mine = me.to_string();
-        strip_stanza_ids(msg, &mine);
+        strip_stanza_ids(msg, &me);
         // To one's own account: archived once, on the way in.
         if cx.to.to_bare() == me || !cx.host.settings().history.on() || !archivable(msg) {
             return Flow::Continue;
@@ -189,7 +189,7 @@ impl Module for Mam {
         let me = cx.to.to_bare();
         let mine = me.to_string();
         // Nobody else may claim an id in this archive (XEP-0359 §5).
-        strip_stanza_ids(msg, &mine);
+        strip_stanza_ids(msg, &me);
         if msg.attr("type") == Some("groupchat") || !cx.host.settings().history.on() || !archivable(msg) {
             return Flow::Continue;
         }
@@ -269,9 +269,18 @@ fn stanza_id(by: &str, id: &str) -> Element {
     Element::new("stanza-id", ns::SID).attr_set("by", by).attr_set("id", id)
 }
 
-/// Removes stanza ids claiming to be from `by` (only that archive may set them).
-pub fn strip_stanza_ids(msg: &mut Element, by: &str) {
-    msg.remove_children(|c| c.is("stanza-id", ns::SID) && c.attr("by").is_some_and(|b| b.eq_ignore_ascii_case(by)));
+/// Removes stanza ids claiming to be from `account`'s archive (only it may set them, XEP-0359
+/// §5), whatever form the `by` takes: compared as normalized JIDs, so `Sam@Example.com` or a
+/// full JID of the account counts, and so does the account's own domain, which a client could
+/// otherwise take for its server's word.
+pub fn strip_stanza_ids(msg: &mut Element, account: &Jid) {
+    let bare = account.to_bare();
+    msg.remove_children(|c| {
+        c.is("stanza-id", ns::SID)
+            && c.attr("by").and_then(|b| Jid::parse(b).ok()).is_some_and(|b| {
+                b.to_bare() == bare || (b.node().is_none() && b.domain() == bare.domain())
+            })
+    });
 }
 
 // ---------------------------------------------------------------- what gets archived
@@ -1221,10 +1230,14 @@ mod tests {
 
     #[test]
     fn spoofed_stanza_ids_are_removed_but_others_kept() {
-        let mut m = el("<message xmlns='jabber:client'><stanza-id xmlns='urn:xmpp:sid:0' by='a@b' id='1'/><stanza-id xmlns='urn:xmpp:sid:0' by='room@c' id='2'/></message>");
-        strip_stanza_ids(&mut m, "a@b");
-        assert_eq!(m.children().count(), 1);
-        assert_eq!(m.first_child().and_then(|c| c.attr("by")), Some("room@c"));
+        let mut m = el(concat!(
+            "<message xmlns='jabber:client'><stanza-id xmlns='urn:xmpp:sid:0' by='a@b' id='1'/><stanza-id xmlns='urn:xmpp:sid:0' by='room@c' id='2'/>",
+            "<stanza-id xmlns='urn:xmpp:sid:0' by='A@B' id='3'/><stanza-id xmlns='urn:xmpp:sid:0' by='a@b/phone' id='4'/>",
+            "<stanza-id xmlns='urn:xmpp:sid:0' by='B' id='5'/><stanza-id xmlns='urn:xmpp:sid:0' by='other@b' id='6'/></message>"
+        ));
+        strip_stanza_ids(&mut m, &Jid::parse("a@b/laptop").unwrap());
+        let left: Vec<_> = m.children().filter_map(|c| c.attr("by")).collect();
+        assert_eq!(left, ["room@c", "other@b"]);
     }
 
     #[test]

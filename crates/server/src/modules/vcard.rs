@@ -66,14 +66,13 @@ impl Module for VCard {
     }
 
     async fn handle_iq(&self, cx: &IqCtx<'_>) -> IqResult {
-        // A vCard IQ without `to` is about the sender's own account.
-        let owner = match cx.to.node() {
-            Some(n) => n.to_string(),
-            None if cx.kind == IqType::Set || cx.local_sender().is_some() => match cx.local_sender() {
-                Some(j) => j.node().unwrap_or_default().to_string(),
-                None => return Err(StanzaError::forbidden()),
-            },
-            None => return Err(StanzaError::item_not_found()),
+        // A vCard IQ without `to` reaches the sender's own bare JID, so it's about the account.
+        // One addressed to the domain is about the server, which has an empty vCard nobody sets.
+        let Some(owner) = cx.to.node().map(str::to_string) else {
+            return match cx.kind {
+                IqType::Get => ok(Element::new("vCard", ns::VCARD)),
+                _ => Err(StanzaError::new(quark_core::Condition::NotAllowed).with_text("The server's own profile can't be changed.")),
+            };
         };
         let h = cx.host.domain.clone();
         match cx.kind {

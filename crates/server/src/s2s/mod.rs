@@ -22,7 +22,8 @@ mod stream;
 pub use dns::Target;
 
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -31,12 +32,14 @@ use anyhow::Context as _;
 use hickory_resolver::TokioAsyncResolver;
 use parking_lot::{Mutex, RwLock};
 use quark_core::{Condition, Element, StanzaError};
+use rustls::sign::CertifiedKey;
 use serde::Serialize;
 use tokio::sync::mpsc::{self, error::TrySendError};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 use crate::config::Config;
 use crate::server::{Remote, Server};
+use crate::tls::CertStore;
 use pki::Pki;
 
 /// ALPN protocol for direct TLS between servers (XEP-0368).
@@ -45,6 +48,14 @@ const ALPN: &[u8] = b"xmpp-server";
 const MAX_UNREACHABLE: usize = 10_000;
 /// Times stanzas from a dropped link are sent again before they bounce.
 const MAX_ATTEMPTS: u8 = 2;
+/// Incoming links one remote domain may have to one of our domains. A server needs one (a few
+/// in a cluster); past this the oldest is closed, so one domain can't fill `max_incoming`
+/// and a server that reconnects after losing its old connection isn't locked out by it.
+const MAX_LINKS_PER_PAIR: usize = 8;
+/// How often trusted certificate files are read again to notice them being replaced.
+const TRUST_RECHECK: Duration = Duration::from_secs(5);
+/// Client TLS configs kept (one per local domain and kind of TLS).
+const MAX_CLIENT_CONFIGS: usize = 1024;
 
 /// A link, for status pages and tests.
 #[derive(Debug, Clone, Serialize)]
@@ -63,18 +74,92 @@ pub struct LinkInfo {
     pub since: i64,
 }
 
-/// TLS material for links: the trust store and the server configs made from it.
+/// TLS material for links: the trust store and the configs made from it.
 struct Tls {
     pki: Arc<Pki>,
     starttls: Arc<rustls::ServerConfig>,
     direct: Arc<rustls::ServerConfig>,
+    /// Client configs by (local domain, direct TLS). Built once rather than per connection:
+    /// checking our own certificate isn't free, and rustls keeps its session cache in the
+    /// config, so only a shared one lets the next connection resume the TLS session. A new
+    /// trust store makes a new `Tls`, which starts this afresh.
+    clients: Mutex<HashMap<(String, bool), ClientTls>>,
+}
+
+/// A cached client config and the certificate it was made for.
+struct ClientTls {
+    /// The certificate the store had for the domain then; a reloaded one is a new `Arc`.
+    from_store: Option<Arc<CertifiedKey>>,
+    /// That certificate, when it's one others can verify (the one we present).
+    own: Option<Arc<CertifiedKey>>,
+    config: Arc<rustls::ClientConfig>,
 }
 
 impl Tls {
-    fn new(pki: Pki, srv: &Server) -> anyhow::Result<Tls> {
-        let starttls = pki.server_config(&srv.certs, &[])?;
-        let direct = pki.server_config(&srv.certs, &[ALPN])?;
-        Ok(Tls { pki: Arc::new(pki), starttls, direct })
+    fn new(pki: Pki, certs: &Arc<CertStore>) -> anyhow::Result<Tls> {
+        let starttls = pki.server_config(certs, &[])?;
+        let direct = pki.server_config(certs, &[ALPN])?;
+        Ok(Tls { pki: Arc::new(pki), starttls, direct, clients: Mutex::new(HashMap::new()) })
+    }
+
+    /// The client config for links from `local`, and our certificate when others can verify it.
+    fn client(
+        &self,
+        certs: &CertStore,
+        local: &str,
+        direct_tls: bool,
+    ) -> Result<(Arc<rustls::ClientConfig>, Option<Arc<CertifiedKey>>), rustls::Error> {
+        let current = certs.certified_key(local);
+        let key = (local.to_string(), direct_tls);
+        let same = |c: &ClientTls| match (&c.from_store, &current) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if let Some(c) = self.clients.lock().get(&key).filter(|c| same(c)) {
+            return Ok((c.config.clone(), c.own.clone()));
+        }
+        let own = current.clone().filter(|ck| self.pki.valid_for(&ck.cert, local));
+        let alpn: &[&[u8]] = if direct_tls { &[ALPN] } else { &[] };
+        let config = self.pki.client_config(own.clone(), alpn)?;
+        let mut clients = self.clients.lock();
+        if clients.len() >= MAX_CLIENT_CONFIGS {
+            clients.clear();
+        }
+        clients.insert(key, ClientTls { from_store: current, own: own.clone(), config: config.clone() });
+        Ok((config, own))
+    }
+}
+
+/// Trusted certificate files and a digest of their contents (None when unreadable).
+type TrustState = (Vec<PathBuf>, Option<[u8; 32]>);
+
+/// What one of our domains takes from other servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Inbound {
+    All,
+    /// Federation is off but push notifications still go out (XEP-0357): only the app
+    /// servers' answers to them come in.
+    Answers,
+    /// Federation is off: nothing.
+    Nothing,
+}
+
+/// The domain's federation settings (a group chat or upload domain follows its host's).
+fn inbound(srv: &Server, domain: &str) -> Inbound {
+    match srv.host(domain).or_else(|| srv.component_host(domain)) {
+        Some(h) => {
+            let s = h.settings();
+            if s.federation {
+                Inbound::All
+            } else if s.push {
+                Inbound::Answers
+            } else {
+                Inbound::Nothing
+            }
+        }
+        // Components configured on their own.
+        None => Inbound::All,
     }
 }
 
@@ -95,9 +180,18 @@ pub struct S2s {
     /// (local, remote) pairs that failed recently: until when, and the error to bounce with.
     unreachable: Mutex<HashMap<(String, String), (Instant, StanzaError)>>,
     links: Mutex<HashMap<(u64, String), LinkInfo>>,
+    /// Wakes an incoming link to close it, when a newer one from the same domain replaces it.
+    evict: Mutex<HashMap<u64, Arc<Notify>>>,
     incoming: AtomicUsize,
     outgoing: AtomicUsize,
     in_slots: Arc<Semaphore>,
+    /// Incoming connections per address (IPv6: per /64), so one peer can't take every slot.
+    per_ip: Mutex<HashMap<IpAddr, usize>>,
+    /// When the trusted certificate files were last read to look for changes.
+    trust_checked: Mutex<Instant>,
+    /// The trust store files and contents that last failed to load, so the same broken state
+    /// isn't retried (and warned about) on every connection.
+    trust_failed: Mutex<Option<TrustState>>,
     ids: AtomicU64,
 }
 
@@ -114,7 +208,7 @@ pub async fn start(srv: &Arc<Server>) -> anyhow::Result<Vec<std::net::SocketAddr
     let secret = secret(srv, &cfg).await?;
     let paths = cfg.s2s.trusted_certs.clone();
     let pki = tokio::task::spawn_blocking(move || Pki::load(&paths)).await?.map_err(anyhow::Error::msg).context("s2s.trusted_certs")?;
-    let tls = Tls::new(pki, srv)?;
+    let tls = Tls::new(pki, &srv.certs)?;
     let s2s = Arc::new_cyclic(|me| S2s {
         me: me.clone(),
         srv: Arc::downgrade(srv),
@@ -124,9 +218,13 @@ pub async fn start(srv: &Arc<Server>) -> anyhow::Result<Vec<std::net::SocketAddr
         out: Mutex::new(HashMap::new()),
         unreachable: Mutex::new(HashMap::new()),
         links: Mutex::new(HashMap::new()),
+        evict: Mutex::new(HashMap::new()),
         incoming: AtomicUsize::new(0),
         outgoing: AtomicUsize::new(0),
         in_slots: Arc::new(Semaphore::new(cfg.s2s.max_incoming.max(1))),
+        per_ip: Mutex::new(HashMap::new()),
+        trust_checked: Mutex::new(Instant::now()),
+        trust_failed: Mutex::new(None),
         ids: AtomicU64::new(1),
     });
     let mut bound = Vec::new();
@@ -186,36 +284,63 @@ impl S2s {
         self.ids.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// The current TLS material, rebuilt when `s2s.trusted_certs` changed in the config.
+    /// The current TLS material, rebuilt when `s2s.trusted_certs` changed in the config or one
+    /// of its files was rewritten (looked at every [`TRUST_RECHECK`] at most).
     async fn tls(&self, srv: &Arc<Server>) -> Arc<Tls> {
         let cur = self.tls.read().clone();
         let paths = srv.config().s2s.trusted_certs.clone();
-        if cur.pki.sources == paths {
+        let same_paths = cur.pki.sources == paths;
+        let failed_paths = self.trust_failed.lock().as_ref().is_some_and(|(p, _)| *p == paths);
+        if same_paths || failed_paths {
+            if paths.is_empty() {
+                return cur;
+            }
+            let mut checked = self.trust_checked.lock();
+            if checked.elapsed() < TRUST_RECHECK {
+                return cur;
+            }
+            *checked = Instant::now();
+        }
+        let p = paths.clone();
+        // Unreadable files: the load below says why.
+        let digest = tokio::task::spawn_blocking(move || Pki::fingerprint(&p)).await.ok().and_then(Result::ok);
+        if same_paths && digest == Some(cur.pki.digest) {
+            return cur;
+        }
+        let state = (paths.clone(), digest);
+        if self.trust_failed.lock().as_ref() == Some(&state) {
             return cur;
         }
         let built = tokio::task::spawn_blocking(move || Pki::load(&paths)).await;
-        match built {
-            Ok(Ok(pki)) => match Tls::new(pki, srv) {
+        let err = match built {
+            Ok(Ok(pki)) => match Tls::new(pki, &srv.certs) {
                 Ok(t) => {
                     let t = Arc::new(t);
                     *self.tls.write() = t.clone();
+                    *self.trust_failed.lock() = None;
                     tracing::info!("federation trust store reloaded");
-                    t
+                    return t;
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "couldn't rebuild the federation TLS config");
-                    cur
-                }
+                Err(e) => format!("couldn't rebuild the federation TLS config: {e}"),
             },
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "couldn't reload s2s.trusted_certs; keeping the old ones");
-                cur
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "reloading s2s.trusted_certs failed");
-                cur
-            }
+            Ok(Err(e)) => format!("couldn't reload s2s.trusted_certs; keeping the old ones: {e}"),
+            Err(e) => format!("reloading s2s.trusted_certs failed: {e}"),
+        };
+        tracing::warn!(error = %err, "federation trust store not reloaded");
+        *self.trust_failed.lock() = Some(state);
+        cur
+    }
+
+    /// Takes one of the incoming connections `ip` may have, if it has one left.
+    fn ip_slot(self: &Arc<Self>, ip: IpAddr, cap: usize) -> Option<IpSlot> {
+        let key = ip_key(ip);
+        let mut per_ip = self.per_ip.lock();
+        let n = per_ip.entry(key).or_insert(0);
+        if *n >= cap {
+            return None;
         }
+        *n += 1;
+        Some(IpSlot { s2s: self.clone(), key })
     }
 
     /// Queues `el` on the link from `local` to `remote`, starting one if needed.
@@ -348,7 +473,29 @@ impl S2s {
         if !links.keys().any(|(i, _)| *i == id) {
             counter.fetch_add(1, Ordering::Relaxed);
         }
+        // Past the cap for this pair, the oldest incoming link (lowest id) makes way.
+        let oldest = (info.direction == "in")
+            .then(|| {
+                let others: Vec<u64> = links
+                    .iter()
+                    .filter(|((i, _), l)| *i != id && l.direction == "in" && l.remote == info.remote && l.local == info.local)
+                    .map(|((i, _), _)| *i)
+                    .collect();
+                (others.len() >= MAX_LINKS_PER_PAIR).then(|| others.into_iter().min()).flatten()
+            })
+            .flatten();
         links.insert((id, info.remote.clone()), info);
+        drop(links);
+        if let Some(n) = oldest.and_then(|old| self.evict.lock().get(&old).cloned()) {
+            n.notify_one();
+        }
+    }
+
+    /// Registers an incoming link so a newer one can close it; returns what it waits on.
+    fn evictable(&self, id: u64) -> Arc<Notify> {
+        let n = Arc::new(Notify::new());
+        self.evict.lock().insert(id, n.clone());
+        n
     }
 
     /// Stream management came on for link `id` after it was registered.
@@ -361,6 +508,7 @@ impl S2s {
     }
 
     fn link_down(&self, id: u64) {
+        self.evict.lock().remove(&id);
         let mut links = self.links.lock();
         let before = links.len();
         let mut dir = None;
@@ -401,6 +549,42 @@ fn bounce(srv: &Arc<Server>, el: Element, err: StanzaError) {
     tokio::spawn(async move { crate::router::bounce(&srv, &el, err).await });
 }
 
+/// Holds one of an address's incoming connections until dropped.
+pub(super) struct IpSlot {
+    s2s: Arc<S2s>,
+    key: IpAddr,
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        let mut per_ip = self.s2s.per_ip.lock();
+        if let Some(n) = per_ip.get_mut(&self.key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                per_ip.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// Incoming connections one address may have open: an eighth of `max_incoming`, so filling
+/// them all takes many addresses.
+fn per_ip_cap(max_incoming: usize) -> usize {
+    (max_incoming / 8).max(1)
+}
+
+/// What connections are counted under: the address, or its /64 for IPv6, since one host
+/// usually has a whole /64 to pick from.
+fn ip_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+        v4 => v4,
+    }
+}
+
 /// How often a link checks its timers, from the idle limit (so short limits in tests work).
 fn tick_period(idle_secs: u64) -> Duration {
     Duration::from_millis((idle_secs * 250).clamp(250, 30_000))
@@ -423,6 +607,35 @@ mod tests {
         assert!(is_blocked(&cfg, "muc.spam.example"));
         assert!(!is_blocked(&cfg, "notspam.example"));
         assert!(!is_blocked(&cfg, "example"));
+    }
+
+    #[test]
+    fn addresses_are_counted_per_host() {
+        assert_eq!(ip_key("10.0.0.1".parse().unwrap()), "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(ip_key("::ffff:10.0.0.1".parse().unwrap()), "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(ip_key("2001:db8:1:2:aaaa::1".parse().unwrap()), ip_key("2001:db8:1:2:bbbb::9".parse().unwrap()));
+        assert_ne!(ip_key("2001:db8:1:2::1".parse().unwrap()), ip_key("2001:db8:1:3::1".parse().unwrap()));
+        assert_eq!(per_ip_cap(2000), 250);
+        assert_eq!(per_ip_cap(3), 1);
+    }
+
+    #[test]
+    fn client_configs_are_reused_until_our_certificate_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let certs = CertStore::new(&dir.path().join("certs"), dir.path(), true);
+        certs.set_domains(vec!["a.test".into()]).unwrap();
+        let tls = Tls::new(Pki::load(&[]).unwrap(), &certs).unwrap();
+        let (first, own) = tls.client(&certs, "a.test", false).unwrap();
+        assert!(own.is_none(), "a self-signed certificate isn't presented");
+        let (again, _) = tls.client(&certs, "a.test", false).unwrap();
+        assert!(Arc::ptr_eq(&first, &again), "the same config, so TLS sessions resume");
+        let (direct, _) = tls.client(&certs, "a.test", true).unwrap();
+        assert!(!Arc::ptr_eq(&first, &direct));
+        assert_eq!(direct.alpn_protocols, [ALPN.to_vec()]);
+        // A reloaded certificate gets a new config.
+        certs.reload().unwrap();
+        let (after, _) = tls.client(&certs, "a.test", false).unwrap();
+        assert!(!Arc::ptr_eq(&first, &after));
     }
 
     #[test]

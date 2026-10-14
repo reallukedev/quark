@@ -216,6 +216,12 @@ pub struct S2sSection {
     /// Let servers without a certificate we trust prove who they are with dialback (XEP-0220).
     #[serde(default = "yes")]
     pub dialback: bool,
+    /// Only believe a remote server whose certificate we can verify: links are only opened to
+    /// servers with a valid certificate, and dialback is only believed when the server called
+    /// back has one. Off by default, so servers with self-signed certificates can federate
+    /// through dialback, which then trusts DNS to find the real server.
+    #[serde(default)]
+    pub require_valid_certs: bool,
     /// The secret dialback keys are made from. Made and stored on first start when unset; set
     /// the same one on every node of a cluster.
     #[serde(default)]
@@ -240,6 +246,7 @@ impl Default for S2sSection {
             routes: BTreeMap::new(),
             trusted_certs: Vec::new(),
             dialback: true,
+            require_valid_certs: false,
             dialback_secret: None,
             retry_secs: default_s2s_retry(),
             max_incoming: default_s2s_incoming(),

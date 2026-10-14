@@ -64,6 +64,7 @@ strip_photo_metadata = false              # strip EXIF/GPS from JPEG uploads (br
 
 [s2s]
 require_tls = true
+require_valid_certs = false   # true: only servers whose certificate verifies (no self-signed)
 idle_secs = 900
 blocked = ["spam.example"]
 

@@ -565,3 +565,267 @@ async fn unacknowledged_stanzas_go_out_again_on_a_new_link() -> anyhow::Result<(
     alice.expect_silence(Duration::from_millis(300)).await?;
     Ok(())
 }
+
+fn error_text(e: &Element) -> Option<String> {
+    e.get_child("error", ns::CLIENT)?.child_text("text", ns::STANZAS)
+}
+
+#[tokio::test]
+async fn federation_off_refuses_other_servers_coming_in() -> anyhow::Result<()> {
+    let (a, b) = pair().await?;
+    let (mut alice, mut bob) = people(&a, &b).await?;
+
+    // Push still on: b.test takes streams (app servers answer push notifications on them) but
+    // refuses what people send, with an error back.
+    b.set_settings(|s| s.federation = false).await?;
+    alice.send(&message("bob@b.test", "chat", "anyone home?")).await?;
+    let err = alice.expect(|e| is_message(e) && e.attr("type") == Some("error")).await?;
+    assert_eq!(error_condition(&err).as_deref(), Some("service-unavailable"));
+    assert_eq!(err.attr("from"), Some("bob@b.test"));
+    bob.expect_silence(Duration::from_millis(300)).await?;
+
+    // Push off too: streams to b.test are refused at the header.
+    b.set_settings(|s| s.push = false).await?;
+    let mut raw = Raw::connect(b.s2s()).await?;
+    let (_, first) = raw.open(A, B).await?;
+    let e = first.expect("an error");
+    assert!(e.is("error", ns::STREAM) && e.has_child("policy-violation", ns::STREAMS), "{e}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn required_valid_certificates_refuse_self_signed_dialback() -> anyhow::Result<()> {
+    let (a, b) = pair_with("", "require_valid_certs = true").await?;
+    let (mut alice, mut bob) = people(&a, &b).await?;
+    // b.test calls a.test back to check its dialback key, but a.test's self-signed certificate
+    // doesn't prove it reached the real a.test.
+    alice.send(&message("bob@b.test", "chat", "trust me")).await?;
+    let err = alice.expect(|e| is_message(e) && e.attr("type") == Some("error")).await?;
+    assert_eq!(error_condition(&err).as_deref(), Some("remote-server-not-found"));
+    // Nor does b.test send to a server it can't verify.
+    bob.send(&message("alice@a.test", "chat", "who are you?")).await?;
+    let err = bob.expect(|e| is_message(e) && e.attr("type") == Some("error")).await?;
+    assert_eq!(error_condition(&err).as_deref(), Some("remote-server-not-found"));
+    bob.expect_silence(Duration::from_millis(100)).await?;
+    alice.expect_silence(Duration::from_millis(100)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dialback_is_believed_when_the_server_called_back_has_a_valid_certificate() -> anyhow::Result<()> {
+    let ca = TestCa::new()?;
+    let dir = tempfile::tempdir()?;
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, ca.pem())?;
+    // a.test doesn't trust the CA, so it doesn't present its certificate as a client one and
+    // proves itself with dialback; b.test checks that a.test's server, called back, is genuine.
+    let a = TestServer::start_with(Options { certs: vec![ca.issue(A)?], ..opts(A, "") }).await?;
+    let strict = format!("[s2s]\nrequire_valid_certs = true\ntrusted_certs = [{ca_path:?}]\n");
+    let b = TestServer::start_with(Options { certs: vec![ca.issue(B)?], ..opts(B, &strict) }).await?;
+    federate(&a, &b)?;
+    let (mut alice, mut bob) = people(&a, &b).await?;
+    alice.send(&message("bob@b.test", "chat", "verified")).await?;
+    assert_eq!(body(&bob.expect(is_message).await?).as_deref(), Some("verified"));
+    let links = b.srv.remote().unwrap().links();
+    assert!(links.iter().any(|l| l.direction == "in" && l.remote == A && l.auth == "dialback"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn international_domains_are_reached_by_their_a_labels() -> anyhow::Result<()> {
+    let fake = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let a = TestServer::start_with(opts(A, "")).await?;
+    a.route("bücher.test", &format!("tls://{}", fake.local_addr()?))?;
+    a.add_user("alice", "password-a").await?;
+    let mut alice = a.online("alice", "password-a", "phone").await?;
+    alice.send(&message("bob@bücher.test", "chat", "hallo")).await?;
+    let (mut tcp, _) = tokio::time::timeout(Duration::from_secs(5), fake.accept()).await??;
+    // The TLS ClientHello names the server in the clear (SNI).
+    let mut hello = Vec::new();
+    let mut buf = [0u8; 4096];
+    let sni = b"xn--bcher-kva.test";
+    while !hello.windows(sni.len()).any(|w| w == sni) {
+        let n = tokio::time::timeout(Duration::from_secs(5), tokio::io::AsyncReadExt::read(&mut tcp, &mut buf)).await??;
+        anyhow::ensure!(n > 0 && hello.len() < 64 * 1024, "no SNI with the A-label in the ClientHello");
+        hello.extend_from_slice(&buf[..n]);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_server_that_stops_reading_loses_its_link() -> anyhow::Result<()> {
+    let fake = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let extra = "[s2s]\nrequire_tls = false\ntimeout_secs = 2\n\n[limits]\nc2s_bytes_per_sec = 1073741824\n";
+    let a = TestServer::start_with(opts(A, extra)).await?;
+    a.route(B, &fake.local_addr()?.to_string())?;
+    a.add_user("alice", "password-a").await?;
+    let mut alice = a.online("alice", "password-a", "phone").await?;
+    alice.send(&message("bob@b.test", "chat", "first")).await?;
+
+    // Plays b.test up to accepting dialback, then never reads again.
+    let (tcp, _) = tokio::time::timeout(Duration::from_secs(5), fake.accept()).await??;
+    let (r, w) = tcp.into_split();
+    let mut raw = Raw { reader: StreamReader::new(r, 1 << 20), writer: w };
+    raw.reader.server_ns = true;
+    assert!(matches!(raw.next().await?, StreamEvent::Open { .. }));
+    raw.send_raw(&stream_header(ns::SERVER, Some(B), Some(A), Some("fake-1"), &[("xmlns:db", ns::DIALBACK)])).await?;
+    raw.send(&Element::new("features", ns::STREAM).child(Element::new("dialback", ns::DIALBACK_FEATURE))).await?;
+    while !raw.recv().await?.is("result", ns::DIALBACK) {}
+    raw.send_raw("<db:result from='b.test' to='a.test' type='valid'/>").await?;
+    let mut up = false;
+    for _ in 0..50 {
+        if a.srv.remote().unwrap().counts().1 == 1 {
+            up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(up, "the link came up");
+
+    // Far more than the socket buffers hold.
+    let big = "x".repeat(60 * 1024);
+    for _ in 0..200 {
+        alice.send(&message("bob@b.test", "chat", &big)).await?;
+    }
+    let mut closed = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if a.srv.remote().unwrap().counts().1 == 0 {
+            closed = true;
+            break;
+        }
+    }
+    assert!(closed, "a stalled write ends the link instead of hanging it");
+    drop(raw);
+    Ok(())
+}
+
+#[tokio::test]
+async fn refused_stanzas_count_for_acks_and_their_errors_come_back() -> anyhow::Result<()> {
+    let (a, b) = plain_pair("").await?;
+    a.add_user("alice", "password-a").await?;
+    let mut alice = a.online("alice", "password-a", "phone").await?;
+    let mut raw = Raw::connect(b.s2s()).await?;
+    raw.dialback_as_a(&b).await?;
+    raw.send(&Element::new("enable", ns::SM)).await?;
+    assert!(raw.recv().await?.is("enabled", ns::SM));
+    raw.send(&message("nobody@", "chat", "where to?").attr_set("from", "alice@a.test/phone").attr_set("id", "m1")).await?;
+    raw.send(&Element::new("r", ns::SM)).await?;
+    let ack = raw.recv().await?;
+    assert!(ack.is("a", ns::SM));
+    assert_eq!(ack.attr("h"), Some("1"), "the refused stanza was handled");
+    // The error comes from b.test itself, since the address it was sent to isn't one.
+    let err = alice.expect(|e| is_message(e) && e.attr("type") == Some("error")).await?;
+    assert_eq!(error_condition(&err).as_deref(), Some("jid-malformed"));
+    assert_eq!((err.attr("from"), err.attr("id")), (Some(B), Some("m1")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_address_cant_take_every_incoming_slot() -> anyhow::Result<()> {
+    // An eighth of 16: two connections per address.
+    let (_a, b) = plain_pair("max_incoming = 16").await?;
+    let mut first = Raw::connect(b.s2s()).await?;
+    first.open(A, B).await?;
+    let mut second = Raw::connect(b.s2s()).await?;
+    second.open(A, B).await?;
+    let mut third = Raw::connect(b.s2s()).await?;
+    assert!(third.open(A, B).await.is_err(), "the third connection from one address is closed");
+    // Closing one frees its place.
+    drop(first);
+    let mut ok = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut again = Raw::connect(b.s2s()).await?;
+        if again.open(A, B).await.is_ok() {
+            ok = true;
+            break;
+        }
+    }
+    assert!(ok);
+    drop(second);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_dialback_checks_dont_keep_a_stream_open_forever() -> anyhow::Result<()> {
+    // slow.test's server takes TCP and never answers, so every check hangs until it times out.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = silent.local_addr()?;
+    let hold = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = silent.accept().await {
+            held.push(s);
+        }
+    });
+    let (_a, b) = plain_pair("timeout_secs = 2\nidle_secs = 4\n\n[limits]\nauth_timeout_secs = 1").await?;
+    b.route("slow.test", &addr.to_string())?;
+    let raw = Raw::connect(b.s2s()).await?;
+    let Raw { mut reader, mut writer } = raw;
+    let header = stream_header(ns::SERVER, Some("slow.test"), Some(B), None, &[("xmlns:db", ns::DIALBACK)]);
+    writer.write_all(header.as_bytes()).await?;
+    // A new check before the last one ends, over and over.
+    let keep_asking = tokio::spawn(async move {
+        loop {
+            let q = quark::s2s::dialback::element("result", "slow.test", B).text("0123456789abcdef");
+            if writer.write_all(q.to_stream_xml(ns::SERVER).as_bytes()).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    });
+    let started = std::time::Instant::now();
+    let cond = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match reader.next().await {
+                Ok(Some(StreamEvent::Stanza(e))) if e.is("error", ns::STREAM) => {
+                    return e.children().find(|c| c.ns() == ns::STREAMS && c.name() != "text").map(|c| c.name().to_string());
+                }
+                Ok(Some(_)) => continue,
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("the unauthenticated stream stayed open"))?;
+    assert_eq!(cond.as_deref(), Some("connection-timeout"));
+    assert!(started.elapsed() < Duration::from_secs(8));
+    keep_asking.abort();
+    hold.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_domain_cant_hold_more_than_a_few_links() -> anyhow::Result<()> {
+    let (_a, b) = plain_pair("").await?;
+    let mut oldest = Raw::connect(b.s2s()).await?;
+    oldest.dialback_as_a(&b).await?;
+    let mut newer = Vec::new();
+    for _ in 0..8 {
+        let mut raw = Raw::connect(b.s2s()).await?;
+        raw.dialback_as_a(&b).await?;
+        newer.push(raw);
+    }
+    // The ninth link from a.test to b.test replaces the first.
+    assert_eq!(oldest.stream_error().await?, "conflict");
+    assert_eq!(b.srv.remote().unwrap().counts().0, 8);
+    Ok(())
+}
+
+#[tokio::test]
+async fn blocked_subdomains_bounce_like_blocked_domains() -> anyhow::Result<()> {
+    let a = TestServer::start_with(opts(A, "[s2s]\nblocked = [\"spam.test\"]\n")).await?;
+    a.add_user("alice", "password-a").await?;
+    let mut alice = a.online("alice", "password-a", "phone").await?;
+    let mut texts = Vec::new();
+    for to in ["x@spam.test", "x@muc.spam.test"] {
+        alice.send(&message(to, "chat", "hi")).await?;
+        let err = alice.expect(|e| is_message(e) && e.attr("type") == Some("error")).await?;
+        assert_eq!(error_condition(&err).as_deref(), Some("remote-server-not-found"));
+        texts.push(error_text(&err));
+    }
+    // One check decides, so both are refused the same way, before any link is tried.
+    assert_eq!(texts[0], texts[1]);
+    assert_eq!(a.srv.remote().unwrap().counts(), (0, 0));
+    Ok(())
+}

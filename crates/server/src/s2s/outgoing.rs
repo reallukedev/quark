@@ -90,6 +90,9 @@ pub(super) struct Opened {
     pub features: Option<Element>,
     /// Our certificate for the local domain, when it's one others can verify.
     pub own: Option<Arc<CertifiedKey>>,
+    /// The peer's certificate is valid for the remote domain: we know who we're talking to,
+    /// not just where DNS sent us.
+    pub verified: bool,
 }
 
 /// Connects to `remote` for `local`: each host in turn until one completes TLS and the stream
@@ -148,20 +151,22 @@ async fn handshake(
     t: &Target,
     tcp: tokio::net::TcpStream,
 ) -> Result<Opened, Fail> {
-    let own = srv.certs.certified_key(local).filter(|ck| tls.pki.valid_for(&ck.cert, local));
-    let alpn: &[&[u8]] = if t.direct_tls { &[super::ALPN] } else { &[] };
-    let client = tls.pki.client_config(own.clone(), alpn).map_err(|e| Fail::refused(format!("TLS setup failed: {e}")))?;
-    let sni = ServerName::try_from(remote.to_string()).map_err(|_| Fail::refused(format!("{remote} isn't a name TLS can check.")))?;
+    let (client, own) = tls.client(&srv.certs, local, t.direct_tls).map_err(|e| Fail::refused(format!("TLS setup failed: {e}")))?;
+    // TLS names are A-labels (RFC 6125 §6.4.2), also for internationalized domains.
+    let sni = dns::to_ascii(remote)
+        .and_then(|a| ServerName::try_from(a).ok())
+        .ok_or_else(|| Fail::refused(format!("{remote} isn't a name TLS can check.")))?;
     let max = cfg.limits.s2s_stanza_bytes;
+    let write_limit = Duration::from_secs(cfg.s2s.timeout_secs.max(1));
     let tls_fail = |e: std::io::Error| {
         tracing::debug!(remote, error = %e, "TLS handshake failed");
         Fail::not_found(format!("Couldn't set up a secure connection to {remote}."))
     };
     let mut st = if t.direct_tls {
         let s = tokio_rustls::TlsConnector::from(client.clone()).connect(sni.clone(), tcp).await.map_err(tls_fail)?;
-        Stream::new(Io::Client(Box::new(s)), max)
+        Stream::new(Io::Client(Box::new(s)), max, write_limit)
     } else {
-        Stream::new(Io::Plain(tcp), max)
+        Stream::new(Io::Plain(tcp), max, write_limit)
     };
     let (mut id, mut features) = start(&mut st, local, remote).await.map_err(|f| Fail::stream(remote, f))?;
     if !st.secure {
@@ -178,7 +183,8 @@ async fn handshake(
             return Err(Fail::not_found(format!("{remote} doesn't support encryption, which this server requires.")));
         }
     }
-    Ok(Opened { st, id, features, own })
+    let verified = st.secure && st.peer_certs.as_deref().is_some_and(|c| tls.pki.valid_for(c, remote));
+    Ok(Opened { st, id, features, own, verified })
 }
 
 /// Sends our stream header and reads the peer's header and features.
@@ -207,8 +213,16 @@ struct Established {
 /// Connects and proves we are `local`.
 async fn establish(s2s: &S2s, srv: &Arc<Server>, local: &str, remote: &str) -> Result<Established, Fail> {
     let cfg = srv.config();
-    let Opened { mut st, mut id, mut features, own } = open(s2s, srv, local, remote).await?;
+    let Opened { mut st, mut id, mut features, own, verified } = open(s2s, srv, local, remote).await?;
     let err = |f: StreamFailure| Fail::stream(remote, f);
+    // Proving who we are doesn't prove who they are: without a valid certificate, the server
+    // we reached is whoever DNS and the network led us to. Dialback accepts that (it's how
+    // self-signed servers federate, see `incoming::verify`); with dialback off, or valid
+    // certificates required, such a server isn't sent anything.
+    if !verified && (cfg.s2s.require_valid_certs || !cfg.s2s.dialback) {
+        st.close(None).await;
+        return Err(Fail::not_found(format!("{remote}'s certificate can't be verified, and this server requires a valid one.")));
+    }
     let mut auth = None;
     let offers = |f: &Option<Element>, mech: &str| {
         f.as_ref()

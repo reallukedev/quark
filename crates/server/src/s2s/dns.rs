@@ -118,29 +118,57 @@ pub fn order(mut records: Vec<Srv>, mut rand: impl FnMut(u32) -> u32) -> Vec<Tar
     out
 }
 
+/// `domain` as DNS and TLS see it: internationalized labels become A-labels (`bücher.example`
+/// is `xn--bcher-kva.example` on the wire; RFC 5890, UTS #46). None when it isn't a valid
+/// domain name at all.
+pub fn to_ascii(domain: &str) -> Option<String> {
+    if domain.is_ascii() {
+        return Some(domain.to_ascii_lowercase());
+    }
+    idna::domain_to_ascii(domain).ok().filter(|d| !d.is_empty())
+}
+
 /// Where to connect for `domain`: a configured route, else SRV, else the domain on 5269.
 pub async fn targets(resolver: &TokioAsyncResolver, route: Option<&str>, domain: &str) -> Result<Vec<Target>, LookupError> {
     if let Some(r) = route {
         return Target::parse_route(r).map(|t| vec![t]).map_err(LookupError::Failed);
     }
+    let domain = to_ascii(domain).ok_or(LookupError::NotFound)?;
+    let domain = domain.as_str();
     // RFC 6761: these never resolve, so don't ask.
     if domain.ends_with(".invalid") || domain == "invalid" || domain == "localhost" || domain.ends_with(".localhost") {
         return Err(LookupError::NotFound);
     }
     let (tls, plain) = tokio::join!(srv(resolver, "_xmpps-server._tcp.", domain, true), srv(resolver, "_xmpp-server._tcp.", domain, false));
+    merge(domain, tls, plain, |n| rand::random::<u32>() % n)
+}
+
+/// One SRV lookup: the records, None when there are none, or why it failed.
+type SrvAnswer = Result<Option<Vec<Srv>>, String>;
+
+/// Combines the direct TLS and STARTTLS SRV answers. A lone "." target means that service isn't
+/// offered: for `_xmpp-server` the domain has no federation at all (RFC 6120 §3.2.1), but for
+/// `_xmpps-server` it only rules out direct TLS, so STARTTLS records or the domain itself on
+/// 5269 are still tried (XEP-0368 §3). Likewise only a failed `_xmpp-server` lookup is fatal.
+fn merge(domain: &str, tls: SrvAnswer, plain: SrvAnswer, rand: impl FnMut(u32) -> u32) -> Result<Vec<Target>, LookupError> {
+    let usable = |rs: Vec<Srv>| rs.into_iter().filter(|r| r.target.host != ".").collect::<Vec<_>>();
+    let denied = matches!(&plain, Ok(Some(rs)) if rs.len() == 1 && rs[0].target.host == ".");
     let mut records = Vec::new();
-    let mut denied = false;
-    let mut failure = None;
-    for r in [tls, plain] {
-        match r {
-            Ok(Some(rs)) if rs.len() == 1 && rs[0].target.host == "." => denied = true,
-            Ok(Some(rs)) => records.extend(rs.into_iter().filter(|r| r.target.host != ".")),
-            Ok(None) => {}
-            Err(e) => failure = Some(e),
-        }
+    match tls {
+        Ok(Some(rs)) => records.extend(usable(rs)),
+        Ok(None) => {}
+        Err(e) => tracing::debug!(domain, error = %e, "direct TLS SRV lookup failed; trying STARTTLS"),
     }
+    let failure = match plain {
+        Ok(Some(rs)) => {
+            records.extend(usable(rs));
+            None
+        }
+        Ok(None) => None,
+        Err(e) => Some(e),
+    };
     if !records.is_empty() {
-        let mut out = order(records, |n| rand::random::<u32>() % n);
+        let mut out = order(records, rand);
         out.truncate(MAX_TARGETS);
         return Ok(out);
     }
@@ -300,6 +328,38 @@ mod tests {
         assert_eq!(tcp.peer_addr().unwrap(), live);
         assert!(connect(&[dead]).await.is_err());
         assert!(connect(&[]).await.is_err());
+    }
+
+    fn dot(tls: bool) -> SrvAnswer {
+        Ok(Some(vec![Srv { priority: 0, weight: 0, target: Target { host: ".".into(), port: 0, direct_tls: tls } }]))
+    }
+
+    #[test]
+    fn no_direct_tls_still_falls_back_to_starttls() {
+        // "." for _xmpps-server only rules out direct TLS: the domain itself on 5269 is next.
+        let out = merge("b.test", dot(true), Ok(None), |_| 0).unwrap();
+        assert_eq!(out, [Target { host: "b.test".into(), port: DEFAULT_PORT, direct_tls: false }]);
+        let plain = Ok(Some(vec![Srv { priority: 5, weight: 0, target: t("xmpp.b.test", false) }]));
+        assert_eq!(merge("b.test", dot(true), plain, |_| 0).unwrap()[0].host, "xmpp.b.test");
+        // A failed direct TLS lookup doesn't stop STARTTLS either.
+        assert_eq!(merge("b.test", Err("SERVFAIL".into()), Ok(None), |_| 0).unwrap()[0].host, "b.test");
+    }
+
+    #[test]
+    fn no_federation_service_means_no_server() {
+        assert_eq!(merge("b.test", Ok(None), dot(false), |_| 0), Err(LookupError::NotFound));
+        assert_eq!(merge("b.test", dot(true), dot(false), |_| 0), Err(LookupError::NotFound));
+        assert!(matches!(merge("b.test", Ok(None), Err("SERVFAIL".into()), |_| 0), Err(LookupError::Failed(_))));
+        // Direct TLS records still count when STARTTLS is ruled out.
+        let tls = Ok(Some(vec![Srv { priority: 0, weight: 0, target: t("tls.b.test", true) }]));
+        assert_eq!(merge("b.test", tls, dot(false), |_| 0).unwrap()[0].host, "tls.b.test");
+    }
+
+    #[test]
+    fn internationalized_domains_become_a_labels() {
+        assert_eq!(to_ascii("bücher.test").as_deref(), Some("xn--bcher-kva.test"));
+        assert_eq!(to_ascii("B.Test").as_deref(), Some("b.test"));
+        assert_eq!(to_ascii("xn--bcher-kva.test").as_deref(), Some("xn--bcher-kva.test"));
     }
 
     #[tokio::test]

@@ -1356,6 +1356,7 @@ dependencies = [
  "hmac",
  "hyper",
  "hyper-util",
+ "idna",
  "if-addrs",
  "ipnet",
  "md-5",

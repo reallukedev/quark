@@ -368,7 +368,7 @@ impl Actor {
                 let too_high = Element::new("handled-count-too-high", ns::SM)
                     .attr_set("h", h.unwrap_or(0).to_string())
                     .attr_set("send-count", sent.to_string());
-                self.close_with(StreamError { condition: "undefined-condition", text: None, app: Some(too_high) }).await
+                self.close_with(StreamError { condition: "undefined-condition", text: None, app: Some(Box::new(too_high)) }).await
             }
             (ns::SM, "enable") => {
                 if self.sm.is_some() {

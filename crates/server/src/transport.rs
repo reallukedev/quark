@@ -22,7 +22,7 @@ pub struct StreamError {
     pub condition: &'static str,
     pub text: Option<String>,
     /// An application-specific condition element.
-    pub app: Option<Element>,
+    pub app: Option<Box<Element>>,
 }
 
 impl StreamError {
@@ -38,7 +38,7 @@ impl StreamError {
             e.append(Element::new("text", ns::STREAMS).attr_set("xml:lang", "en").text(t.clone()));
         }
         if let Some(a) = &self.app {
-            e.append(a.clone());
+            e.append((**a).clone());
         }
         e
     }

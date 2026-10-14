@@ -227,12 +227,11 @@ impl Service {
     /// the background) go through the message hooks, so push can wake the phone. Messages to a
     /// person rather than to the room's occupants (private messages, invitations) aren't sent
     /// this way at all but routed (see [`Out::route`]).
-    async fn deliver(&self, srv: &Arc<Server>, stanzas: Vec<Element>) -> Vec<Jid> {
+    async fn deliver(&self, srv: &Arc<Server>, stanzas: Vec<(Jid, Element)>) -> Vec<Jid> {
         let mut gone = Vec::new();
         // Most of a batch comes from one occupant: parse its address once.
         let mut last_from: Option<(String, Jid)> = None;
-        for mut el in stanzas {
-            let Some(to) = el.attr("to").and_then(|t| Jid::parse(t).ok()) else { continue };
+        for (to, mut el) in stanzas {
             match srv.resolve(to.domain()) {
                 Dest::Local(host) if to.is_full() => {
                     let Some(s) = srv.sessions.get(&to) else {
@@ -688,17 +687,17 @@ impl Service {
             match kind {
                 IqType::Result | IqType::Error => {
                     if let Some(back) = room.relay_answer(from, nick, &el) {
-                        out.send.push(back);
+                        out.push(back);
                     }
                 }
                 IqType::Get | IqType::Set => {
                     let self_ping = el.first_child().is_some_and(|p| p.is("ping", ns::PING)) && room.nick_of(from) == Some(nick);
                     if self_ping {
                         // XEP-0410: the room answers for the client, which is still joined.
-                        out.send.push(iq_result(&el));
+                        out.push(iq_result(&el));
                     } else {
                         match room.relay_iq(from, nick, &el) {
-                            Ok(fwd) => out.send.push(fwd),
+                            Ok(fwd) => out.push(fwd),
                             Err(e) => self.reply_error(srv, &el, e),
                         }
                     }
@@ -744,17 +743,11 @@ impl Service {
                     Ok(None)
                 }
             }
-            // Only a room that says it keeps an archive answers queries on it.
+            // Only a room that says it keeps an archive (it logs, see disco#info) answers queries
+            // on it; the archive of one that stopped logging isn't served either.
             ns::MAM if !room.logging => Err(StanzaError::service_unavailable().with_text("This group chat keeps no message archive.")),
             ns::MAM => {
-                // Only a room that advertises MAM (it keeps a log, see disco#info) answers
-                // queries; the archive of one that stopped logging isn't served either.
-                let allowed = if room.logging {
-                    room.may_read_archive(from, admin)
-                } else {
-                    Err(StanzaError::feature_not_implemented().with_text("This group chat doesn't keep its history."))
-                };
-                return match allowed {
+                return match room.may_read_archive(from, admin) {
                     Err(e) => {
                         self.reply_error(srv, &el, e);
                         self.finish(srv, cell, room, out).await
@@ -793,11 +786,11 @@ impl Service {
                 if let Some(p) = payload {
                     res.append(p);
                 }
-                out.send.push(res);
+                out.push(res);
             }
             Err(e) => {
                 if let Some(r) = error_reply(&el, &e) {
-                    out.send.push(r);
+                    out.push(r);
                 }
             }
         }
@@ -836,7 +829,9 @@ impl Service {
                 Ok(())
             }
             Some("submit") => {
-                let v = Values::parse(x);
+                // Room for the owner and admin lists, and one more to tell a list that's too
+                // long from one that just fits (a cut list would demote whoever was cut).
+                let v = Values::parse_up_to(x, super::room::MAX_ITEMS_PER_REQUEST + 1);
                 if v.form_type().is_some_and(|t| t != super::config::ROOMCONFIG) {
                     return Err(err(Condition::BadRequest, "That isn't a group chat settings form."));
                 }

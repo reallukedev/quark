@@ -151,6 +151,14 @@ pub enum Event {
     SettingsChanged {
         domain: String,
     },
+    /// Local people were mentioned in a group chat while none of their devices in it was awake
+    /// (not joined, or only from devices that are asleep or in the background), so push can
+    /// wake one. `message` is the groupchat message as the room sent it.
+    RoomMention {
+        room: Jid,
+        users: Vec<Jid>,
+        message: Element,
+    },
 }
 
 /// A disco#info identity (XEP-0030).
@@ -183,6 +191,12 @@ pub trait Component: Send + Sync + 'static {
 #[async_trait]
 pub trait Module: Send + Sync + 'static {
     fn name(&self) -> &'static str;
+
+    /// The module as `Any`, for functions outside the trait that need its state (the group chat
+    /// admin functions find their module this way).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 
     /// Tables this module owns. Rows tied to an account should reference
     /// `accounts(host, user) ON DELETE CASCADE`.
@@ -299,7 +313,7 @@ pub fn all() -> Vec<Arc<dyn Module>> {
         Arc::new(extdisco::ExtDisco),
         Arc::new(carbons::Carbons),
         Arc::new(pep::Pep),
-        Arc::new(muc::Muc),
+        Arc::new(muc::Muc::new()),
         Arc::new(upload::Upload),
         Arc::new(crate::http::Web),
         // Archive before push, so notifications can carry the stanza id.

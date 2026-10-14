@@ -118,8 +118,35 @@ Cheap; use it as a liveness check.
 - `account.delete` `{ host, user }` → `true` (also when it didn't exist). Removes roster, archive,
   PEP data and closes sessions.
 
+### Moving accounts (XEP-0227)
+Accounts move between servers in the Portable Import/Export Format, which Prosody
+(`mod_storage_xep0227`) and ejabberd (`export_piefxis` / `import_piefxis`) also read and write.
+
+- `account.export` `{ host?: string, users?: string[] }` → `{ xml: string, accounts: number }`.
+  Every account on every domain, or on `host`, or just `users` there (`not_found` when one doesn't
+  exist). Each `<user/>` carries its SCRAM keys (Quark never has passwords), contacts, vCard,
+  private XML storage, waiting offline messages, a `<account xmlns='urn:quark:pie:0' role
+  enabled created/>` element, and whatever modules add (PEP, archives). **The keys let someone
+  test passwords offline: treat an export like a password database.**
+- `account.import` `{ xml: string, host?: string }` →
+  `{ created: string[], skipped: [{ jid, reason }], notes: string[] }`. Only `host`'s accounts
+  when given. Accounts that already exist, invalid usernames and domains this server doesn't
+  serve are skipped (nothing is overwritten); `invalid` when the text isn't an export or holds no
+  accounts. Up to 32 MB per request.
+  - Keys come from `<scram-credentials/>` (SHA-1, SHA-256, SHA-512 sharing one salt), else from a
+    plain `password` attribute (kept as is, even when shorter than Quark's minimum), else the
+    account gets a random password and a note suggests a reset invite.
+  - Prosody keeps SCRAM-SHA-1 keys only. Those accounts sign in with SCRAM-SHA-1 or PLAIN; apps
+    that insist on SCRAM-SHA-256 fail until the first PLAIN sign-in, which fills in the other
+    keys, or a new password. `notes` lists them.
+  - Imports don't send welcome messages.
+
 ### Invites (XEP-0401 / XEP-0379)
-- `invite.create` `{ host, username: string|null, role, days: number, reusable: boolean }` → `Invite`.
+- `invite.create` `{ host, username: string|null, role, days: number, reusable: boolean, reset?: boolean }`
+  → `Invite`. `exists` when `username` is taken. With `reset: true` (and the `username` of an
+  existing account) the link sets a new password instead of making an account, and signs the
+  account's devices out. Returned invites also carry `inviter` (a JID, for invites members made
+  for friends, or null) and `uses`.
 - `invite.revoke` `{ host, token }` → `true`.
 - `invite.peek` `{ host, token }` → `{ expires, username, uri } | null`.
 

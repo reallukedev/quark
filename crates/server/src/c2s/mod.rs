@@ -114,8 +114,8 @@ pub async fn serve(srv: Arc<Server>, mut t: Box<dyn Transport>) {
             let info =
                 SessionInfo { ip: t.peer(), secure: t.secure(), since: quark_core::time::now_ms(), transport: t.kind(), client: b.client };
             let (reader, writer) = t.split();
-            session::spawn(session::Start {
-                srv,
+            let handle = session::spawn(session::Start {
+                srv: srv.clone(),
                 host: b.host,
                 jid: b.jid,
                 info,
@@ -126,6 +126,14 @@ pub async fn serve(srv: Arc<Server>, mut t: Box<dyn Transport>) {
                 inactive: b.inactive,
                 sm: b.sm,
             });
+            // An admin may have turned the account off or deleted it while this connection
+            // was signing in; that sign-out only reached sessions already registered.
+            let (user, domain) = (handle.jid.node().unwrap_or_default(), handle.jid.domain());
+            match srv.accounts.info(domain, user).await {
+                Ok(Some(i)) if i.enabled => {}
+                Ok(_) => handle.close("not-authorized", Some("This account was turned off.".into())),
+                Err(e) => tracing::warn!(error = %e, "couldn't recheck an account after sign-in"),
+            }
         }
         Outcome::Resume { handle, h, wrap } => {
             let (reader, writer) = t.split();
@@ -181,6 +189,8 @@ struct Negotiation {
     header_sent: bool,
     /// Failed sign-in attempts on this stream.
     failures: u32,
+    /// In-band registration state (an invite token sent with `<preauth/>`).
+    register: crate::modules::register::PreauthState,
 }
 
 type NegResult<T> = Result<T, Option<StreamError>>;
@@ -226,6 +236,7 @@ impl Negotiation {
             client: None,
             header_sent: false,
             failures: 0,
+            register: Default::default(),
         }
     }
 
@@ -342,8 +353,8 @@ impl Negotiation {
                             .child(fast),
                     ),
             );
-            if host.settings().sign_up != crate::settings::SignUp::Closed {
-                f.append(Element::new("register", ns::REGISTER_FEATURE));
+            for e in crate::modules::register::preauth_features(&self.srv, host, t.secure()) {
+                f.append(e);
             }
         } else {
             f.append(Element::new("bind", ns::BIND));
@@ -373,9 +384,10 @@ impl Negotiation {
                 }
                 Ok(None)
             }
-            _ if !t.secure() && cfg.tls.require_c2s && el.ns() != ns::TLS => {
-                Err(Some(StreamError::with_text("policy-violation", if t.can_starttls() { "Use TLS first (STARTTLS)." } else { "This server only accepts encrypted connections." })))
-            }
+            _ if !t.secure() && cfg.tls.require_c2s && el.ns() != ns::TLS => Err(Some(StreamError::with_text(
+                "policy-violation",
+                if t.can_starttls() { "Use TLS first (STARTTLS)." } else { "This server only accepts encrypted connections." },
+            ))),
             (ns::SASL, "auth") if self.user.is_none() => {
                 self.sasl2 = None;
                 let mech = el.attr("mechanism").unwrap_or_default().to_string();
@@ -446,8 +458,8 @@ impl Negotiation {
             (ns::CLIENT, "iq") if self.user.is_none() => {
                 // Only in-band registration is allowed before signing in (XEP-0077).
                 let reply = match el.first_child() {
-                    Some(q) if q.is("query", ns::REGISTER) => {
-                        crate::modules::register::preauth(&self.srv, &host, &el, t.secure(), t.peer()).await
+                    Some(q) if q.is("query", ns::REGISTER) || q.is("preauth", ns::PARS) => {
+                        crate::modules::register::preauth_with(&self.srv, &host, &el, t.secure(), t.peer(), &mut self.register).await
                     }
                     // Anything else before signing in ends the stream (RFC 6120 §4.3.5).
                     _ => return Err(Some(StreamError::new("not-authorized"))),

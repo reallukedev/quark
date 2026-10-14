@@ -171,7 +171,9 @@ impl TestServer {
 
     /// Enables or disables an account.
     pub async fn set_enabled(&self, user: &str, enabled: bool) -> anyhow::Result<()> {
-        self.srv.accounts.set_enabled(DOMAIN, user, enabled).await.map_err(|e| anyhow!("{e:?}"))
+        // Through the same path as the admin API, which also signs the account out.
+        let host = self.srv.host(self.domain()).context("no host")?;
+        quark::modules::register::set_enabled(&self.srv, &host, user, enabled).await.map(|_| ()).map_err(|e| anyhow!("{e}"))
     }
 
     /// Puts `contact` in `user`'s roster with this subscription (`none`, `to`, `from`, `both`),

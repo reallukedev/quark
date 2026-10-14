@@ -475,7 +475,8 @@ mod tests {
         let cb = ChannelBindings { exporter: Some(vec![7; 32]), server_end_point: None };
         let c = ctx(&a, &cb);
         let bare = "n=user,r=xyz";
-        let (s, Step::Challenge(sf)) = Sasl::start(&c, "SCRAM-SHA-256-PLUS", Some(format!("p=tls-exporter,,{bare}").as_bytes())).await else {
+        let (s, Step::Challenge(sf)) = Sasl::start(&c, "SCRAM-SHA-256-PLUS", Some(format!("p=tls-exporter,,{bare}").as_bytes())).await
+        else {
             panic!()
         };
         let sf = String::from_utf8(sf).unwrap();

@@ -9,12 +9,23 @@ use std::sync::Arc;
 use quark_core::stanza::{iq_result, IqType};
 use quark_core::{ns, Condition, Element, Jid, StanzaError};
 
-use super::config::{defaults_for, NodeConfig, PUBLISH_OPTIONS};
+use super::config::{defaults_for, NodeConfig, MAX_ITEMS, PUBLISH_OPTIONS};
 use super::store::{self, Affiliation, Item, Owner};
 use super::{db_err, Origin, State, MAX_ACCOUNT_BYTES, MAX_ITEM_BYTES, MAX_NAME, MAX_NODES, MAX_PER_NODE};
 use crate::modules::roster;
 use crate::modules::{ok, ok_empty, IqCtx, IqReply, IqResult};
 use crate::server::Server;
+
+/// Room left in an items reply for the stanza around the payloads.
+const REPLY_SLACK: u64 = 4096;
+
+/// Payload bytes an items reply may carry: what fits in a stanza here and on other servers
+/// (the configured c2s and s2s stanza limits), so a node full of large items is sent in part
+/// rather than in a stanza nobody accepts.
+fn reply_budget(srv: &Server) -> usize {
+    let l = &srv.config().limits;
+    usize::try_from(l.c2s_stanza_bytes.min(l.s2s_stanza_bytes).saturating_sub(REPLY_SLACK).max(1024)).unwrap_or(usize::MAX)
+}
 
 /// A pubsub error with its XEP-0060 application condition.
 pub(super) fn perr(cond: Condition, app: &str) -> StanzaError {
@@ -69,6 +80,30 @@ pub(super) fn access(cfg: &NodeConfig, owner: bool, contact: Option<&roster::Ite
     }
 }
 
+/// Explicit subscribers from other servers one node takes, in all and from any one domain:
+/// each publish sends a notification to every one of them.
+const MAX_REMOTE_SUBSCRIBERS: usize = 128;
+const MAX_SUBSCRIBERS_PER_DOMAIN: usize = 16;
+
+/// Whether a JID on another server may subscribe explicitly. Being able to read an open node
+/// isn't enough: it has to be someone the account knows (a contact with a presence
+/// subscription either way, or affiliated with the node), so strangers can't sign arbitrary
+/// addresses up for a stream of notifications, and only so many per domain and in all.
+/// `remote` are the node's current subscribers on other servers.
+fn remote_may_subscribe(viewer: &Viewer, jid: &Jid, remote: &[Jid]) -> Result<(), StanzaError> {
+    let known = viewer.contact.as_ref().is_some_and(|c| c.subscription.sends_to_contact() || c.subscription.receives_from_contact())
+        || !viewer.affs.is_empty();
+    if !known {
+        return Err(perr(Condition::NotAuthorized, "presence-subscription-required")
+            .with_text("Only contacts on other servers can subscribe here."));
+    }
+    if remote.len() >= MAX_REMOTE_SUBSCRIBERS || remote.iter().filter(|s| s.domain() == jid.domain()).count() >= MAX_SUBSCRIBERS_PER_DOMAIN
+    {
+        return Err(StanzaError::new(Condition::ResourceConstraint).with_text("This node has too many subscribers from other servers."));
+    }
+    Ok(())
+}
+
 /// How to treat a node that a publish creates or finds.
 pub(super) enum Opts {
     /// Defaults for a new node, nothing to check on an existing one.
@@ -84,6 +119,8 @@ pub(super) struct Published {
     pub node: String,
     pub cfg: NodeConfig,
     pub item: Item,
+    /// Older items the node's limit pushed out.
+    pub trimmed: Vec<String>,
 }
 
 /// The requester's standing towards an account's nodes.
@@ -257,8 +294,17 @@ impl State {
                         cfg
                     }
                 };
-                store::put_item(t, &o, &node, &item, cfg.keep())?;
-                Ok(Ok(Published { node, cfg, item }))
+                // A limit at the most this server keeps means "as many as possible": the client
+                // never asked to lose its oldest bookmark, so a full node refuses instead.
+                if cfg.persist && cfg.max_items >= MAX_ITEMS {
+                    let (count, replaces) = store::fill(t, &o, &node, &item.id)?;
+                    if !replaces && count >= MAX_ITEMS {
+                        return Ok(Err(StanzaError::new(Condition::ResourceConstraint)
+                            .with_text(format!("This node is full ({MAX_ITEMS} items); remove one first."))));
+                    }
+                }
+                let trimmed = store::put_item(t, &o, &node, &item, cfg.keep())?;
+                Ok(Ok(Published { node, cfg, item, trimmed }))
             })
             .await
             .map_err(db_err)?
@@ -267,14 +313,12 @@ impl State {
     /// Notifications and conversions after a publish.
     pub(super) async fn after_publish(self: &Arc<Self>, srv: &Arc<Server>, o: &Owner, p: &Published, origin: Origin) {
         if p.cfg.deliver_notifications {
-            let payload = p.cfg.deliver_payloads;
-            let mut item = p.item.to_element(ns::PUBSUB_EVENT, payload);
-            if p.cfg.itemreply != super::config::ItemReply::Publisher {
-                item.remove_attr("publisher");
-            }
-            let ev = Element::new("event", ns::PUBSUB_EVENT)
-                .child(Element::new("items", ns::PUBSUB_EVENT).attr_set("node", p.node.clone()).child(item));
+            let ev = super::deliver::item_event(&p.node, &p.cfg, &p.item);
             self.notify(srv, o, &p.node, &p.cfg, ev).await;
+        }
+        // Items the limit pushed out are deleted like retracted ones (XEP-0060 §7.1.2).
+        if !p.trimmed.is_empty() {
+            self.after_retract(srv, o, &p.node, &p.cfg, &p.trimmed, None).await;
         }
         if origin == Origin::Client {
             self.node_changed(srv, o, &p.node).await;
@@ -390,18 +434,25 @@ impl State {
         let requester = cx.from.to_bare();
         let is_owner = requester == o.jid();
         let (oo, n, r) = (o.clone(), node.clone(), requester.to_string());
+        let budget = reply_budget(cx.srv);
         let found = cx
             .srv
             .db
             .read(move |c| {
                 let Some(cfg) = store::node(c, &oo, &n)? else { return Ok(None) };
                 let aff = if is_owner { None } else { store::affiliation(c, &oo, &n, &r)? };
-                let items = if ids.is_empty() { store::items(c, &oo, &n, max)? } else { store::items_by_id(c, &oo, &n, &ids)? };
-                Ok(Some((cfg, aff, items)))
+                let (items, total) = if ids.is_empty() {
+                    store::items_within(c, &oo, &n, max, budget)?
+                } else {
+                    let items = store::items_by_id(c, &oo, &n, &ids, budget)?;
+                    let n = items.len() as u32;
+                    (items, n)
+                };
+                Ok(Some((cfg, aff, items, total)))
             })
             .await
             .map_err(db_err)?;
-        let Some((cfg, aff, items)) = found else { return Err(not_found()) };
+        let Some((cfg, aff, items, total)) = found else { return Err(not_found()) };
         if !is_owner {
             let contact = if aff.is_none() && matches!(cfg.access, super::config::Access::Presence | super::config::Access::Roster) {
                 roster::item(cx.srv, &o.host, &o.user, &requester).await.map_err(db_err)?
@@ -412,13 +463,25 @@ impl State {
         }
         let mut el = Element::new("items", ns::PUBSUB).attr_set("node", node);
         for it in &items {
-            let mut i = it.to_element(ns::PUBSUB, true);
-            if cfg.itemreply != super::config::ItemReply::Publisher {
-                i.remove_attr("publisher");
-            }
-            el.append(i);
+            el.append(it.shown(ns::PUBSUB, &cfg, true));
         }
-        ok(Element::new("pubsub", ns::PUBSUB).child(el))
+        let mut reply = Element::new("pubsub", ns::PUBSUB).child(el);
+        // Cut short to fit a stanza: say which part this is, the newest (XEP-0060 §6.5.4).
+        if (items.len() as u32) < total {
+            if let (Some(first), Some(last)) = (items.first(), items.last()) {
+                reply.append(
+                    Element::new("set", ns::RSM)
+                        .child(
+                            Element::new("first", ns::RSM)
+                                .attr_set("index", (total - items.len() as u32).to_string())
+                                .text(first.id.clone()),
+                        )
+                        .text_child("last", ns::RSM, last.id.clone())
+                        .text_child("count", ns::RSM, total.to_string()),
+                );
+            }
+        }
+        ok(reply)
     }
 
     async fn create_iq(&self, srv: &Arc<Server>, o: &Owner, op: &Element, config: Option<&Element>) -> IqResult {
@@ -465,16 +528,21 @@ impl State {
             .srv
             .db
             .read(move |c| {
-                let cfg = store::node(c, &oo, &n)?;
-                let count = store::subscription_count(c, &oo, &n)?;
-                Ok(cfg.map(|cfg| (cfg, count)))
+                let Some(cfg) = store::node(c, &oo, &n)? else { return Ok(None) };
+                Ok(Some((cfg, store::subscribers(c, &oo, &n)?)))
             })
             .await
             .map_err(db_err)?;
-        let Some((cfg, count)) = cfg else { return Err(not_found()) };
+        let Some((cfg, subs)) = cfg else { return Err(not_found()) };
         viewer.may(&node, &cfg)?;
-        if count >= MAX_PER_NODE {
-            return Err(StanzaError::new(Condition::ResourceConstraint).with_text("This node has too many subscribers."));
+        if !subs.contains(&j) {
+            if subs.len() as u32 >= MAX_PER_NODE {
+                return Err(StanzaError::new(Condition::ResourceConstraint).with_text("This node has too many subscribers."));
+            }
+            if !cx.srv.is_local(jid.domain()) {
+                let remote: Vec<Jid> = subs.iter().filter_map(|s| Jid::parse(s).ok()).filter(|s| !cx.srv.is_local(s.domain())).collect();
+                remote_may_subscribe(&viewer, &jid, &remote)?;
+            }
         }
         let (oo, n) = (o.clone(), node.clone());
         cx.srv.db.write(move |t| store::subscribe(t, &oo, &n, &j)).await.map_err(db_err)?;
@@ -584,17 +652,17 @@ impl State {
             .db
             .write(move |t| {
                 if store::node(t, &oo, &n)?.is_none() {
-                    return Ok(false);
+                    return Ok(None);
                 }
-                store::configure(t, &oo, &n, &c2)?;
-                Ok(true)
+                store::configure(t, &oo, &n, &c2).map(Some)
             })
             .await
             .map_err(db_err)?;
-        if !existed {
-            return Err(not_found());
-        }
+        let Some(trimmed) = existed else { return Err(not_found()) };
         crate::router::reply(cx.srv, cx.session, iq_result(cx.iq)).await;
+        if !trimmed.is_empty() {
+            self.after_retract(cx.srv, o, &node, &cfg, &trimmed, None).await;
+        }
         if cfg.notify_config && cfg.deliver_notifications {
             let ev = Element::new("event", ns::PUBSUB_EVENT)
                 .child(Element::new("configuration", ns::PUBSUB_EVENT).attr_set("node", node.clone()));

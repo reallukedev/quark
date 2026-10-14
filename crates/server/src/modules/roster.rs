@@ -171,14 +171,16 @@ pub async fn items(srv: &Server, host: &str, user: &str) -> Result<Vec<Item>, Db
 }
 
 pub async fn item(srv: &Server, host: &str, user: &str, contact: &Jid) -> Result<Option<Item>, DbError> {
-    let (h, u, c) = (host.to_string(), user.to_string(), contact.to_bare().to_string());
-    srv.db
-        .read(move |db| {
-            db.query_row(&format!("SELECT {COLS} FROM roster WHERE host = ?1 AND user = ?2 AND contact = ?3"), params![h, u, c], row_item)
-                .optional()
-                .map(Option::flatten)
-        })
-        .await
+    let (h, u, c) = (host.to_string(), user.to_string(), contact.to_bare());
+    srv.db.read(move |db| item_in(db, &h, &u, &c)).await
+}
+
+/// [`item`] inside a database closure, for modules reading it along with their own tables.
+pub fn item_in(db: &rusqlite::Connection, host: &str, user: &str, contact: &Jid) -> rusqlite::Result<Option<Item>> {
+    db.prepare_cached(&format!("SELECT {COLS} FROM roster WHERE host = ?1 AND user = ?2 AND contact = ?3"))?
+        .query_row(params![host, user, contact.to_bare().to_string()], row_item)
+        .optional()
+        .map(Option::flatten)
 }
 
 /// Saves an item and bumps the roster version. Returns the new version.

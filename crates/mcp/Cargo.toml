@@ -4,6 +4,11 @@ description = "An MCP server that lets an AI assistant manage a running Quark th
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
 # rmcp needs a newer compiler than the rest of the workspace.
 rust-version = "1.88"
 

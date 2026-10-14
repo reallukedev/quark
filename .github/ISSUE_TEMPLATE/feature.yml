@@ -1,0 +1,11 @@
+name: Feature request
+description: Suggest something Quark should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What would you like?
+      description: The problem it solves, and the XEP if there is one.
+    validations:
+      required: true

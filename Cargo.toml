@@ -5,7 +5,12 @@ members = ["crates/core", "crates/server", "crates/testkit", "crates/mcp"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "AGPL-3.0-or-later"
+license = "MIT"
+repository = "https://github.com/reallukedev/quark"
+homepage = "https://github.com/reallukedev/quark"
+authors = ["Luke"]
+keywords = ["xmpp", "jabber", "chat", "server", "federation"]
+categories = ["network-programming"]
 rust-version = "1.88"
 
 [workspace.dependencies]

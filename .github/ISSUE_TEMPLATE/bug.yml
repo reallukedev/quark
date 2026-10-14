@@ -1,0 +1,29 @@
+name: Bug report
+description: Something doesn't work as it should
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Quark version
+      description: Output of `quark --version`, or the image tag
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: Chat app and version
+      placeholder: e.g. Conversations 2.17, Monal 6.4
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: With `QUARK_LOG=quark=debug` if you can. Remove passwords, tokens and personal addresses.
+      render: text

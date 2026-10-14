@@ -105,4 +105,4 @@ cargo test --workspace
 cargo clippy --all-targets
 ```
 
-License: AGPL-3.0-or-later.
+License: [MIT](LICENSE).

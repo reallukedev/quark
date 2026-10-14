@@ -4,6 +4,11 @@ description = "XML, JID and stanza primitives for the Quark XMPP server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 quick-xml = { version = "0.37", features = ["async-tokio"] }

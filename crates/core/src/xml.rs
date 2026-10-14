@@ -1,14 +1,18 @@
 //! A small, namespace-aware XML tree for stanzas, its serializer, and parsers: one for complete
 //! documents (WebSocket frames, stored stanzas) and an incremental one for XML streams.
 
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use quick_xml::events::{BytesStart, Event};
-use quick_xml::name::ResolveResult;
+use quick_xml::escape::{resolve_xml_entity, unescape_with};
+use quick_xml::events::attributes::Attribute;
+use quick_xml::events::{BytesRef, BytesStart, Event};
+use quick_xml::name::{NamespaceResolver, QName, ResolveResult};
 use quick_xml::NsReader;
 use tokio::io::{AsyncRead, BufReader, ReadBuf};
 
@@ -16,6 +20,14 @@ const READ_AHEAD: u64 = 16 * 1024;
 
 /// The deepest nesting accepted inside one stanza. Real stanzas stay under 20 levels.
 pub const MAX_DEPTH: usize = 64;
+
+/// The most namespace declarations (`xmlns`, `xmlns:p`) one element may carry.
+const MAX_NS_DECLS: usize = 32;
+
+/// The most namespace bindings in scope at once: a default namespace on every level down to
+/// [`MAX_DEPTH`], plus room for prefixes. Bounds the resolver's memory and the cost of each
+/// prefix lookup, which scans the bindings in scope.
+const MAX_NS_IN_SCOPE: usize = MAX_DEPTH + MAX_NS_DECLS;
 
 use crate::ns;
 
@@ -349,20 +361,33 @@ impl Element {
     /// Parses one complete element (a WebSocket frame, a stored stanza).
     pub fn parse(s: &str) -> Result<Element, XmlError> {
         let mut r = NsReader::from_str(s);
-        configure(r.config_mut());
+        configure(&mut r);
         let mut stack: Vec<Element> = Vec::new();
+        // Text and the references inside it come as separate events: joined back into one node.
+        let mut text = String::new();
         loop {
             let (res, ev) = r.read_resolved_event().map_err(XmlError::from)?;
+            match text_piece(&ev)? {
+                Some(t) => {
+                    if !stack.is_empty() {
+                        text.push_str(&t);
+                    } else if !t.trim().is_empty() {
+                        return Err(XmlError::Malformed("text outside an element".into()));
+                    }
+                    continue;
+                }
+                None => flush_text(&mut stack, &mut text),
+            }
             let ens = element_ns(&res);
             match ev {
                 Event::Start(e) => {
                     if stack.len() >= MAX_DEPTH {
                         return Err(XmlError::TooDeep);
                     }
-                    stack.push(start_element(&r, ens, &e)?)
+                    stack.push(start_element(r.resolver(), ens, &e)?)
                 }
                 Event::Empty(e) => {
-                    let el = start_element(&r, ens, &e)?;
+                    let el = start_element(r.resolver(), ens, &e)?;
                     match stack.last_mut() {
                         Some(p) => p.append(el),
                         None => return finish_single(&mut r, el),
@@ -375,19 +400,11 @@ impl Element {
                         None => return finish_single(&mut r, el),
                     }
                 }
-                Event::Text(t) => {
-                    let t = checked(t.unescape().map_err(XmlError::from)?)?;
-                    match stack.last_mut() {
-                        Some(p) => p.append_text(t.into_owned()),
-                        None if t.trim().is_empty() => {}
-                        None => return Err(XmlError::Malformed("text outside an element".into())),
-                    }
-                }
+                Event::Text(_) | Event::GeneralRef(_) => {}
                 Event::CData(t) => {
-                    let t =
-                        checked(String::from_utf8(t.into_inner().into_owned()).map_err(|_| XmlError::Malformed("invalid UTF-8".into()))?)?;
+                    let t = checked(t.into_inner())?;
                     if let Some(p) = stack.last_mut() {
-                        p.append_text(t);
+                        p.append_text(t.into_owned());
                     }
                 }
                 Event::Decl(_) => {}
@@ -402,7 +419,7 @@ fn finish_single(r: &mut NsReader<&[u8]>, el: Element) -> Result<Element, XmlErr
     loop {
         match r.read_event().map_err(XmlError::from)? {
             Event::Eof => return Ok(el),
-            Event::Text(t) if t.iter().all(|b| b.is_ascii_whitespace()) => {}
+            Event::Text(t) if t.bytes().all(|b| b.is_ascii_whitespace()) => {}
             _ => return Err(XmlError::Malformed("more than one root element".into())),
         }
     }
@@ -486,15 +503,62 @@ impl From<quick_xml::events::attributes::AttrError> for XmlError {
     }
 }
 
-fn configure(c: &mut quick_xml::reader::Config) {
+fn configure<R>(r: &mut NsReader<R>) {
+    let c = r.config_mut();
     c.check_end_names = true;
     c.expand_empty_elements = false;
+    c.allow_dangling_amp = false;
+    c.allow_unmatched_ends = false;
     c.trim_text(false);
+    r.resolver_mut().set_max_namespace_bindings(MAX_NS_IN_SCOPE);
+}
+
+/// The text an event adds to the current text node: character data, or what a reference
+/// stands for. Only the five predefined entities and character references are known (there
+/// is no DTD to declare more); anything else is an error.
+fn text_piece<'e>(ev: &'e Event<'_>) -> Result<Option<Cow<'e, str>>, XmlError> {
+    match ev {
+        Event::Text(t) => Ok(Some(checked(Cow::Borrowed(&**t))?)),
+        Event::GeneralRef(r) => Ok(Some(Cow::Owned(reference(r)?))),
+        _ => Ok(None),
+    }
+}
+
+fn reference(r: &BytesRef) -> Result<String, XmlError> {
+    if let Some(c) = r.resolve_char_ref().map_err(XmlError::from)? {
+        return checked(c.to_string());
+    }
+    match resolve_xml_entity(r) {
+        Some(s) => Ok(s.to_string()),
+        None => Err(XmlError::Malformed("unknown entity".into())),
+    }
+}
+
+/// Appends the text gathered so far to the open element.
+fn flush_text(stack: &mut [Element], text: &mut String) {
+    if text.is_empty() {
+        return;
+    }
+    match stack.last_mut() {
+        Some(p) => p.append_text(std::mem::take(text)),
+        None => text.clear(),
+    }
+}
+
+/// An attribute value with references replaced (the five predefined entities and character
+/// references only). Whitespace is kept as written, as before.
+fn attr_value(a: &Attribute) -> Result<String, XmlError> {
+    let v = unescape_with(&a.value, resolve_xml_entity).map_err(|e| XmlError::Malformed(e.to_string()))?;
+    Ok(checked(v)?.into_owned())
+}
+
+fn is_ns_decl(key: &str) -> bool {
+    key == "xmlns" || key.starts_with("xmlns:")
 }
 
 fn resolved_ns(res: &ResolveResult) -> String {
     match res {
-        ResolveResult::Bound(n) => String::from_utf8_lossy(n.as_ref()).into_owned(),
+        ResolveResult::Bound(n) => n.as_ref().to_string(),
         _ => String::new(),
     }
 }
@@ -511,37 +575,44 @@ fn element_ns(res: &ResolveResult) -> Result<String, XmlError> {
 /// attribute namespaces and re-made on output. Attributes with a prefix other than `xml:` are
 /// kept under `{ns}local` keys (see [`Element::write_attrs`]): keeping `p:local` literally
 /// while dropping `xmlns:p` would relay a prefix nobody declared.
-fn start_element<R>(r: &NsReader<R>, ns: Result<String, XmlError>, e: &BytesStart) -> Result<Element, XmlError> {
+fn start_element(r: &NamespaceResolver, ns: Result<String, XmlError>, e: &BytesStart) -> Result<Element, XmlError> {
     let name = e.local_name();
-    let local = checked(utf8(name.as_ref())?)?;
+    let local = checked(name.as_ref())?;
     let mut el = Element::new(local, checked(ns?)?);
+    let mut decls = 0;
+    // `{ns}local` keys seen so far. Literal duplicates are caught by the parser; this catches
+    // two prefixes bound to one namespace naming the same attribute twice. A set, so an element
+    // with many attributes costs linear time, not quadratic.
+    let mut qualified: HashSet<String> = HashSet::new();
     for a in e.attributes() {
         let a = a?;
         let key = a.key.as_ref();
-        if key == b"xmlns" || key.starts_with(b"xmlns:") {
+        if is_ns_decl(key) {
+            decls += 1;
+            if decls > MAX_NS_DECLS {
+                return Err(XmlError::Malformed("too many namespace declarations".into()));
+            }
             continue;
         }
-        let raw = checked(utf8(key)?)?;
+        let raw = checked(key)?;
         let k = match a.key.prefix() {
             None => raw.to_string(),
-            Some(p) if p.as_ref() == b"xml" => raw.to_string(),
+            Some(p) if p.as_ref() == "xml" => raw.to_string(),
             Some(_) => match r.resolve_attribute(a.key) {
-                (ResolveResult::Bound(n), l) => format!("{{{}}}{}", checked(utf8(n.as_ref())?)?, utf8(l.as_ref())?),
+                (ResolveResult::Bound(n), l) => {
+                    let k = format!("{{{}}}{}", checked(n.as_ref())?, l.as_ref());
+                    if !qualified.insert(k.clone()) {
+                        return Err(XmlError::Malformed("duplicate attribute".into()));
+                    }
+                    k
+                }
                 _ => return Err(XmlError::Malformed("undeclared namespace prefix".into())),
             },
         };
-        // Two prefixes bound to one namespace can still name the same attribute twice.
-        if el.attrs.iter().any(|(n, _)| *n == k) {
-            return Err(XmlError::Malformed("duplicate attribute".into()));
-        }
-        let v = checked(a.unescape_value().map_err(XmlError::from)?)?;
-        el.attrs.push((k, v.into_owned()));
+        let v = attr_value(&a)?;
+        el.attrs.push((k, v));
     }
     Ok(el)
-}
-
-fn utf8(b: &[u8]) -> Result<&str, XmlError> {
-    std::str::from_utf8(b).map_err(|_| XmlError::Malformed("invalid UTF-8".into()))
 }
 
 /// `{ns}local` split into its parts.
@@ -634,6 +705,8 @@ pub struct StreamReader<R> {
     count: Arc<AtomicU64>,
     limit: Arc<AtomicU64>,
     stack: Vec<Element>,
+    /// Text of the open element not yet appended (text and references come as separate events).
+    text: String,
     opened: bool,
     /// Largest top-level element, in bytes.
     pub max_stanza: u64,
@@ -651,8 +724,18 @@ impl<R: AsyncRead + Unpin> StreamReader<R> {
 
     fn from_buf(br: BufReader<Counting<R>>, count: Arc<AtomicU64>, limit: Arc<AtomicU64>, max_stanza: u64) -> Self {
         let mut reader = NsReader::from_reader(br);
-        configure(reader.config_mut());
-        StreamReader { reader, buf: Vec::with_capacity(4096), count, limit, stack: Vec::new(), opened: false, max_stanza, server_ns: false }
+        configure(&mut reader);
+        StreamReader {
+            reader,
+            buf: Vec::with_capacity(4096),
+            count,
+            limit,
+            stack: Vec::new(),
+            text: String::new(),
+            opened: false,
+            max_stanza,
+            server_ns: false,
+        }
     }
 
     /// Starts parsing afresh on the same connection (after SASL or a stream restart), keeping any
@@ -725,33 +808,47 @@ impl<R: AsyncRead + Unpin> StreamReader<R> {
                 }
                 Err(e) => return Err(e.into()),
             };
+            if let Some(t) = text_piece(&ev)? {
+                if !self.stack.is_empty() {
+                    self.text.push_str(&t);
+                } else if matches!(ev, Event::GeneralRef(_)) || !t.bytes().all(|b| b.is_ascii_whitespace()) {
+                    return Err(XmlError::Malformed("text between stanzas".into()));
+                }
+                continue;
+            }
+            flush_text(&mut self.stack, &mut self.text);
             match ev {
                 Event::Decl(_) => {}
                 Event::Start(e) if !self.opened => {
                     let name = e.local_name();
-                    if name.as_ref() != b"stream" {
+                    if name.as_ref() != "stream" {
                         return Err(XmlError::Malformed("expected <stream:stream>".into()));
                     }
                     if !matches!(&res, Ok(n) if n == ns::STREAM) {
                         return Err(XmlError::InvalidNamespace);
                     }
                     let mut attrs = Vec::new();
+                    let mut decls = 0;
                     for a in e.attributes() {
                         let a = a?;
-                        let k = String::from_utf8_lossy(a.key.as_ref()).into_owned();
-                        if k == "xmlns" || k.starts_with("xmlns:") {
+                        let k = a.key.as_ref().to_string();
+                        if is_ns_decl(&k) {
+                            decls += 1;
+                            if decls > MAX_NS_DECLS {
+                                return Err(XmlError::Malformed("too many namespace declarations".into()));
+                            }
                             continue;
                         }
-                        let v = a.unescape_value().map_err(XmlError::from)?.into_owned();
+                        let v = attr_value(&a)?;
                         attrs.push((k, v));
                     }
-                    let (dres, _) = self.reader.resolve_element(quick_xml::name::QName(b"x"));
+                    let (dres, _) = self.reader.resolver().resolve_element(QName("x"));
                     let default_ns = resolved_ns(&dres);
                     self.opened = true;
                     return Ok(Some(StreamEvent::Open { attrs, default_ns }));
                 }
                 Event::Start(e) => {
-                    let mut el = start_element(&self.reader, res, &e)?;
+                    let mut el = start_element(self.reader.resolver(), res, &e)?;
                     if self.server_ns && el.ns == ns::SERVER {
                         el.ns = ns::CLIENT.to_string();
                     }
@@ -761,7 +858,7 @@ impl<R: AsyncRead + Unpin> StreamReader<R> {
                     self.stack.push(el);
                 }
                 Event::Empty(e) => {
-                    let mut el = start_element(&self.reader, res, &e)?;
+                    let mut el = start_element(self.reader.resolver(), res, &e)?;
                     if self.server_ns && el.ns == ns::SERVER {
                         el.ns = ns::CLIENT.to_string();
                     }
@@ -777,20 +874,11 @@ impl<R: AsyncRead + Unpin> StreamReader<R> {
                         None => return Ok(Some(StreamEvent::Stanza(el))),
                     },
                 },
-                Event::Text(t) => {
-                    if let Some(p) = self.stack.last_mut() {
-                        let t = checked(t.unescape().map_err(XmlError::from)?)?;
-                        p.append_text(t.into_owned());
-                    } else if !t.iter().all(|b| b.is_ascii_whitespace()) {
-                        return Err(XmlError::Malformed("text between stanzas".into()));
-                    }
-                }
+                Event::Text(_) | Event::GeneralRef(_) => {}
                 Event::CData(t) => {
                     if let Some(p) = self.stack.last_mut() {
-                        let t = checked(
-                            String::from_utf8(t.into_inner().into_owned()).map_err(|_| XmlError::Malformed("invalid UTF-8".into()))?,
-                        )?;
-                        p.append_text(t);
+                        let t = checked(t.into_inner())?;
+                        p.append_text(t.into_owned());
                     }
                 }
                 Event::Comment(_) | Event::PI(_) | Event::DocType(_) => return Err(XmlError::Restricted),
@@ -888,6 +976,46 @@ mod tests {
         // Built in code (from the admin API, say): written out as U+FFFD instead.
         let el = Element::new("a", "x").attr_set("v", "a\u{1}").text("b\u{2}\u{FFFF}");
         assert_eq!(el.to_xml(), "<a xmlns='x' v='a\u{FFFD}'>b\u{FFFD}\u{FFFD}</a>");
+    }
+
+    #[tokio::test]
+    async fn only_predefined_entities_and_char_refs() {
+        let el = Element::parse("<a xmlns='x' v='&lt;&#x41;&quot;'>1 &amp; 2 &#65;&gt;<![CDATA[&amp;]]></a>").unwrap();
+        assert_eq!(el.attr("v"), Some("<A\""));
+        // Text and the references in it make one text node, as before; CDATA stays its own.
+        assert_eq!(el.children.len(), 2);
+        assert_eq!(el.text_content(), "1 & 2 A>&amp;");
+        for bad in ["<a xmlns='x'>&nbsp;</a>", "<a xmlns='x' v='&foo;'/>", "<a xmlns='x'>&#0;</a>", "<a xmlns='x'>a & b</a>"] {
+            assert!(matches!(Element::parse(bad), Err(XmlError::Malformed(_))), "{bad:?}");
+            let data = format!("<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>{bad}");
+            let mut r = StreamReader::new(data.as_bytes(), 1 << 16);
+            r.next().await.unwrap();
+            assert!(matches!(r.next().await, Err(XmlError::Malformed(_))), "{bad:?}");
+        }
+        let data = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>&#32;<presence/>";
+        let mut r = StreamReader::new(data.as_bytes(), 1 << 16);
+        r.next().await.unwrap();
+        assert!(matches!(r.next().await, Err(XmlError::Malformed(_))), "reference between stanzas");
+    }
+
+    #[test]
+    fn namespace_declarations_are_capped() {
+        let decls = |n: usize| (0..n).map(|i| format!(" xmlns:p{i}='u:{i}'")).collect::<String>();
+        assert!(Element::parse(&format!("<a xmlns='x'{}/>", decls(MAX_NS_DECLS - 1))).is_ok());
+        let too_many = Element::parse(&format!("<a xmlns='x'{}/>", decls(MAX_NS_DECLS)));
+        assert!(matches!(&too_many, Err(XmlError::Malformed(m)) if m.contains("namespace")), "{too_many:?}");
+        // Spread over levels, the bindings in scope are capped too.
+        let deep = format!("{}{}", format!("<a xmlns='x'{}>", decls(4)).repeat(MAX_DEPTH / 2), "</a>".repeat(MAX_DEPTH / 2));
+        let deep = Element::parse(&deep);
+        assert!(matches!(&deep, Err(XmlError::Malformed(m)) if m.contains("namespace")), "{deep:?}");
+    }
+
+    #[test]
+    fn many_prefixed_attributes() {
+        let attrs = (0..5000).map(|i| format!(" p:a{i}='{i}'")).collect::<String>();
+        let el = Element::parse(&format!("<a xmlns='x' xmlns:p='u:p'{attrs}/>")).unwrap();
+        assert_eq!(el.attr_ns("u:p", "a4999"), Some("4999"));
+        assert!(Element::parse("<a xmlns='x' p:b='1' p:b='2' xmlns:p='u:p'/>").is_err(), "literal duplicate");
     }
 
     #[test]

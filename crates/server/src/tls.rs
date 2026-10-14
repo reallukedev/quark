@@ -10,7 +10,7 @@ use std::time::SystemTime;
 use parking_lot::RwLock;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls_pemfile::Item;
+use rustls_pki_types::pem::PemObject;
 use serde::Serialize;
 use sha2::Digest;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -256,7 +256,7 @@ fn load_entry(crt: &Path, key: &Path, self_signed: bool) -> Result<Entry, TlsErr
     let crt_pem = std::fs::read(crt).map_err(|e| err(crt, e.to_string()))?;
     let key_pem = std::fs::read(key).map_err(|e| err(key, e.to_string()))?;
     let chain: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut crt_pem.as_slice()).collect::<Result<_, _>>().map_err(|e| err(crt, e.to_string()))?;
+        CertificateDer::pem_slice_iter(&crt_pem).collect::<Result<_, _>>().map_err(|e| err(crt, e.to_string()))?;
     let leaf = chain.first().ok_or_else(|| err(crt, "no certificate in the file".into()))?.clone();
     let key_der = loop_key(&key_pem).ok_or_else(|| err(key, "no private key in the file".into()))?;
     let signer = rustls::crypto::ring::sign::any_supported_type(&key_der).map_err(|e| err(key, e.to_string()))?;
@@ -287,16 +287,9 @@ fn load_entry(crt: &Path, key: &Path, self_signed: bool) -> Result<Entry, TlsErr
     Ok(Entry { key: Arc::new(ck), names, info: CertInfo { self_signed, not_after, issuer }, end_point })
 }
 
+/// The first PKCS#8, PKCS#1 or SEC1 private key in the file; sections that don't decode are skipped.
 fn loop_key(pem: &[u8]) -> Option<PrivateKeyDer<'static>> {
-    for item in rustls_pemfile::read_all(&mut &pem[..]).flatten() {
-        match item {
-            Item::Pkcs8Key(k) => return Some(PrivateKeyDer::Pkcs8(k)),
-            Item::Pkcs1Key(k) => return Some(PrivateKeyDer::Pkcs1(k)),
-            Item::Sec1Key(k) => return Some(PrivateKeyDer::Sec1(k)),
-            _ => {}
-        }
-    }
-    None
+    PrivateKeyDer::pem_slice_iter(pem).flatten().next()
 }
 
 /// TLS session facts the stream needs: SNI, ALPN and channel bindings.

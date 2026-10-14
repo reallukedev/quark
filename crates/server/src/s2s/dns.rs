@@ -5,8 +5,8 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use hickory_resolver::error::ResolveErrorKind;
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::proto::rr::RData;
+use hickory_resolver::TokioResolver;
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 
@@ -131,7 +131,7 @@ pub fn to_ascii(domain: &str) -> Option<String> {
 }
 
 /// Where to connect for `domain`: a configured route, else SRV, else the domain on 5269.
-pub async fn targets(resolver: &TokioAsyncResolver, route: Option<&str>, domain: &str) -> Result<Vec<Target>, LookupError> {
+pub async fn targets(resolver: &TokioResolver, route: Option<&str>, domain: &str) -> Result<Vec<Target>, LookupError> {
     if let Some(r) = route {
         return Target::parse_route(r).map(|t| vec![t]).map_err(LookupError::Failed);
     }
@@ -188,31 +188,36 @@ fn merge(domain: &str, tls: SrvAnswer, plain: SrvAnswer, rand: impl FnMut(u32) -
 }
 
 /// SRV records under `prefix` + `domain`; None when there are none.
-async fn srv(resolver: &TokioAsyncResolver, prefix: &str, domain: &str, direct_tls: bool) -> Result<Option<Vec<Srv>>, String> {
+async fn srv(resolver: &TokioResolver, prefix: &str, domain: &str, direct_tls: bool) -> Result<Option<Vec<Srv>>, String> {
     let name = format!("{prefix}{domain}.");
     match resolver.srv_lookup(name).await {
         Ok(l) => Ok(Some(
-            l.iter()
+            l.answers()
+                .iter()
+                .filter_map(|r| match &r.data {
+                    RData::SRV(r) => Some(r),
+                    _ => None,
+                })
                 .map(|r| {
-                    let host = r.target().to_utf8();
+                    let host = r.target.to_utf8();
                     let host = if host == "." { host } else { host.trim_end_matches('.').to_ascii_lowercase() };
-                    Srv { priority: r.priority(), weight: r.weight(), target: Target { host, port: r.port(), direct_tls } }
+                    Srv { priority: r.priority, weight: r.weight, target: Target { host, port: r.port, direct_tls } }
                 })
                 .collect(),
         )),
-        Err(e) if matches!(e.kind(), ResolveErrorKind::NoRecordsFound { .. }) => Ok(None),
+        Err(e) if e.is_no_records_found() => Ok(None),
         Err(e) => Err(e.to_string()),
     }
 }
 
 /// The addresses of a target, IPv6 and IPv4 interleaved.
-pub async fn addrs(resolver: &TokioAsyncResolver, t: &Target) -> Result<Vec<SocketAddr>, LookupError> {
+pub async fn addrs(resolver: &TokioResolver, t: &Target) -> Result<Vec<SocketAddr>, LookupError> {
     if let Ok(ip) = t.host.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, t.port)]);
     }
     let ips = match resolver.lookup_ip(format!("{}.", t.host)).await {
         Ok(l) => l.iter().collect::<Vec<_>>(),
-        Err(e) if matches!(e.kind(), ResolveErrorKind::NoRecordsFound { .. }) => return Err(LookupError::NotFound),
+        Err(e) if e.is_no_records_found() => return Err(LookupError::NotFound),
         Err(e) => return Err(LookupError::Failed(e.to_string())),
     };
     Ok(interleave(ips).into_iter().take(MAX_ADDRS).map(|ip| SocketAddr::new(ip, t.port)).collect())
@@ -387,16 +392,22 @@ mod tests {
         assert_eq!(reachable(&lan, vec![a("10.0.0.5"), a("192.168.1.1")]), [a("10.0.0.5")]);
     }
 
+    fn test_resolver() -> TokioResolver {
+        use hickory_resolver::config::{ResolverConfig, GOOGLE};
+        use hickory_resolver::net::runtime::TokioRuntimeProvider;
+        TokioResolver::builder_with_config(ResolverConfig::udp_and_tcp(&GOOGLE), TokioRuntimeProvider::default()).build().unwrap()
+    }
+
     #[tokio::test]
     async fn ip_literal_domains_skip_dns() {
-        let r = TokioAsyncResolver::tokio(Default::default(), Default::default());
+        let r = test_resolver();
         assert_eq!(targets(&r, None, "127.0.0.1").await.unwrap()[0].host, "127.0.0.1");
         assert_eq!(targets(&r, None, "[::1]").await.unwrap()[0].host, "::1");
     }
 
     #[tokio::test]
     async fn reserved_names_are_not_looked_up() {
-        let r = TokioAsyncResolver::tokio(Default::default(), Default::default());
+        let r = test_resolver();
         assert_eq!(targets(&r, None, "nowhere.invalid").await, Err(LookupError::NotFound));
         assert_eq!(targets(&r, Some("10.1.2.3:5300"), "b.test").await.unwrap()[0].port, 5300);
     }

@@ -29,7 +29,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::TokioResolver;
 use parking_lot::{Mutex, RwLock};
 use quark_core::{Condition, Element, StanzaError};
 use rustls::sign::CertifiedKey;
@@ -174,7 +174,7 @@ pub struct S2s {
     srv: Weak<Server>,
     /// Dialback key secret (XEP-0185).
     secret: Vec<u8>,
-    resolver: TokioAsyncResolver,
+    resolver: TokioResolver,
     tls: RwLock<Arc<Tls>>,
     out: Mutex<HashMap<(String, String), OutLink>>,
     /// (local, remote) pairs that failed recently: until when, and the error to bounce with.
@@ -209,11 +209,12 @@ pub async fn start(srv: &Arc<Server>) -> anyhow::Result<Vec<std::net::SocketAddr
     let paths = cfg.s2s.trusted_certs.clone();
     let pki = tokio::task::spawn_blocking(move || Pki::load(&paths)).await?.map_err(anyhow::Error::msg).context("s2s.trusted_certs")?;
     let tls = Tls::new(pki, &srv.certs)?;
+    let resolver = resolver().context("DNS resolver")?;
     let s2s = Arc::new_cyclic(|me| S2s {
         me: me.clone(),
         srv: Arc::downgrade(srv),
         secret,
-        resolver: resolver(),
+        resolver,
         tls: RwLock::new(Arc::new(tls)),
         out: Mutex::new(HashMap::new()),
         unreachable: Mutex::new(HashMap::new()),
@@ -257,17 +258,19 @@ async fn secret(srv: &Arc<Server>, cfg: &Config) -> anyhow::Result<Vec<u8>> {
 
 /// The system's DNS servers, with short timeouts: a message shouldn't wait long on a dead
 /// resolver. Falls back to public resolvers when the system config can't be read.
-fn resolver() -> TokioAsyncResolver {
+fn resolver() -> anyhow::Result<TokioResolver> {
+    use hickory_resolver::config::{ResolverConfig, GOOGLE};
+    use hickory_resolver::net::runtime::TokioRuntimeProvider;
     let (config, mut opts) = match hickory_resolver::system_conf::read_system_conf() {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "couldn't read the system DNS config; using public resolvers");
-            Default::default()
+            (ResolverConfig::udp_and_tcp(&GOOGLE), Default::default())
         }
     };
     opts.timeout = Duration::from_secs(4);
     opts.attempts = 2;
-    TokioAsyncResolver::tokio(config, opts)
+    Ok(TokioResolver::builder_with_config(config, TokioRuntimeProvider::default()).with_options(opts).build()?)
 }
 
 /// Is `domain`, or a domain it's under, in `s2s.blocked`?

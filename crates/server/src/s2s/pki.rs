@@ -12,6 +12,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, RootCertStore, SignatureScheme};
+use rustls_pki_types::pem::PemObject;
 
 use sha2::{Digest, Sha256};
 
@@ -49,7 +50,7 @@ impl Pki {
             let pem = std::fs::read(path).map_err(|e| format!("couldn't read {}: {e}", path.display()))?;
             hash_file(&mut digest, &pem);
             let mut n = 0;
-            for c in rustls_pemfile::certs(&mut pem.as_slice()) {
+            for c in CertificateDer::pem_slice_iter(&pem) {
                 let c = c.map_err(|e| format!("{}: {e}", path.display()))?;
                 roots.add(c).map_err(|e| format!("{}: {e}", path.display()))?;
                 n += 1;

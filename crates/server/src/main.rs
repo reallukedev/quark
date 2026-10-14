@@ -20,6 +20,14 @@ enum Cmd {
     Run,
     /// Send one admin request (JSON on stdin) to the running server; prints the JSON answer.
     Ctl,
+    /// Serve the admin tools to an AI assistant (MCP over stdin/stdout), using the running
+    /// server's admin socket.
+    #[cfg(feature = "mcp")]
+    Mcp {
+        /// The admin socket (defaults to `<data_dir>/admin.sock` from the config).
+        #[arg(long, env = "QUARK_ADMIN_SOCKET")]
+        socket: Option<PathBuf>,
+    },
     /// Check a config file and say what's wrong with it.
     CheckConfig {
         /// The file to check (defaults to --config).
@@ -45,6 +53,17 @@ fn main() -> std::process::ExitCode {
             }
         },
         Cmd::Ctl => std::process::ExitCode::from(rt.block_on(quark::admin::ctl(&cli.config)).clamp(0, 255) as u8),
+        #[cfg(feature = "mcp")]
+        Cmd::Mcp { socket } => {
+            let socket = socket.unwrap_or_else(|| admin_socket(&cli.config));
+            match rt.block_on(quark_mcp::serve_stdio(socket)) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("quark mcp: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
         Cmd::CheckConfig { file } => {
             let path = file.unwrap_or(cli.config);
             match quark::config::Config::load(&path) {
@@ -62,4 +81,20 @@ fn main() -> std::process::ExitCode {
             }
         }
     }
+}
+
+/// `<data_dir>/admin.sock`, reading the config without creating anything (stdout is for MCP).
+#[cfg(feature = "mcp")]
+fn admin_socket(config: &std::path::Path) -> PathBuf {
+    let data_dir = match quark::config::Config::load(config) {
+        Ok(mut c) => {
+            let _ = c.apply_env(|k| std::env::var(k).ok());
+            c.server.data_dir
+        }
+        Err(_) => std::env::var_os("QUARK_DATA_DIR")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| quark::config::ServerSection::default().data_dir),
+    };
+    data_dir.join("admin.sock")
 }

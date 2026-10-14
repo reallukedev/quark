@@ -9,8 +9,14 @@ license.workspace = true
 name = "quark"
 path = "src/main.rs"
 
+[features]
+default = ["mcp"]
+# `quark mcp`: the admin tools for AI assistants (needs Rust 1.88 for rmcp).
+mcp = ["dep:quark-mcp"]
+
 [dependencies]
 quark-core.workspace = true
+quark-mcp = { path = "../mcp", optional = true }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }

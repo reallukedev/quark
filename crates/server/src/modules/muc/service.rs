@@ -300,7 +300,7 @@ impl Service {
 
     fn send_remote(&self, srv: &Arc<Server>, to: &Jid, el: Element) {
         let allowed =
-            srv.host(&self.host).is_some_and(|h| h.settings().federation) && !srv.config().s2s.blocked.iter().any(|b| b == to.domain());
+            srv.host(&self.host).is_some_and(|h| h.settings().federation) && !crate::s2s::is_blocked(&srv.config(), to.domain());
         if let (true, Some(r)) = (allowed, srv.remote()) {
             r.send(&self.domain, to.domain(), el);
         }

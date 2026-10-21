@@ -13,7 +13,7 @@ categories.workspace = true
 rust-version = "1.88"
 
 [dependencies]
-rand = "0.8"
+rand = "0.10"
 rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "transport-io"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }

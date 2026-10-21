@@ -19,7 +19,7 @@ base64 = "0.22"
 futures-util = { version = "0.3", features = ["sink"] }
 hmac = "0.12"
 pbkdf2 = "0.12"
-rand = "0.8"
+rand = "0.10"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 sha1 = "0.10"
 sha2 = "0.10"
